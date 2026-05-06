@@ -47,6 +47,11 @@ import adminAnalyticsRouter from "./routes/analytics.js";
 
 import { autoReconcile } from './middleware/autoReconcile.js';
 
+import {
+  mercadoPagoRouter,
+  mercadoPagoWebhookHandler,
+} from "./routes/mercadoPago.js";
+
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
 import { ensureAppConfig } from "./services/config.js";
@@ -146,6 +151,10 @@ app.use("/api/autopay", autopayVindiRouter);
 app.use("/api/me/draws", meDraws);
 
 app.use("/api/admin/autopay", autopayRunnerRoute);
+
+app.use("/api/mercadopago", mercadoPagoRouter);
+app.use("/api/payments/mercadopago", mercadoPagoRouter);
+app.post("/api/payments/webhook/mercadopago", mercadoPagoWebhookHandler);
 
 // 404 padrão
 app.use((req, res) => {
