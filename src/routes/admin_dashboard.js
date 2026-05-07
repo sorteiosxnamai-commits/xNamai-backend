@@ -1,283 +1,164 @@
-// backend/src/routes/admin_dashboard.js
 import { Router } from "express";
-import { query } from "../db.js";
-import { requireAuth, requireAdmin } from "../middleware/auth.js";
-import { getTicketPriceCents, setTicketPriceCents } from "../services/config.js";
+import { getPool, query } from "../db.js";
 import { runAutopayForDraw } from "../services/autopayRunner.js";
 
 const router = Router();
 
-function log(...a) {
-  console.log("[admin/dashboard]", ...a);
-}
+const toInt = (value, fallback) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+};
 
-/**
- * GET /api/admin/dashboard/summary
- * -> { draw_id, sold, remaining, price_cents, sold_by_payments, sold_by_numbers, available_by_numbers }
- *
- * Agora:
- * - "sold" = quantidade de números vendidos APENAS por payments aprovados (approved/paid/pago)
- * - "remaining" = 100 - sold
- * Mantive também contagens da tabela numbers como campos auxiliares (debug).
- */
-router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
+router.get("/", async (_req, res, next) => {
   try {
-    console.log("[admin/dashboard] GET /summary");
-
-    // sorteio aberto mais recente
-    const d = await query(
-      `SELECT id, opened_at
-         FROM draws
-        WHERE status = 'open'
-        ORDER BY id DESC
-        LIMIT 1`
+    const cfg = await query(
+      `SELECT key, value FROM app_config
+       WHERE key IN ('ticket_price_cents','max_numbers_per_selection','banner_title')`
     );
-    const current = d.rows[0] || null;
 
-    const price_cents = await getTicketPriceCents();
+    const config = {
+      ticket_price_cents: 5500,
+      max_numbers_per_selection: 5,
+      banner_title: "",
+    };
 
-    if (!current?.id) {
-      return res.json({
-        draw_id: null,
-        sold: 0,
-        remaining: 0,
-        price_cents,
-        sold_by_payments: 0,
-        sold_by_numbers: 0,
-        available_by_numbers: 0,
-      });
+    for (const row of cfg.rows) {
+      if (row.key === "ticket_price_cents") {
+        config.ticket_price_cents = Number(row.value || 5500);
+      }
+
+      if (row.key === "max_numbers_per_selection") {
+        config.max_numbers_per_selection = Number(row.value || 5);
+      }
+
+      if (row.key === "banner_title") {
+        config.banner_title = row.value || "";
+      }
     }
 
-    // 1) vendidos por payments aprovados (distinct em payments.numbers)
-    // 2) métricas da tabela numbers (mantidas para diagnóstico)
-    const agg = await query(
-      `
-      WITH approved AS (
-        SELECT DISTINCT t.n
-          FROM payments p
-          CROSS JOIN LATERAL unnest(p.numbers) AS t(n)
-         WHERE p.draw_id = $1
-           AND lower(p.status) IN ('approved','paid','pago')
-      ),
-      nums AS (
-        SELECT
-          SUM(CASE WHEN status = 'sold'      THEN 1 ELSE 0 END)::int AS sold_numbers,
-          SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END)::int AS available_numbers
-          FROM numbers
-         WHERE draw_id = $1
-      )
-      SELECT
-        (SELECT COUNT(*)::int FROM approved)        AS sold_by_payments,
-        (SELECT sold_numbers       FROM nums)       AS sold_by_numbers,
-        (SELECT available_numbers  FROM nums)       AS available_by_numbers
-      `,
-      [current.id]
+    const draw = await query(
+      `SELECT id, status, product_name, product_link, created_at, closed_at
+       FROM draws
+       WHERE status = 'open'
+       ORDER BY id DESC
+       LIMIT 1`
     );
 
-    const row = agg.rows[0] || {};
-    const sold_by_payments     = Number(row.sold_by_payments || 0);
-    const sold_by_numbers      = Number(row.sold_by_numbers  || 0);
-    const available_by_numbers = Number(row.available_by_numbers || 0);
+    const currentDraw = draw.rows[0] || null;
 
-    // contador exibido: somente aprovados
-    const sold = sold_by_payments;
-    const remaining = Math.max(0, 100 - sold);
+    let sold = 0;
+    let remaining = 100;
 
-    return res.json({
-      draw_id: current.id,
-      sold,
-      remaining,
-      price_cents,
-      // campos extras para conferência/depuração (não usados pelo front)
-      sold_by_payments,
-      sold_by_numbers,
-      available_by_numbers,
+    if (currentDraw) {
+      const stats = await query(
+        `SELECT
+          COUNT(*) FILTER (WHERE status = 'sold')::int AS sold,
+          COUNT(*) FILTER (WHERE status = 'available')::int AS remaining
+         FROM numbers
+         WHERE draw_id = $1`,
+        [currentDraw.id]
+      );
+
+      sold = Number(stats.rows[0]?.sold || 0);
+      remaining = Number(stats.rows[0]?.remaining || 0);
+    }
+
+    res.json({
+      ok: true,
+      config,
+      current_draw: currentDraw,
+      stats: {
+        sold,
+        remaining,
+        total: 100,
+      },
     });
-  } catch (e) {
-    console.error("[admin/dashboard] /summary error:", e);
-    return res.status(500).json({ error: "summary_failed" });
+  } catch (error) {
+    next(error);
   }
 });
 
-
-/**
- * POST /api/admin/dashboard/new
- * Fecha sorteios 'open', cria um novo, popula 0..99 'available'
- * e DISPARA o Autopay oficial (services/autopayRunner.js).
- */
-router.post("/new", requireAuth, requireAdmin, async (_req, res) => {
+router.post("/config", async (req, res, next) => {
   try {
-    log("POST /new");
+    const ticketPrice = toInt(req.body.ticket_price_cents, 5500);
+    const maxTickets = toInt(req.body.max_numbers_per_selection, 5);
+    const bannerTitle = String(req.body.banner_title || "");
 
-    // fecha os abertos anteriores
     await query(
-      `update draws
-          set status = 'closed', closed_at = now()
-        where status = 'open'`
+      `INSERT INTO app_config (key, value, updated_at)
+       VALUES
+        ('ticket_price_cents', $1, NOW()),
+        ('max_numbers_per_selection', $2, NOW()),
+        ('banner_title', $3, NOW())
+       ON CONFLICT (key)
+       DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [String(ticketPrice), String(maxTickets), bannerTitle]
     );
 
-    // cria draw novo
-    const ins = await query(
-      `insert into draws(status, opened_at, autopay_ran_at)
-       values('open', now(), null)
-       returning id`
-    );
-    const newId = ins.rows[0].id;
-    log("novo draw id =", newId);
-
-    // popula números 00..99
-    const tuples = Array.from({ length: 100 }, (_, i) => `(${newId}, ${i}, 'available', null)`);
-    await query(
-      `insert into numbers(draw_id, n, status, reservation_id)
-       values ${tuples.join(",")}`
-    );
-
-    // dispara o AUTOPAY oficial — gera logs [autopayRunner]
-    const autopay = await runAutopayForDraw(newId);
-
-    // resposta inclui o resultado do autopay para depuração
-    if (!autopay?.ok) {
-      console.warn("[admin/dashboard] autopay falhou", autopay);
-      return res.status(500).json({ ok: false, draw_id: newId, sold: 0, remaining: 100, autopay });
-    }
-
-    return res.json({ ok: true, draw_id: newId, sold: 0, remaining: 100, autopay });
-  } catch (e) {
-    console.error("[admin/dashboard] /new error:", e);
-    return res.status(500).json({ error: "new_draw_failed" });
-  }
-});
-
-/**
- * POST /api/admin/dashboard/price
- * Body: { price_cents }
- */
-router.post("/price", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const saved = await setTicketPriceCents(req.body?.price_cents);
-    return res.json({ ok: true, price_cents: saved });
-  } catch (e) {
-    console.error("[admin/dashboard] /price error:", e);
-    return res.status(400).json({ error: "invalid_price" });
-  }
-});
-
-/**
- * Alias: POST /api/admin/dashboard/ticket-price
- */
-router.post("/ticket-price", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const saved = await setTicketPriceCents(req.body?.price_cents);
-    return res.json({ ok: true, price_cents: saved });
-  } catch (e) {
-    console.error("[admin/dashboard] /ticket-price error:", e);
-    return res.status(400).json({ error: "invalid_price" });
-  }
-});
-
-// === NOVO: compradores do sorteio aberto (apenas payments aprovados)
-router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
-  try {
-    const d = await query(
-      `SELECT id
-         FROM draws
-        WHERE status = 'open'
-        ORDER BY id DESC
-        LIMIT 1`
-    );
-    const cur = d.rows[0];
-    if (!cur?.id) {
-      return res.json({
-        draw_id: null,
-        sold: 0,
-        remaining: 100,
-        buyers: [],
-        numbers: [],
-      });
-    }
-
-    // Agregado por comprador
-    const sql = `
-      WITH p_ok AS (
-        SELECT p.user_id, p.numbers, p.amount_cents::int AS amount_cents, p.paid_at
-          FROM payments p
-         WHERE p.draw_id = $1
-           AND lower(p.status) IN ('approved','paid','pago')
-      ),
-      unn AS (
-        SELECT user_id, unnest(numbers)::int AS n
-          FROM p_ok
-      ),
-      per_user AS (
-        SELECT u.user_id,
-               array_agg(DISTINCT u.n ORDER BY u.n) AS numbers,
-               COUNT(DISTINCT u.n)::int            AS count
-          FROM unn u
-         GROUP BY u.user_id
-      ),
-      totals AS (
-        SELECT user_id,
-               COALESCE(SUM(amount_cents),0)::int AS total_cents,
-               MAX(paid_at)                       AS last_paid_at
-          FROM p_ok
-         GROUP BY user_id
-      ),
-      taken AS ( SELECT DISTINCT n FROM unn )
-      SELECT
-        (SELECT COUNT(*)::int FROM taken) AS sold_approved,
-        json_agg(
-          json_build_object(
-            'user_id', pu.user_id,
-            'name',    COALESCE(us.name, us.email),      -- << apenas colunas existentes
-            'email',   us.email,
-            'numbers', pu.numbers,
-            'count',   pu.count,
-            'total_cents', COALESCE(t.total_cents,0),
-            'last_paid_at', t.last_paid_at
-          )
-          ORDER BY lower(COALESCE(us.name, us.email, ''))
-        ) FILTER (WHERE pu.user_id IS NOT NULL) AS buyers_json
-      FROM per_user pu
-      LEFT JOIN totals t ON t.user_id = pu.user_id
-      LEFT JOIN users  us ON us.id     = pu.user_id
-    `;
-    const agg = await query(sql, [cur.id]);
-    const sold = Number(agg.rows[0]?.sold_approved || 0);
-    const buyers = agg.rows[0]?.buyers_json || [];
-
-    // Mapa número -> comprador
-    const nums = await query(
-      `
-      WITH p_ok AS (
-        SELECT p.user_id, p.numbers
-          FROM payments p
-         WHERE p.draw_id = $1
-           AND lower(p.status) IN ('approved','paid','pago')
-      ),
-      unn AS ( SELECT user_id, unnest(numbers)::int AS n FROM p_ok )
-      SELECT u.n,
-             us.id   AS user_id,
-             COALESCE(us.name, us.email) AS name,  -- << apenas colunas existentes
-             us.email
-        FROM unn u
-        LEFT JOIN users us ON us.id = u.user_id
-       ORDER BY u.n
-      `,
-      [cur.id]
-    );
-
-    return res.json({
-      draw_id: cur.id,
-      sold,
-      remaining: Math.max(0, 100 - sold),
-      buyers,
-      numbers: nums.rows || [],
+    res.json({
+      ok: true,
+      config: {
+        ticket_price_cents: ticketPrice,
+        max_numbers_per_selection: maxTickets,
+        banner_title: bannerTitle,
+      },
     });
-  } catch (e) {
-    console.error("[admin/dashboard] /open-buyers error:", e);
-    return res.status(500).json({ error: "open_buyers_failed" });
+  } catch (error) {
+    next(error);
   }
 });
 
+router.post("/new", async (req, res, next) => {
+  const pool = getPool();
+  const client = await pool.connect();
+
+  try {
+    const productName = String(req.body.product_name || "").trim() || null;
+    const productLink = String(req.body.product_link || "").trim() || null;
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE draws
+       SET status = 'closed', closed_at = NOW()
+       WHERE status = 'open'`
+    );
+
+    const insertedDraw = await client.query(
+      `INSERT INTO draws (status, product_name, product_link, created_at)
+       VALUES ('open', $1, $2, NOW())
+       RETURNING id, status, product_name, product_link, created_at`,
+      [productName, productLink]
+    );
+
+    const draw = insertedDraw.rows[0];
+
+    await client.query(
+      `INSERT INTO numbers (draw_id, n, status)
+       SELECT $1, gs.n, 'available'
+       FROM generate_series(0, 99) AS gs(n)`,
+      [draw.id]
+    );
+
+    await client.query("COMMIT");
+
+    runAutopayForDraw(draw.id).catch((error) => {
+      console.error("[autopay] erro ao rodar compra automática:", error?.message || error);
+    });
+
+    res.json({
+      ok: true,
+      message: "Novo sorteio criado com números de 00 até 99.",
+      draw,
+      numbers_created: 100,
+      numbers_range: "00-99",
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    next(error);
+  } finally {
+    client.release();
+  }
+});
 
 export default router;
