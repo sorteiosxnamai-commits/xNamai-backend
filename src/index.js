@@ -67,13 +67,18 @@ try { validateTrayConfigAtStartup(); } catch {}
 
 const PORT = process.env.PORT || 4000;
 
-// Se não setar CORS_ORIGIN, usamos esta allowlist padrão
-const ORIGIN =
+const corsRaw =
   process.env.CORS_ORIGIN ||
-  "http://localhost:3000,https://newstore-frontend-ten.vercel.app,https://newstorerj.com.br,https://www.newstorerj.com.br";
+  process.env.CORS_ORIGINS ||
+  process.env.FRONTEND_URL ||
+  "";
 
-// ⚠️ CORS_ORIGIN deve conter SOMENTE origens (sem /api, sem paths)
-const ORIGINS = ORIGIN.split(",").map((s) => s.trim()).filter(Boolean);
+const allowList = corsRaw
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+console.log("[cors] origins =", allowList.join(", ") || "(vazio)");
 
 // Saúde do DB (mantém conexão viva em hosts free)
 setInterval(() => {
@@ -83,16 +88,24 @@ setInterval(() => {
 }, 60_000);
 
 // ── Middlewares ─────────────────────────────────────────────
-const corsOptions = {
-  origin: ORIGINS, // array de origens permitidas
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  // Deixe allowedHeaders indefinido para refletir os headers solicitados no preflight
-  optionsSuccessStatus: 204,
-};
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true);
 
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // responde TODOS os preflights
+      if (allowList.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.warn("[cors] blocked origin:", origin);
+      return callback(null, false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    optionsSuccessStatus: 204,
+  })
+);
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
 
@@ -336,7 +349,7 @@ async function bootstrap() {
 
     app.listen(PORT, () => {
       console.log(`API listening on :${PORT}`);
-      console.log(`[cors] origins = ${ORIGINS.join(", ")}`);
+      console.log(`[cors] origins = ${allowList.join(", ") || "(vazio)"}`);
     });
   } catch (e) {
     console.error("[bootstrap] falha ao iniciar backend:", e);
