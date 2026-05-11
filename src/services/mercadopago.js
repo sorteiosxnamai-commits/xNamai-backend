@@ -218,4 +218,64 @@ export async function mpChargeCard({
   return { status: pay.status, paymentId: pay.id };
 }
 
-export default { mpEnsureCustomer, mpSaveCard, mpChargeCard };
+export async function mpCreatePixPayment({
+  amount_cents,
+  description,
+  payer_email,
+  payer_name,
+  external_reference,
+  notification_url,
+  metadata,
+  expires_at,
+  idempotency_key,
+}) {
+  const amount = toBRL(amount_cents);
+  if (!amount || amount <= 0) {
+    const err = new Error("Valor do PIX inválido.");
+    err.status = 400;
+    err.code = "invalid_pix_amount";
+    throw err;
+  }
+
+  const payment = await mpFetch(
+    "POST",
+    "/v1/payments",
+    {
+      transaction_amount: amount,
+      description: description || "Pagamento xNaMai",
+      payment_method_id: "pix",
+      external_reference: String(external_reference || crypto.randomUUID()),
+      payer: {
+        email: payer_email || "comprador@xnamai.com",
+        first_name: payer_name || "Cliente xNaMai",
+      },
+      notification_url,
+      metadata: metadata || {},
+      date_of_expiration: expires_at || undefined,
+    },
+    { "X-Idempotency-Key": idempotency_key || crypto.randomUUID() }
+  );
+
+  const transactionData = payment?.point_of_interaction?.transaction_data || {};
+  const qr_code = typeof transactionData.qr_code === "string"
+    ? transactionData.qr_code.trim()
+    : "";
+  const qr_code_base64 = typeof transactionData.qr_code_base64 === "string"
+    ? transactionData.qr_code_base64.replace(/\s+/g, "")
+    : "";
+
+  return {
+    raw: payment,
+    payment_id: String(payment.id),
+    status: payment.status || "pending",
+    status_detail: payment.status_detail || null,
+    qr_code,
+    qr_code_base64,
+    ticket_url: transactionData.ticket_url || payment?.transaction_details?.external_resource_url || "",
+    amount,
+    amount_cents: Math.round(amount * 100),
+    external_reference: String(payment.external_reference || external_reference || ""),
+  };
+}
+
+export default { mpEnsureCustomer, mpSaveCard, mpChargeCard, mpCreatePixPayment };

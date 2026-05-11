@@ -30,6 +30,14 @@ function isDebugMpEnabled() {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+async function ensureReservationPaymentColumns() {
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+}
+
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
@@ -114,6 +122,8 @@ async function finalizeDrawIfComplete(drawId) {
  * e marca a reserva (se houver) como 'paid'.
  */
 async function settleApprovedPayment(id, drawId, numbers) {
+  await ensureReservationPaymentColumns().catch(() => {});
+
   // marca números como vendidos
   await query(
     `UPDATE numbers
@@ -127,7 +137,9 @@ async function settleApprovedPayment(id, drawId, numbers) {
   // marca reserva como paga (idempotente)
   await query(
     `UPDATE reservations
-        SET status = 'paid'
+        SET status = 'paid',
+            payment_status = 'paid',
+            updated_at = NOW()
       WHERE payment_id = $1`,
     [id]
   );
@@ -236,24 +248,16 @@ router.post('/pix', requireAuth, async (req, res) => {
   console.log('[payments/pix] user=', req.user?.id, 'body=', req.body);
   try {
     if (!req.user?.id) return res.status(401).json({ error: 'unauthorized' });
+    await ensureReservationPaymentColumns();
 
     const { reservationId } = req.body || {};
     if (!reservationId) {
       return res.status(400).json({ error: 'missing_reservation' });
     }
 
-    // Corrige reservas antigas sem user_id (anexa ao usuário atual)
-    await query(
-      `UPDATE reservations
-          SET user_id = $2
-        WHERE id = $1
-          AND user_id IS NULL`,
-      [reservationId, req.user.id]
-    );
-
     // Carrega a reserva + (opcional) usuário
     const r = await query(
-      `SELECT r.id, r.user_id, r.draw_id, r.numbers, r.status, r.expires_at,
+      `SELECT r.id, r.user_id, r.draw_id, r.numbers, r.status, r.payment_status, r.expires_at,
               u.email AS user_email, u.name AS user_name
          FROM reservations r
     LEFT JOIN users u ON u.id = r.user_id
@@ -264,7 +268,19 @@ router.post('/pix', requireAuth, async (req, res) => {
 
     const rs = r.rows[0];
 
-    if (rs.status !== 'active') return res.status(400).json({ error: 'reservation_not_active' });
+    if (Number(rs.user_id) !== Number(req.user.id)) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Você não tem permissão para pagar esta reserva.',
+      });
+    }
+
+    if (!['active', 'reserved', 'open', 'pending'].includes(String(rs.status || '').toLowerCase())) {
+      return res.status(400).json({ error: 'reservation_not_active' });
+    }
+    if (String(rs.payment_status || 'pending').toLowerCase() !== 'pending') {
+      return res.status(400).json({ error: 'payment_not_pending' });
+    }
     if (new Date(rs.expires_at).getTime() < Date.now()) {
       return res.status(400).json({ error: 'reservation_expired' });
     }
@@ -321,9 +337,10 @@ router.post('/pix', requireAuth, async (req, res) => {
     const td = point_of_interaction?.transaction_data || {};
 
     // Normaliza QR/copia-e-cola
-    let { qr_code, qr_code_base64 } = td;
+    let { qr_code, qr_code_base64, ticket_url } = td;
     if (typeof qr_code_base64 === 'string') qr_code_base64 = qr_code_base64.replace(/\s+/g, '');
     if (typeof qr_code === 'string') qr_code = qr_code.trim();
+    ticket_url = ticket_url || body?.transaction_details?.external_resource_url || '';
 
     // Persiste o pagamento
     await query(
@@ -346,12 +363,36 @@ router.post('/pix', requireAuth, async (req, res) => {
     );
 
     // Amarra a reserva ao pagamento (status segue 'active' até aprovar)
-    await query(`UPDATE reservations SET payment_id = $2 WHERE id = $1`, [reservationId, String(id)]);
+    await query(
+      `UPDATE reservations
+          SET payment_id = $2,
+              payment_status = 'pending',
+              updated_at = NOW()
+        WHERE id = $1`,
+      [reservationId, String(id)]
+    );
 
-    return res.json({ paymentId: String(id), status, qr_code, qr_code_base64 });
+    return res.json({
+      ok: true,
+      payment_id: String(id),
+      paymentId: String(id),
+      reservation_id: reservationId,
+      status,
+      qr_code,
+      qr_code_base64,
+      ticket_url,
+      amount,
+      payment_status: 'pending',
+    });
   } catch (e) {
-    console.error('[pix] error:', e);
-    return res.status(500).json({ error: 'pix_failed' });
+    console.error('[MAIN_PIX_ERROR]', {
+      code: e?.code,
+      message: e?.message,
+      detail: e?.detail,
+      hint: e?.hint,
+      stack: e?.stack,
+    });
+    return res.status(500).json({ ok: false, error: 'Erro ao gerar PIX da reserva.', code: e?.code || 'MAIN_PIX_ERROR' });
   }
 });
 

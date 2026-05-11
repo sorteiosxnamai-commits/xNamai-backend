@@ -371,6 +371,54 @@ export async function listPromotionalParticipationsForUser(user_id, email) {
   return rows;
 }
 
+export async function getPromotionalReservationForPayment(draw_id, reservation_id) {
+  await ensurePromotionalSchema();
+  const { rows } = await query(`
+    SELECT
+      r.id AS reservation_id,
+      r.draw_id,
+      r.user_id,
+      r.numbers,
+      r.buyer_name,
+      r.buyer_email,
+      r.buyer_phone,
+      r.status,
+      r.payment_status,
+      r.payment_id,
+      r.expires_at,
+      d.title,
+      d.prize,
+      d.price_cents
+    FROM public.promotional_reservations r
+    JOIN public.promotional_draws d ON d.id = r.draw_id
+    WHERE r.id = $1
+      AND r.draw_id = $2
+    LIMIT 1
+  `, [reservation_id, draw_id]);
+  return rows[0] || null;
+}
+
+export async function attachPromotionalPixPayment(draw_id, reservation_id, payment_id) {
+  await ensurePromotionalSchema();
+  await query(`
+    UPDATE public.promotional_reservations
+    SET payment_id = $3,
+        payment_status = 'pending',
+        updated_at = NOW()
+    WHERE id = $1
+      AND draw_id = $2
+  `, [reservation_id, draw_id, payment_id]);
+
+  await query(`
+    UPDATE public.promotional_numbers
+    SET payment_id = $3,
+        payment_status = 'pending',
+        updated_at = NOW()
+    WHERE draw_id = $1
+      AND reservation_id = $2
+  `, [draw_id, reservation_id, payment_id]);
+}
+
 export async function reservePromotionalNumbers(draw_id, payload) {
   const pool = await getPool();
   const client = await pool.connect();
@@ -424,7 +472,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         payment_status,
         expires_at
       )
-      VALUES ($1,$2,$3,$4::int[],$5,$6,$7,'pending','pending',$8)
+      VALUES ($1,$2,$3,$4::int[],$5,$6,$7,'reserved','pending',$8)
       RETURNING *
     `, [
       reservationId,

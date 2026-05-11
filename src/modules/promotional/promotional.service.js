@@ -1,5 +1,7 @@
 import { getPool } from "../../db.js";
+import { mpCreatePixPayment } from "../../services/mercadopago.js";
 import {
+  attachPromotionalPixPayment,
   createPromotionalDraw,
   createPromotionalNumbers,
   countPromotionalNumbersByContact,
@@ -7,6 +9,7 @@ import {
   getPromotionalDrawById,
   getPromotionalNumbers,
   getPromotionalParticipants,
+  getPromotionalReservationForPayment,
   listActivePromotionalDraws,
   listPromotionalDraws,
   listPromotionalParticipationsForUser,
@@ -135,7 +138,8 @@ function mapReservationStatus(status) {
   if (normalized === "paid") return "PAGO";
   if (normalized === "expired") return "EXPIRADO";
   if (normalized === "cancelled") return "CANCELADO";
-  return "RESERVADO";
+  if (normalized === "sorted") return "SORTEADO";
+  return "ABERTO";
 }
 
 function formatDay(value) {
@@ -209,6 +213,89 @@ export async function reserveNumbers(draw_id, payload, user = null) {
   return reservePromotionalNumbers(draw.id, data);
 }
 
+export async function createPromotionalPix(draw_id, reservation_id, user = null, options = {}) {
+  const userId = Number(user?.id);
+  if (!Number.isInteger(userId)) {
+    const err = new Error("Usuário não autenticado.");
+    err.status = 401;
+    err.code = "unauthorized";
+    throw err;
+  }
+
+  const reservation = await getPromotionalReservationForPayment(
+    Number(draw_id),
+    reservation_id
+  );
+
+  if (!reservation) {
+    throw notFound("Reserva promocional não encontrada.", "promotional_reservation_not_found");
+  }
+
+  const userEmail = String(user?.email || "").trim().toLowerCase();
+  const ownerEmail = String(reservation.buyer_email || "").trim().toLowerCase();
+  const isOwner = Number(reservation.user_id) === userId || (userEmail && ownerEmail === userEmail);
+
+  if (!isOwner) {
+    const err = new Error("Você não tem permissão para pagar esta reserva.");
+    err.status = 403;
+    err.code = "promotional_reservation_forbidden";
+    throw err;
+  }
+
+  if (String(reservation.payment_status || "pending").toLowerCase() !== "pending") {
+    const err = new Error("Esta reserva promocional não está pendente de pagamento.");
+    err.status = 400;
+    err.code = "promotional_payment_not_pending";
+    throw err;
+  }
+
+  if (["cancelled", "expired"].includes(String(reservation.status || "").toLowerCase())) {
+    const err = new Error("Esta reserva promocional não pode ser paga.");
+    err.status = 400;
+    err.code = "promotional_reservation_not_payable";
+    throw err;
+  }
+
+  const numbers = Array.isArray(reservation.numbers) ? reservation.numbers.map(Number) : [];
+  const amountCents = numbers.length * Number(reservation.price_cents || 0);
+  const description = `Sorteio promocional xNaMai - ${reservation.title || reservation.prize || reservation.draw_id}`;
+  const notificationUrl = options.notification_url || undefined;
+
+  const pix = await mpCreatePixPayment({
+    amount_cents: amountCents,
+    description,
+    payer_email: reservation.buyer_email || user.email,
+    payer_name: reservation.buyer_name || user.name || user.email,
+    external_reference: `promotional:${reservation.reservation_id}`,
+    notification_url: notificationUrl,
+    metadata: {
+      type: "promotional",
+      draw_id: reservation.draw_id,
+      reservation_id: reservation.reservation_id,
+      numbers,
+      user_id: userId,
+    },
+    idempotency_key: `promotional-${reservation.reservation_id}-${Date.now()}`,
+  });
+
+  await attachPromotionalPixPayment(
+    Number(draw_id),
+    reservation.reservation_id,
+    pix.payment_id
+  );
+
+  return {
+    ok: true,
+    payment_id: pix.payment_id,
+    reservation_id: reservation.reservation_id,
+    qr_code: pix.qr_code,
+    qr_code_base64: pix.qr_code_base64,
+    ticket_url: pix.ticket_url,
+    amount: pix.amount,
+    payment_status: "pending",
+  };
+}
+
 export async function listMyParticipations(user = null) {
   const userId = Number(user?.id);
   if (!Number.isInteger(userId)) {
@@ -233,8 +320,13 @@ export async function listMyParticipations(user = null) {
       numbers,
       numbers_label: numbers.map((n) => String(n).padStart(2, "0")).join(", "),
       day: formatDay(row.created_at),
-      payment: mapPaymentStatus(row.payment_status),
-      status: mapReservationStatus(row.reservation_status),
+      payment_status: row.payment_status || "pending",
+      payment_label: mapPaymentStatus(row.payment_status),
+      status: row.reservation_status || "reserved",
+      status_label: mapReservationStatus(row.reservation_status),
+      can_pay:
+        String(row.payment_status || "pending").toLowerCase() === "pending" &&
+        !["cancelled", "expired"].includes(String(row.reservation_status || "").toLowerCase()),
       reservation_id: row.reservation_id,
       created_at: row.created_at,
     };

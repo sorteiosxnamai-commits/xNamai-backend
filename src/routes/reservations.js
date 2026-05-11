@@ -3,8 +3,32 @@ import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
+import { getTicketPriceCents } from '../services/config.js';
+import { mpCreatePixPayment } from '../services/mercadopago.js';
 
 const router = Router();
+
+async function ensureReservationPaymentColumns() {
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+}
+
+function getBaseUrl(req) {
+  const publicUrl = process.env.PUBLIC_URL ? String(process.env.PUBLIC_URL).replace(/\/$/, '') : '';
+  if (publicUrl) return publicUrl;
+
+  const protoRaw = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  const proto = String(protoRaw).split(',')[0].trim() || 'https';
+  const host = req.get('host');
+  let baseUrl = `${proto}://${host}`.replace(/\/$/, '');
+  if (process.env.NODE_ENV === 'production' && !baseUrl.startsWith('https://')) {
+    baseUrl = baseUrl.replace(/^http:\/\//, 'https://');
+  }
+  return baseUrl;
+}
 
 /**
  * Expira reservas vencidas (best-effort, fora da transação principal).
@@ -40,6 +64,8 @@ router.post('/', requireAuth, async (req, res) => {
   const DBG = process.env.DEBUG_RESERVATIONS === 'true';
 
   try {
+    await ensureReservationPaymentColumns();
+
     if (DBG) {
       console.log('[reservations] origin =', req.headers.origin || '(none)');
       console.log('[reservations] auth header =', !!req.headers.authorization);
@@ -183,9 +209,27 @@ router.post('/', requireAuth, async (req, res) => {
     const expiresAt = new Date(Date.now() + ttlMin * 60 * 1000);
 
     await query(
-      `INSERT INTO reservations (id, user_id, draw_id, numbers, status, expires_at)
-       VALUES ($1, $2, $3, $4::int[], 'active', $5)`,
-      [reservationId, req.user.id, drawId, nums, expiresAt]
+      `INSERT INTO reservations (
+        id,
+        user_id,
+        draw_id,
+        numbers,
+        status,
+        payment_status,
+        buyer_name,
+        buyer_email,
+        expires_at
+      )
+       VALUES ($1, $2, $3, $4::int[], 'reserved', 'pending', $5, $6, $7)`,
+      [
+        reservationId,
+        req.user.id,
+        drawId,
+        nums,
+        req.user?.name || req.user?.nome || req.user?.email || null,
+        req.user?.email || null,
+        expiresAt,
+      ]
     );
 
     await query(
@@ -212,11 +256,153 @@ router.post('/', requireAuth, async (req, res) => {
 
     return res
       .status(201)
-      .json({ reservationId, id: reservationId, drawId, expiresAt, numbers: nums });
+      .json({
+        reservationId,
+        id: reservationId,
+        drawId,
+        expiresAt,
+        numbers: nums,
+        payment_status: 'pending',
+        status: 'reserved',
+        can_pay: true,
+      });
   } catch (e) {
     try { await query('ROLLBACK'); } catch {}
     console.error('[reservations] error:', e.code || e.message, e);
     return res.status(500).json({ error: 'reserve_failed' });
+  }
+});
+
+router.post('/:reservationId/pix', requireAuth, async (req, res) => {
+  try {
+    await ensureReservationPaymentColumns();
+
+    const reservationId = req.params.reservationId;
+    const r = await query(
+      `SELECT r.id,
+              r.user_id,
+              r.draw_id,
+              r.numbers,
+              r.status,
+              r.payment_status,
+              r.expires_at,
+              u.email AS user_email,
+              u.name AS user_name
+         FROM reservations r
+    LEFT JOIN users u ON u.id = r.user_id
+        WHERE r.id = $1
+        LIMIT 1`,
+      [reservationId]
+    );
+
+    if (!r.rows.length) {
+      return res.status(404).json({ ok: false, error: 'Reserva não encontrada.' });
+    }
+
+    const reservation = r.rows[0];
+    if (Number(reservation.user_id) !== Number(req.user.id)) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Você não tem permissão para pagar esta reserva.',
+      });
+    }
+
+    const paymentStatus = String(reservation.payment_status || 'pending').toLowerCase();
+    if (paymentStatus !== 'pending') {
+      return res.status(400).json({
+        ok: false,
+        error: 'Esta reserva não está pendente de pagamento.',
+      });
+    }
+
+    const reservationStatus = String(reservation.status || '').toLowerCase();
+    if (['cancelled', 'expired'].includes(reservationStatus)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Esta reserva não pode ser paga.',
+      });
+    }
+
+    if (reservation.expires_at && new Date(reservation.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Reserva expirada.',
+      });
+    }
+
+    const priceCents = await getTicketPriceCents();
+    const numbers = Array.isArray(reservation.numbers) ? reservation.numbers.map(Number) : [];
+    const amountCents = numbers.length * priceCents;
+
+    const pix = await mpCreatePixPayment({
+      amount_cents: amountCents,
+      description: `Sorteio xNaMai - números ${numbers.map((n) => String(n).padStart(2, '0')).join(', ')}`,
+      payer_email: reservation.user_email || req.user.email,
+      payer_name: reservation.user_name || req.user.name || req.user.email,
+      external_reference: String(reservationId),
+      notification_url: `${getBaseUrl(req)}/api/payments/webhook`,
+      metadata: {
+        type: 'main',
+        draw_id: reservation.draw_id,
+        reservation_id: reservationId,
+        numbers,
+        user_id: req.user.id,
+      },
+      idempotency_key: `main-${reservationId}-${Date.now()}`,
+    });
+
+    await query(
+      `INSERT INTO payments (id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (id) DO UPDATE
+         SET status = EXCLUDED.status,
+             qr_code = COALESCE(EXCLUDED.qr_code, payments.qr_code),
+             qr_code_base64 = COALESCE(EXCLUDED.qr_code_base64, payments.qr_code_base64)`,
+      [
+        pix.payment_id,
+        req.user.id,
+        reservation.draw_id,
+        numbers,
+        amountCents,
+        pix.status,
+        pix.qr_code || null,
+        pix.qr_code_base64 || null,
+      ]
+    );
+
+    await query(
+      `UPDATE reservations
+          SET payment_id = $2,
+              payment_status = 'pending',
+              updated_at = NOW()
+        WHERE id = $1`,
+      [reservationId, pix.payment_id]
+    );
+
+    return res.json({
+      ok: true,
+      payment_id: pix.payment_id,
+      reservation_id: reservationId,
+      qr_code: pix.qr_code,
+      qr_code_base64: pix.qr_code_base64,
+      ticket_url: pix.ticket_url,
+      amount: pix.amount,
+      payment_status: 'pending',
+    });
+  } catch (err) {
+    console.error('[MAIN_PIX_ERROR]', {
+      code: err?.code,
+      message: err?.message,
+      detail: err?.detail,
+      hint: err?.hint,
+      stack: err?.stack,
+    });
+
+    return res.status(500).json({
+      ok: false,
+      error: 'Erro ao gerar PIX da reserva.',
+      code: err?.code || 'MAIN_PIX_ERROR',
+    });
   }
 });
 

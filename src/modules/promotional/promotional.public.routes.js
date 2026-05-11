@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAuth } from "../../middleware/auth.js";
 import {
+  createPromotionalPix,
   getNumbers,
   getPublicDraw,
   listMyParticipations,
@@ -50,6 +51,20 @@ function logPromotionalError(tag, err) {
     hint: err?.hint,
     stack: err?.stack,
   });
+}
+
+function getBaseUrl(req) {
+  const publicUrl = process.env.PUBLIC_URL ? String(process.env.PUBLIC_URL).replace(/\/$/, "") : "";
+  if (publicUrl) return publicUrl;
+
+  const protoRaw = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const proto = String(protoRaw).split(",")[0].trim() || "https";
+  const host = req.get("host");
+  let baseUrl = `${proto}://${host}`.replace(/\/$/, "");
+  if (process.env.NODE_ENV === "production" && !baseUrl.startsWith("https://")) {
+    baseUrl = baseUrl.replace(/^http:\/\//, "https://");
+  }
+  return baseUrl;
 }
 
 function handleError(res, err, options = {}) {
@@ -133,9 +148,13 @@ router.post("/:id/reserve", requirePromotionalAuth, async (req, res) => {
     return res.status(201).json({
       ok: true,
       reservation_id: reservation.id,
+      draw_id: Number(req.params.id),
       user_id: reservation.user_id,
       buyer_email: reservation.buyer_email,
       numbers: reservation.numbers,
+      payment_status: reservation.payment_status || "pending",
+      status: reservation.status || "reserved",
+      can_pay: true,
       message: "Números promocionais reservados com sucesso.",
     });
   } catch (err) {
@@ -143,6 +162,37 @@ router.post("/:id/reserve", requirePromotionalAuth, async (req, res) => {
       tag: "[PROMOTIONAL_RESERVE_ERROR]",
       error: "Erro ao processar participação promocional.",
       code: "PROMOTIONAL_RESERVE_ERROR",
+    });
+  }
+});
+
+router.post("/:drawId/reservations/:reservationId/pix", requireAuth, async (req, res) => {
+  try {
+    const pix = await createPromotionalPix(
+      req.params.drawId,
+      req.params.reservationId,
+      req.user,
+      {
+        notification_url: `${getBaseUrl(req)}/api/payments/webhook/mercadopago`,
+      }
+    );
+    return res.json(pix);
+  } catch (err) {
+    logPromotionalError("[PROMOTIONAL_PIX_ERROR]", err);
+
+    if (err?.status === 403) {
+      return res.status(403).json({
+        ok: false,
+        error: "Você não tem permissão para pagar esta reserva.",
+      });
+    }
+
+    return res.status(err?.status || 500).json({
+      ok: false,
+      error: err?.status && err.status < 500
+        ? err.message
+        : "Erro ao gerar PIX promocional.",
+      code: err?.code || "PROMOTIONAL_PIX_ERROR",
     });
   }
 });
