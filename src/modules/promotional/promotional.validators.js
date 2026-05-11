@@ -155,7 +155,7 @@ export function validateUpdatePromotionalDraw(payload = {}) {
   return patch;
 }
 
-export function validateReservationPayload(payload = {}) {
+export function validateReservationPayload(payload = {}, user = null) {
   const numbers = Array.isArray(payload.numbers)
     ? [...new Set(payload.numbers.map(Number))]
     : [];
@@ -165,18 +165,17 @@ export function validateReservationPayload(payload = {}) {
     throw validationError("numbers deve conter números inteiros entre 0 e 1000.");
   }
 
-  const name = sanitizeString(payload.name, 255);
-  const email = sanitizeString(payload.email, 255);
-  const phone = sanitizeString(payload.phone, 40);
+  const name = sanitizeString(payload.name ?? payload.buyer_name ?? user?.name ?? "", 255);
+  const email = sanitizeString(payload.email ?? payload.buyer_email ?? user?.email ?? "", 255);
+  const phone = sanitizeString(payload.phone ?? payload.buyer_phone ?? user?.phone ?? "", 40);
 
-  if (!name) throw validationError("name é obrigatório.");
-  if (!email) throw validationError("email é obrigatório.");
-  if (!phone) throw validationError("phone é obrigatório.");
+  if (!email) throw validationError("buyer_email é obrigatório para participação promocional.");
 
   return {
     numbers: validNumbers,
-    name,
+    name: name || email,
     email,
     phone,
+    user_id: Number.isInteger(Number(user?.id)) ? Number(user.id) : null,
   };
 }

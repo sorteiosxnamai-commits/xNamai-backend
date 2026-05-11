@@ -28,13 +28,17 @@ export async function ensurePromotionalSchema(client = null) {
 
   await dbQuery(client, `
     CREATE TABLE IF NOT EXISTS public.promotional_reservations (
-      id TEXT PRIMARY KEY,
+      id UUID PRIMARY KEY,
       draw_id BIGINT NOT NULL REFERENCES public.promotional_draws(id) ON DELETE CASCADE,
+      user_id INTEGER,
       numbers INTEGER[] NOT NULL DEFAULT '{}',
-      status TEXT NOT NULL DEFAULT 'pending',
       buyer_name TEXT NOT NULL DEFAULT '',
       buyer_email TEXT NOT NULL DEFAULT '',
       buyer_phone TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      payment_status TEXT DEFAULT 'pending',
+      payment_id TEXT,
+      paid_at TIMESTAMPTZ,
       expires_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -48,9 +52,10 @@ export async function ensurePromotionalSchema(client = null) {
       n INTEGER NOT NULL,
       label TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'available',
-      user_id BIGINT,
-      reservation_id TEXT REFERENCES public.promotional_reservations(id) ON DELETE SET NULL,
+      user_id INTEGER,
+      reservation_id UUID REFERENCES public.promotional_reservations(id) ON DELETE SET NULL,
       payment_id TEXT,
+      payment_status TEXT DEFAULT 'pending',
       buyer_name TEXT,
       buyer_email TEXT,
       buyer_phone TEXT,
@@ -79,7 +84,18 @@ export async function ensurePromotionalSchema(client = null) {
   `);
 
   await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS banner_url TEXT`);
-  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id BIGINT`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reservation_id UUID NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_name TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_email TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_phone TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
 }
 
 function drawSelect() {
@@ -263,6 +279,12 @@ export async function updatePromotionalNumberStatus(draw_id, n, status) {
     SET status = $3,
         reservation_id = CASE WHEN $3 = 'available' THEN NULL ELSE reservation_id END,
         payment_id = CASE WHEN $3 = 'available' THEN NULL ELSE payment_id END,
+        payment_status = CASE
+          WHEN $3 = 'available' THEN 'pending'
+          WHEN $3 = 'sold' THEN 'paid'
+          ELSE payment_status
+        END,
+        user_id = CASE WHEN $3 = 'available' THEN NULL ELSE user_id END,
         buyer_name = CASE WHEN $3 = 'available' THEN NULL ELSE buyer_name END,
         buyer_email = CASE WHEN $3 = 'available' THEN NULL ELSE buyer_email END,
         buyer_phone = CASE WHEN $3 = 'available' THEN NULL ELSE buyer_phone END,
@@ -290,11 +312,14 @@ export async function getPromotionalParticipants(draw_id) {
   const { rows } = await query(`
     SELECT
       r.id AS reservation_id,
+      r.user_id,
       r.buyer_name,
       r.buyer_email,
       r.buyer_phone,
       r.numbers,
       r.status,
+      r.payment_status,
+      r.payment_id,
       r.created_at,
       r.expires_at
     FROM public.promotional_reservations r
@@ -304,7 +329,7 @@ export async function getPromotionalParticipants(draw_id) {
   return rows;
 }
 
-export async function countPromotionalNumbersByContact(draw_id, email, phone) {
+export async function countPromotionalNumbersByContact(draw_id, email, phone, user_id = null) {
   await ensurePromotionalSchema();
   const { rows } = await query(`
     SELECT COALESCE(SUM(cardinality(numbers)), 0)::int AS total
@@ -312,11 +337,38 @@ export async function countPromotionalNumbersByContact(draw_id, email, phone) {
     WHERE draw_id = $1
       AND status IN ('pending', 'paid')
       AND (
-        lower(buyer_email) = lower($2)
-        OR regexp_replace(buyer_phone, '\\D', '', 'g') = regexp_replace($3, '\\D', '', 'g')
+        ($4::integer IS NOT NULL AND user_id = $4::integer)
+        OR lower(buyer_email) = lower($2)
+        OR (
+          $3 <> ''
+          AND regexp_replace(buyer_phone, '\\D', '', 'g') = regexp_replace($3, '\\D', '', 'g')
+        )
       )
-  `, [draw_id, email, phone]);
+  `, [draw_id, email, phone || "", user_id]);
   return Number(rows[0]?.total || 0);
+}
+
+export async function listPromotionalParticipationsForUser(user_id, email) {
+  await ensurePromotionalSchema();
+  const { rows } = await query(`
+    SELECT
+      r.id AS reservation_id,
+      r.draw_id,
+      r.numbers,
+      r.status AS reservation_status,
+      r.payment_status,
+      r.payment_id,
+      r.created_at,
+      d.title AS draw_title,
+      d.prize
+    FROM public.promotional_reservations r
+    JOIN public.promotional_draws d ON d.id = r.draw_id
+    WHERE
+      r.user_id = $1
+      OR LOWER(r.buyer_email) = LOWER($2)
+    ORDER BY r.created_at DESC
+  `, [user_id, email || ""]);
+  return rows;
 }
 
 export async function reservePromotionalNumbers(draw_id, payload) {
@@ -363,18 +415,21 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       INSERT INTO public.promotional_reservations (
         id,
         draw_id,
+        user_id,
         numbers,
-        status,
         buyer_name,
         buyer_email,
         buyer_phone,
+        status,
+        payment_status,
         expires_at
       )
-      VALUES ($1,$2,$3::int[],'pending',$4,$5,$6,$7)
+      VALUES ($1,$2,$3,$4::int[],$5,$6,$7,'pending','pending',$8)
       RETURNING *
     `, [
       reservationId,
       draw_id,
+      payload.user_id,
       payload.numbers,
       payload.name,
       payload.email,
@@ -386,9 +441,11 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       UPDATE public.promotional_numbers
       SET status = 'reserved',
           reservation_id = $3,
-          buyer_name = $4,
-          buyer_email = $5,
-          buyer_phone = $6,
+          user_id = $4,
+          buyer_name = $5,
+          buyer_email = $6,
+          buyer_phone = $7,
+          payment_status = 'pending',
           reserved_at = NOW(),
           updated_at = NOW()
       WHERE draw_id = $1
@@ -397,6 +454,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       draw_id,
       payload.numbers,
       reservationId,
+      payload.user_id,
       payload.name,
       payload.email,
       payload.phone,
@@ -405,7 +463,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
     await client.query("COMMIT");
     return reservation.rows[0];
   } catch (err) {
-    console.error("[PROMOTIONAL_ERROR]", {
+    console.error("[PROMOTIONAL_RESERVE_ERROR]", {
       code: err?.code,
       message: err?.message,
       detail: err?.detail,

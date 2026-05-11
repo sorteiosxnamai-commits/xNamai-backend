@@ -9,6 +9,7 @@ import {
   getPromotionalParticipants,
   listActivePromotionalDraws,
   listPromotionalDraws,
+  listPromotionalParticipationsForUser,
   reservePromotionalNumbers,
   updatePromotionalDraw,
   updatePromotionalDrawStatus,
@@ -121,9 +122,32 @@ export async function archiveDraw(id) {
   return draw;
 }
 
-export async function reserveNumbers(draw_id, payload) {
+function mapPaymentStatus(status) {
+  const normalized = String(status || "pending").toLowerCase();
+  if (normalized === "paid") return "PAGO";
+  if (normalized === "cancelled") return "CANCELADO";
+  if (normalized === "expired") return "EXPIRADO";
+  return "PENDENTE";
+}
+
+function mapReservationStatus(status) {
+  const normalized = String(status || "pending").toLowerCase();
+  if (normalized === "paid") return "PAGO";
+  if (normalized === "expired") return "EXPIRADO";
+  if (normalized === "cancelled") return "CANCELADO";
+  return "RESERVADO";
+}
+
+function formatDay(value) {
+  if (!value) return "";
+  return new Intl.DateTimeFormat("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+  }).format(new Date(value));
+}
+
+export async function reserveNumbers(draw_id, payload, user = null) {
   const draw = await getPublicDraw(draw_id);
-  const data = validateReservationPayload(payload);
+  const data = validateReservationPayload(payload, user);
 
   if (data.numbers.length > Number(draw.max_numbers_per_user || 1)) {
     const err = new Error("Quantidade de números acima do limite permitido.");
@@ -135,7 +159,8 @@ export async function reserveNumbers(draw_id, payload) {
   const alreadyReserved = await countPromotionalNumbersByContact(
     draw.id,
     data.email,
-    data.phone
+    data.phone,
+    data.user_id
   );
   if (alreadyReserved + data.numbers.length > Number(draw.max_numbers_per_user || 1)) {
     const err = new Error("Quantidade de números acima do limite por participante.");
@@ -156,6 +181,38 @@ export async function reserveNumbers(draw_id, payload) {
   }
 
   return reservePromotionalNumbers(draw.id, data);
+}
+
+export async function listMyParticipations(user = null) {
+  const userId = Number(user?.id);
+  if (!Number.isInteger(userId)) {
+    const err = new Error("Usuário não autenticado.");
+    err.status = 401;
+    err.code = "unauthorized";
+    throw err;
+  }
+
+  const rows = await listPromotionalParticipationsForUser(
+    userId,
+    user.email || ""
+  );
+
+  return rows.map((row) => {
+    const numbers = Array.isArray(row.numbers) ? row.numbers.map(Number) : [];
+    return {
+      type: "promotional",
+      draw_id: Number(row.draw_id),
+      draw_title: row.draw_title || "",
+      prize: row.prize || "",
+      numbers,
+      numbers_label: numbers.map((n) => String(n).padStart(2, "0")).join(", "),
+      day: formatDay(row.created_at),
+      payment: mapPaymentStatus(row.payment_status),
+      status: mapReservationStatus(row.reservation_status),
+      reservation_id: row.reservation_id,
+      created_at: row.created_at,
+    };
+  });
 }
 
 export async function updateNumberStatus(draw_id, number, status) {
