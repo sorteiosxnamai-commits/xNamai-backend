@@ -18,9 +18,9 @@ export async function ensurePromotionalSchema(client = null) {
       number_end INTEGER NOT NULL,
       max_numbers_per_user INTEGER NOT NULL DEFAULT 1,
       status TEXT NOT NULL DEFAULT 'draft',
+      banner_url TEXT,
       starts_at TIMESTAMPTZ,
       ends_at TIMESTAMPTZ,
-      archived_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
@@ -43,10 +43,12 @@ export async function ensurePromotionalSchema(client = null) {
 
   await dbQuery(client, `
     CREATE TABLE IF NOT EXISTS public.promotional_numbers (
+      id BIGSERIAL PRIMARY KEY,
       draw_id BIGINT NOT NULL REFERENCES public.promotional_draws(id) ON DELETE CASCADE,
       n INTEGER NOT NULL,
       label TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'available',
+      user_id BIGINT,
       reservation_id TEXT REFERENCES public.promotional_reservations(id) ON DELETE SET NULL,
       payment_id TEXT,
       buyer_name TEXT,
@@ -55,14 +57,17 @@ export async function ensurePromotionalSchema(client = null) {
       reserved_at TIMESTAMPTZ,
       sold_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (draw_id, n)
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
 
   await dbQuery(client, `
     CREATE INDEX IF NOT EXISTS promotional_draws_status_idx
     ON public.promotional_draws(status)
+  `);
+  await dbQuery(client, `
+    CREATE UNIQUE INDEX IF NOT EXISTS promotional_numbers_draw_n_uq
+    ON public.promotional_numbers(draw_id, n)
   `);
   await dbQuery(client, `
     CREATE INDEX IF NOT EXISTS promotional_numbers_draw_status_idx
@@ -72,6 +77,9 @@ export async function ensurePromotionalSchema(client = null) {
     CREATE INDEX IF NOT EXISTS promotional_reservations_draw_idx
     ON public.promotional_reservations(draw_id, created_at DESC)
   `);
+
+  await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS banner_url TEXT`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id BIGINT`);
 }
 
 function drawSelect() {
@@ -101,8 +109,7 @@ export async function listActivePromotionalDraws() {
   await ensurePromotionalSchema();
   const { rows } = await query(`
     ${drawSelect()}
-    WHERE d.archived_at IS NULL
-      AND d.status = 'active'
+    WHERE d.status = 'active'
       AND (d.starts_at IS NULL OR d.starts_at <= NOW())
       AND (d.ends_at IS NULL OR d.ends_at >= NOW())
     GROUP BY d.id
@@ -115,7 +122,6 @@ export async function listPromotionalDraws() {
   await ensurePromotionalSchema();
   const { rows } = await query(`
     ${drawSelect()}
-    WHERE d.archived_at IS NULL
     GROUP BY d.id
     ORDER BY d.created_at DESC, d.id DESC
   `);
@@ -127,21 +133,20 @@ export async function getPromotionalDrawById(id, client = null) {
   const { rows } = await dbQuery(client, `
     ${drawSelect()}
     WHERE d.id = $1
-      AND d.archived_at IS NULL
     GROUP BY d.id
     LIMIT 1
   `, [id]);
   return rows[0] || null;
 }
 
-export async function getPromotionalNumbers(drawId, client = null) {
+export async function getPromotionalNumbers(draw_id, client = null) {
   await ensurePromotionalSchema(client);
   const { rows } = await dbQuery(client, `
     SELECT *
     FROM public.promotional_numbers
     WHERE draw_id = $1
     ORDER BY n ASC
-  `, [drawId]);
+  `, [draw_id]);
   return rows.map(normalizeNumberRow);
 }
 
@@ -157,10 +162,11 @@ export async function createPromotionalDraw(payload, client = null) {
       number_end,
       max_numbers_per_user,
       status,
+      banner_url,
       starts_at,
       ends_at
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     RETURNING *
   `, [
     payload.title,
@@ -171,6 +177,7 @@ export async function createPromotionalDraw(payload, client = null) {
     payload.number_end,
     payload.max_numbers_per_user,
     payload.status,
+    payload.banner_url,
     payload.starts_at,
     payload.ends_at,
   ]);
@@ -192,7 +199,6 @@ export async function updatePromotionalDraw(id, payload) {
     SET ${fields.join(", ")},
         updated_at = NOW()
     WHERE id = $1
-      AND archived_at IS NULL
     RETURNING *
   `, values);
   return rows[0] || null;
@@ -205,7 +211,6 @@ export async function updatePromotionalDrawStatus(id, status) {
     SET status = $2,
         updated_at = NOW()
     WHERE id = $1
-      AND archived_at IS NULL
     RETURNING *
   `, [id, status]);
   return rows[0] || null;
@@ -216,21 +221,19 @@ export async function deletePromotionalDraw(id) {
   const { rows } = await query(`
     UPDATE public.promotional_draws
     SET status = 'inactive',
-        archived_at = NOW(),
         updated_at = NOW()
     WHERE id = $1
-      AND archived_at IS NULL
     RETURNING *
   `, [id]);
   return rows[0] || null;
 }
 
-export async function createPromotionalNumbers(drawId, numberStart, numberEnd, client = null) {
+export async function createPromotionalNumbers(draw_id, number_start, number_end, client = null) {
   await ensurePromotionalSchema(client);
   const rows = [];
 
-  for (let n = numberStart; n <= numberEnd; n += 1) {
-    rows.push([drawId, n, formatPromotionalNumber(n), "available"]);
+  for (let n = number_start; n <= number_end; n += 1) {
+    rows.push([draw_id, n, formatPromotionalNumber(n), "available"]);
   }
 
   if (!rows.length) return [];
@@ -253,7 +256,7 @@ export async function createPromotionalNumbers(drawId, numberStart, numberEnd, c
   return inserted.map(normalizeNumberRow);
 }
 
-export async function updatePromotionalNumberStatus(drawId, number, status) {
+export async function updatePromotionalNumberStatus(draw_id, n, status) {
   await ensurePromotionalSchema();
   const { rows } = await query(`
     UPDATE public.promotional_numbers
@@ -277,12 +280,12 @@ export async function updatePromotionalNumberStatus(drawId, number, status) {
     WHERE draw_id = $1
       AND n = $2
     RETURNING *
-  `, [drawId, number, status]);
+  `, [draw_id, n, status]);
 
   return rows[0] ? normalizeNumberRow(rows[0]) : null;
 }
 
-export async function getPromotionalParticipants(drawId) {
+export async function getPromotionalParticipants(draw_id) {
   await ensurePromotionalSchema();
   const { rows } = await query(`
     SELECT
@@ -297,11 +300,11 @@ export async function getPromotionalParticipants(drawId) {
     FROM public.promotional_reservations r
     WHERE r.draw_id = $1
     ORDER BY r.created_at DESC
-  `, [drawId]);
+  `, [draw_id]);
   return rows;
 }
 
-export async function countPromotionalNumbersByContact(drawId, email, phone) {
+export async function countPromotionalNumbersByContact(draw_id, email, phone) {
   await ensurePromotionalSchema();
   const { rows } = await query(`
     SELECT COALESCE(SUM(cardinality(numbers)), 0)::int AS total
@@ -312,11 +315,11 @@ export async function countPromotionalNumbersByContact(drawId, email, phone) {
         lower(buyer_email) = lower($2)
         OR regexp_replace(buyer_phone, '\\D', '', 'g') = regexp_replace($3, '\\D', '', 'g')
       )
-  `, [drawId, email, phone]);
+  `, [draw_id, email, phone]);
   return Number(rows[0]?.total || 0);
 }
 
-export async function reservePromotionalNumbers(drawId, payload) {
+export async function reservePromotionalNumbers(draw_id, payload) {
   const pool = await getPool();
   const client = await pool.connect();
   const reservationId = randomUUID();
@@ -333,7 +336,7 @@ export async function reservePromotionalNumbers(drawId, payload) {
         AND n = ANY($2::int[])
       ORDER BY n ASC
       FOR UPDATE
-    `, [drawId, payload.numbers]);
+    `, [draw_id, payload.numbers]);
 
     const found = new Set(locked.rows.map((row) => Number(row.n)));
     const missing = payload.numbers.filter((n) => !found.has(n));
@@ -371,7 +374,7 @@ export async function reservePromotionalNumbers(drawId, payload) {
       RETURNING *
     `, [
       reservationId,
-      drawId,
+      draw_id,
       payload.numbers,
       payload.name,
       payload.email,
@@ -391,7 +394,7 @@ export async function reservePromotionalNumbers(drawId, payload) {
       WHERE draw_id = $1
         AND n = ANY($2::int[])
     `, [
-      drawId,
+      draw_id,
       payload.numbers,
       reservationId,
       payload.name,
@@ -402,6 +405,13 @@ export async function reservePromotionalNumbers(drawId, payload) {
     await client.query("COMMIT");
     return reservation.rows[0];
   } catch (err) {
+    console.error("[PROMOTIONAL_ERROR]", {
+      code: err?.code,
+      message: err?.message,
+      detail: err?.detail,
+      hint: err?.hint,
+      stack: err?.stack,
+    });
     await client.query("ROLLBACK").catch(() => {});
     throw err;
   } finally {

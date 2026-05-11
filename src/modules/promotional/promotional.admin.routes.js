@@ -18,8 +18,20 @@ router.use(requireAuth, requireAdmin);
 
 function handleError(res, err) {
   const status = err?.status || err?.statusCode || 500;
+  console.error("[PROMOTIONAL_ERROR]", {
+    code: err?.code,
+    message: err?.message,
+    detail: err?.detail,
+    hint: err?.hint,
+    stack: err?.stack,
+  });
+
   if (status >= 500) {
-    console.error("[promotional.admin]", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Erro ao carregar campanhas promocionais",
+      code: err?.code || "PROMOTIONAL_ERROR",
+    });
   }
 
   return res.status(status).json({

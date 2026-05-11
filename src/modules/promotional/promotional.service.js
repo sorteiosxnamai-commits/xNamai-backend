@@ -64,10 +64,10 @@ export async function getAdminDraw(id) {
   return draw;
 }
 
-export async function getNumbers(drawId, { requireActive = false } = {}) {
+export async function getNumbers(draw_id, { requireActive = false } = {}) {
   const draw = requireActive
-    ? await getPublicDraw(drawId)
-    : await getAdminDraw(drawId);
+    ? await getPublicDraw(draw_id)
+    : await getAdminDraw(draw_id);
   const numbers = await getPromotionalNumbers(draw.id);
   return { draw, numbers };
 }
@@ -84,6 +84,13 @@ export async function createDraw(payload) {
     await client.query("COMMIT");
     return getPromotionalDrawById(draw.id);
   } catch (err) {
+    console.error("[PROMOTIONAL_ERROR]", {
+      code: err?.code,
+      message: err?.message,
+      detail: err?.detail,
+      hint: err?.hint,
+      stack: err?.stack,
+    });
     await client.query("ROLLBACK").catch(() => {});
     throw err;
   } finally {
@@ -114,8 +121,8 @@ export async function archiveDraw(id) {
   return draw;
 }
 
-export async function reserveNumbers(drawId, payload) {
-  const draw = await getPublicDraw(drawId);
+export async function reserveNumbers(draw_id, payload) {
+  const draw = await getPublicDraw(draw_id);
   const data = validateReservationPayload(payload);
 
   if (data.numbers.length > Number(draw.max_numbers_per_user || 1)) {
@@ -151,8 +158,8 @@ export async function reserveNumbers(drawId, payload) {
   return reservePromotionalNumbers(draw.id, data);
 }
 
-export async function updateNumberStatus(drawId, number, status) {
-  await getAdminDraw(drawId);
+export async function updateNumberStatus(draw_id, number, status) {
+  await getAdminDraw(draw_id);
 
   const n = Number(number);
   if (!Number.isInteger(n) || n < 0 || n > 1000) {
@@ -163,7 +170,7 @@ export async function updateNumberStatus(drawId, number, status) {
   }
 
   const normalized = validateNumberStatus(status);
-  const updated = await updatePromotionalNumberStatus(Number(drawId), n, normalized);
+  const updated = await updatePromotionalNumberStatus(Number(draw_id), n, normalized);
   if (!updated) {
     throw notFound("Número promocional não encontrado.", "promotional_number_not_found");
   }
@@ -174,9 +181,9 @@ export async function listAdminDraws() {
   return listPromotionalDraws();
 }
 
-export async function listParticipants(drawId) {
-  await getAdminDraw(drawId);
-  return getPromotionalParticipants(Number(drawId));
+export async function listParticipants(draw_id) {
+  await getAdminDraw(draw_id);
+  return getPromotionalParticipants(Number(draw_id));
 }
 
 export function assertPromotionalAdminEmail(req) {

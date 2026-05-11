@@ -106,6 +106,7 @@ export function validateCreatePromotionalDraw(payload = {}) {
     ...range,
     max_numbers_per_user,
     status: validatePromotionalStatus(payload.status || "draft"),
+    banner_url: sanitizeString(payload.banner_url, 2048),
     starts_at: toOptionalDate(payload.starts_at, "starts_at"),
     ends_at: toOptionalDate(payload.ends_at, "ends_at"),
   };
@@ -136,6 +137,9 @@ export function validateUpdatePromotionalDraw(payload = {}) {
   }
   if (payload.status !== undefined) {
     patch.status = validatePromotionalStatus(payload.status);
+  }
+  if (payload.banner_url !== undefined) {
+    patch.banner_url = sanitizeString(payload.banner_url, 2048);
   }
   if (payload.starts_at !== undefined) {
     patch.starts_at = toOptionalDate(payload.starts_at, "starts_at");
