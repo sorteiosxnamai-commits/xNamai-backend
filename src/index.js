@@ -15,6 +15,8 @@ import paymentsVindiRoutes from "./routes/payments_vindi.js";
 import meRoutes from "./routes/me.js";
 import drawsRoutes from "./routes/draws.js";
 import drawsExtRoutes from "./routes/draws_ext.js";
+import promotionalPublicRouter from "./modules/promotional/promotional.public.routes.js";
+import promotionalAdminRouter from "./modules/promotional/promotional.admin.routes.js";
 
 // Routers ADMIN específicos (monte ANTES do /api/admin genérico)
 import adminDrawsRouter from "./routes/admin_draws.js";
@@ -130,6 +132,10 @@ app.use("/api/participations", paymentsRoutes); // aliases
 app.use("/api/me", meRoutes);
 app.use("/api/draws", drawsRoutes);
 app.use("/api/draws-ext", drawsExtRoutes);
+
+// ── Módulo Promocional isolado ───────────────────────────────
+app.use("/api/promotional/admin", promotionalAdminRouter);
+app.use("/api/promotional", promotionalPublicRouter);
 
 // ── Rotas ADMIN específicas (antes do genérico) ────────────
 app.use("/api/admin/draws", adminDrawsRouter);
