@@ -1,5 +1,4 @@
 import { Router } from "express";
-import jwt from "jsonwebtoken";
 import { requireAuth } from "../../middleware/auth.js";
 import {
   getNumbers,
@@ -11,36 +10,36 @@ import {
 
 const router = Router();
 
-const JWT_SECRET =
-  process.env.JWT_SECRET ||
-  process.env.JWT_SECRET_KEY ||
-  process.env.SUPABASE_JWT_SECRET ||
-  "change-me-in-env";
+function requirePromotionalAuth(req, res, next) {
+  const originalStatus = res.status.bind(res);
+  const originalJson = res.json.bind(res);
+  let statusCode = 200;
 
-function optionalAuth(req, res, next) {
-  const auth = req.headers?.authorization || "";
-  const match = auth.match(/^Bearer\s+(.+)$/i);
-
-  if (!match) return next();
-
-  try {
-    const payload = jwt.verify(match[1].trim(), JWT_SECRET);
-    req.user = {
-      id: payload.id || payload.sub,
-      email: payload.email || payload.user?.email,
-      name: payload.name || payload.user?.name,
-      phone: payload.phone || payload.user?.phone,
-      role: payload.role || payload.user?.role,
-      ...payload,
-    };
-    return next();
-  } catch (err) {
-    return res.status(401).json({
-      ok: false,
-      error: "Token inválido.",
-      code: "unauthorized",
-    });
+  function restore() {
+    res.status = originalStatus;
+    res.json = originalJson;
   }
+
+  res.status = (code) => {
+    statusCode = code;
+    return res;
+  };
+
+  res.json = (payload) => {
+    restore();
+    if (statusCode === 401) {
+      return originalStatus(401).json({
+        ok: false,
+        error: "Entre ou crie uma conta para reservar números promocionais.",
+      });
+    }
+    return originalStatus(statusCode).json(payload);
+  };
+
+  return requireAuth(req, res, (err) => {
+    restore();
+    return next(err);
+  });
 }
 
 function logPromotionalError(tag, err) {
@@ -63,6 +62,28 @@ function handleError(res, err, options = {}) {
       ok: false,
       error: options.error || "Erro ao carregar campanhas promocionais",
       code: options.code || err?.code || "PROMOTIONAL_ERROR",
+    });
+  }
+
+  if (options.code === "PROMOTIONAL_RESERVE_ERROR") {
+    if (status === 409) {
+      return res.status(409).json({
+        ok: false,
+        error: "Um ou mais números já estão indisponíveis.",
+      });
+    }
+
+    if (status === 401) {
+      return res.status(401).json({
+        ok: false,
+        error: err?.message || "Usuário não autenticado.",
+      });
+    }
+
+    return res.status(status).json({
+      ok: false,
+      error: err?.message || "Erro ao reservar números promocionais.",
+      ...(err?.conflicts && { conflicts: err.conflicts }),
     });
   }
 
@@ -106,12 +127,14 @@ router.get("/:id/numbers", async (req, res) => {
   }
 });
 
-router.post("/:id/reserve", optionalAuth, async (req, res) => {
+router.post("/:id/reserve", requirePromotionalAuth, async (req, res) => {
   try {
-    const reservation = await reserveNumbers(req.params.id, req.body || {}, req.user || null);
+    const reservation = await reserveNumbers(req.params.id, req.body || {}, req.user);
     return res.status(201).json({
       ok: true,
       reservation_id: reservation.id,
+      user_id: reservation.user_id,
+      buyer_email: reservation.buyer_email,
       numbers: reservation.numbers,
       message: "Números promocionais reservados com sucesso.",
     });

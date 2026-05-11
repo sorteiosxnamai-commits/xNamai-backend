@@ -146,8 +146,34 @@ function formatDay(value) {
 }
 
 export async function reserveNumbers(draw_id, payload, user = null) {
+  const userId = Number(user?.id);
+  const userEmail = String(user?.email || "").trim();
+  const userName = String(user?.name || user?.nome || userEmail).trim();
+
+  if (!Number.isInteger(userId) || !userEmail) {
+    const err = new Error("Usuário não autenticado.");
+    err.status = 401;
+    err.code = "unauthorized";
+    throw err;
+  }
+
   const draw = await getPublicDraw(draw_id);
-  const data = validateReservationPayload(payload, user);
+  const data = validateReservationPayload(
+    {
+      ...payload,
+      name: userName,
+      email: userEmail,
+      phone: payload?.buyer_phone || null,
+      buyer_name: userName,
+      buyer_email: userEmail,
+      buyer_phone: payload?.buyer_phone || null,
+    },
+    {
+      id: userId,
+      email: userEmail,
+      name: userName,
+    }
+  );
 
   if (data.numbers.length > Number(draw.max_numbers_per_user || 1)) {
     const err = new Error("Quantidade de números acima do limite permitido.");
