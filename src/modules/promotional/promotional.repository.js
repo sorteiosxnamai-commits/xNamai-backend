@@ -87,6 +87,7 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_provider TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reservation_id UUID NULL`);
@@ -335,7 +336,7 @@ export async function countPromotionalNumbersByContact(draw_id, email, phone, us
     SELECT COALESCE(SUM(cardinality(numbers)), 0)::int AS total
     FROM public.promotional_reservations
     WHERE draw_id = $1
-      AND status IN ('pending', 'paid')
+      AND status IN ('pending', 'reserved', 'paid')
       AND (
         ($4::integer IS NOT NULL AND user_id = $4::integer)
         OR lower(buyer_email) = lower($2)
@@ -404,6 +405,7 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, payme
     UPDATE public.promotional_reservations
     SET payment_id = $3,
         payment_status = 'pending',
+        payment_provider = 'mercadopago',
         updated_at = NOW()
     WHERE id = $1
       AND draw_id = $2

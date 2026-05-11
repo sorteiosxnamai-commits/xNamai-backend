@@ -139,7 +139,7 @@ function mapReservationStatus(status) {
   if (normalized === "expired") return "EXPIRADO";
   if (normalized === "cancelled") return "CANCELADO";
   if (normalized === "sorted") return "SORTEADO";
-  return "ABERTO";
+  return "RESERVADO";
 }
 
 function formatDay(value) {
@@ -242,7 +242,15 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
     throw err;
   }
 
-  if (String(reservation.payment_status || "pending").toLowerCase() !== "pending") {
+  const paymentStatus = String(reservation.payment_status || "pending").toLowerCase();
+  if (paymentStatus === "paid") {
+    const err = new Error("Esta reserva já está paga.");
+    err.status = 400;
+    err.code = "promotional_payment_already_paid";
+    throw err;
+  }
+
+  if (paymentStatus !== "pending") {
     const err = new Error("Esta reserva promocional não está pendente de pagamento.");
     err.status = 400;
     err.code = "promotional_payment_not_pending";
@@ -257,7 +265,15 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
   }
 
   const numbers = Array.isArray(reservation.numbers) ? reservation.numbers.map(Number) : [];
-  const amountCents = numbers.length * Number(reservation.price_cents || 0);
+  const priceCents = Number(reservation.price_cents || 0);
+  if (!Number.isFinite(priceCents) || priceCents <= 0) {
+    const err = new Error("Preço do sorteio promocional inválido.");
+    err.status = 400;
+    err.code = "invalid_promotional_price";
+    throw err;
+  }
+
+  const amountCents = numbers.length * priceCents;
   const description = `Sorteio promocional xNaMai - ${reservation.title || reservation.prize || reservation.draw_id}`;
   const notificationUrl = options.notification_url || undefined;
 
@@ -288,10 +304,12 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
     ok: true,
     payment_id: pix.payment_id,
     reservation_id: reservation.reservation_id,
+    draw_id: Number(reservation.draw_id),
+    amount: pix.amount,
+    amount_cents: amountCents,
     qr_code: pix.qr_code,
     qr_code_base64: pix.qr_code_base64,
     ticket_url: pix.ticket_url,
-    amount: pix.amount,
     payment_status: "pending",
   };
 }

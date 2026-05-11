@@ -187,12 +187,12 @@ router.post("/:drawId/reservations/:reservationId/pix", requireAuth, async (req,
       });
     }
 
-    return res.status(err?.status || 500).json({
+    const status = err?.status && err.status < 500 ? err.status : 500;
+
+    return res.status(status).json({
       ok: false,
-      error: err?.status && err.status < 500
-        ? err.message
-        : "Erro ao gerar PIX promocional.",
-      code: err?.code || "PROMOTIONAL_PIX_ERROR",
+      error: err?.message || "Erro ao gerar PIX promocional.",
+      ...(status >= 500 ? {} : { code: err?.code || "PROMOTIONAL_PIX_ERROR" }),
     });
   }
 });

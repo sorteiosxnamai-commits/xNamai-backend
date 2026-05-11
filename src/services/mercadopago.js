@@ -10,6 +10,7 @@ const MP_BASE =
 function getAccessToken() {
   return (
     process.env.MERCADOPAGO_ACCESS_TOKEN ||
+    process.env.MERCADO_PAGO_ACCESS_TOKEN ||
     process.env.MP_ACCESS_TOKEN ||
     process.env.REACT_APP_MP_ACCESS_TOKEN || // fallback (não recomendado)
     ""
