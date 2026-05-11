@@ -5,8 +5,13 @@
 
 import express from "express";
 import { query as q } from "../db.js"; // ✅ usa o pool já configurado (SSL, etc)
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = express.Router();
+const PAID_STATUS_SQL = "lower(trim(coalesce(status, ''))) IN ('approved','paid','pago')";
+const PAID_STATUS_P_SQL = "lower(trim(coalesce(p.status, ''))) IN ('approved','paid','pago')";
+
+router.use(requireAuth, requireAdmin);
 
 // opcional: rota de ping
 router.get("/ping", (_req, res) => res.json({ ok: true }));
@@ -39,7 +44,7 @@ router.get("/summary/:drawId", async (req, res) => {
               COALESCE(AVG(amount_cents),0) AS avg_ticket_cents,
               COUNT(*) AS paid_orders,
               MAX(paid_at) AS last_paid_at
-       FROM payments WHERE draw_id=$1 AND status='paid'`,
+       FROM payments WHERE draw_id=$1 AND ${PAID_STATUS_SQL}`,
       [drawId]
     ))?.rows?.[0] || { gmv_cents: 0, avg_ticket_cents: 0, paid_orders: 0, last_paid_at: null };
 
@@ -59,7 +64,7 @@ router.get("/summary/:drawId", async (req, res) => {
       `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
               COUNT(*) AS paid
          FROM payments
-        WHERE status='paid' AND paid_at IS NOT NULL AND draw_id=$1
+        WHERE ${PAID_STATUS_SQL} AND paid_at IS NOT NULL AND draw_id=$1
         GROUP BY 1 ORDER BY 1`,
       [drawId]
     ))?.rows ?? [];
@@ -68,7 +73,7 @@ router.get("/summary/:drawId", async (req, res) => {
       `SELECT n.n::int AS n, COUNT(*)::int AS sold_count
          FROM numbers n
          JOIN reservations r ON r.id=n.reservation_id AND r.status='captured'
-         JOIN payments p ON p.id=r.payment_id AND p.status='paid'
+         JOIN payments p ON p.id=r.payment_id AND ${PAID_STATUS_P_SQL}
         WHERE n.status='sold' AND n.draw_id=$1
         GROUP BY n.n
         ORDER BY n.n`,
@@ -136,7 +141,7 @@ router.get("/draws-summary", async (_req, res) => {
                 AVG(amount_cents) AS avg_ticket_cents,
                 COUNT(*)          AS paid_orders
            FROM payments
-          WHERE status='paid'
+          WHERE ${PAID_STATUS_SQL}
           GROUP BY draw_id
        )
        SELECT d.id, d.status, d.opened_at, d.closed_at, d.realized_at, d.product_name,
@@ -228,7 +233,7 @@ router.get("/rfm", async (req, res) => {
     const { rows } = await q(
       `WITH paid AS (
          SELECT user_id, SUM(amount_cents) AS m, COUNT(*) AS f, MAX(paid_at) AS last_paid
-           FROM payments WHERE status='paid' GROUP BY user_id
+           FROM payments WHERE ${PAID_STATUS_SQL} GROUP BY user_id
        )
        SELECT u.id, u.name, u.email, u.phone,
               p.f::int AS freq,
@@ -268,7 +273,7 @@ router.get("/cohorts", async (_req, res) => {
       `WITH first_paid AS (
          SELECT user_id, MIN(paid_at) AS first_paid_at
            FROM payments
-          WHERE status='paid'
+          WHERE ${PAID_STATUS_SQL}
           GROUP BY user_id
        ),
        cohort AS (
@@ -281,7 +286,7 @@ router.get("/cohorts", async (_req, res) => {
               SUM(p.amount_cents) AS gmv_cents
          FROM payments p
          JOIN cohort c ON c.user_id=p.user_id
-        WHERE p.status='paid'
+        WHERE ${PAID_STATUS_P_SQL}
         GROUP BY 1,2
         ORDER BY 1 DESC, 2`
     );
@@ -303,7 +308,7 @@ router.get("/numbers/soldcount/:drawId", async (req, res) => {
       `SELECT n.n::int AS n, COUNT(*)::int AS sold_count
          FROM numbers n
          JOIN reservations r ON r.id=n.reservation_id AND r.status='captured'
-         JOIN payments p ON p.id=r.payment_id AND p.status='paid'
+         JOIN payments p ON p.id=r.payment_id AND ${PAID_STATUS_P_SQL}
         WHERE n.status='sold' AND n.draw_id=$1
         GROUP BY n.n
         ORDER BY n.n`,
@@ -323,7 +328,7 @@ router.get("/numbers/favorites-by-user", async (_req, res) => {
          FROM payments p
          JOIN users u ON u.id=p.user_id
          JOIN LATERAL unnest(p.numbers) AS x(n) ON true
-        WHERE p.status='paid'
+        WHERE ${PAID_STATUS_P_SQL}
         GROUP BY u.id, u.name, x.n
         ORDER BY times_bought DESC, u.id ASC, x.n ASC`
     );
@@ -344,12 +349,12 @@ router.get("/coupons/efficacy", async (_req, res) => {
          SELECT p.*, u.coupon_code, u.coupon_value_cents, u.coupon_updated_at
            FROM payments p
            JOIN users u ON u.id=p.user_id
-          WHERE p.status IN ('paid','expired','pending','processing')
+          WHERE lower(trim(coalesce(p.status, ''))) IN ('approved','paid','pago','expired','pending','processing')
        )
        SELECT coupon_code,
-              COUNT(*) FILTER (WHERE status='paid')::float / NULLIF(COUNT(*),0) AS pay_rate,
-              SUM(amount_cents) FILTER (WHERE status='paid') AS gmv_cents,
-              AVG(amount_cents) FILTER (WHERE status='paid') AS avg_ticket_cents,
+              COUNT(*) FILTER (WHERE ${PAID_STATUS_SQL})::float / NULLIF(COUNT(*),0) AS pay_rate,
+              SUM(amount_cents) FILTER (WHERE ${PAID_STATUS_SQL}) AS gmv_cents,
+              AVG(amount_cents) FILTER (WHERE ${PAID_STATUS_SQL}) AS avg_ticket_cents,
               AVG(coupon_value_cents) AS avg_coupon_cents
          FROM enriched
         GROUP BY coupon_code
@@ -397,7 +402,7 @@ router.get("/payments/hourly", async (req, res) => {
   const drawId = req.query.drawId ? Number(req.query.drawId) : null;
   try {
     const params = [];
-    let filter = `WHERE status='paid' AND paid_at IS NOT NULL`;
+    let filter = `WHERE ${PAID_STATUS_SQL} AND paid_at IS NOT NULL`;
     if (Number.isFinite(drawId)) {
       filter += ` AND draw_id=$1`;
       params.push(drawId);
@@ -422,7 +427,7 @@ router.get("/payments/latency", async (req, res) => {
   const drawId = req.query.drawId ? Number(req.query.drawId) : null;
   try {
     const params = [days];
-    let filter = `WHERE p.status='paid' AND p.paid_at >= now() - ($1 || ' days')::interval`;
+    let filter = `WHERE ${PAID_STATUS_P_SQL} AND p.paid_at >= now() - ($1 || ' days')::interval`;
     if (Number.isFinite(drawId)) {
       filter += ` AND p.draw_id=$2`;
       params.push(drawId);
@@ -495,7 +500,7 @@ router.get("/kpis/overview", async (_req, res) => {
       `WITH paid AS (
          SELECT user_id, amount_cents
          FROM payments
-         WHERE status='paid'
+         WHERE ${PAID_STATUS_SQL}
        )
        SELECT
          COALESCE(SUM(amount_cents),0)::bigint                 AS total_gmv_cents,
@@ -510,7 +515,7 @@ router.get("/kpis/overview", async (_req, res) => {
       `WITH agg AS (
          SELECT user_id, COUNT(*) AS f
          FROM payments
-         WHERE status='paid'
+         WHERE ${PAID_STATUS_SQL}
          GROUP BY user_id
        )
        SELECT COALESCE(AVG(f),0)::float AS avg_orders_per_buyer
@@ -523,7 +528,7 @@ router.get("/kpis/overview", async (_req, res) => {
               SUM(amount_cents)::bigint  AS gmv_cents,
               COUNT(*)::int              AS orders
          FROM payments
-        WHERE status='paid' AND paid_at >= now() - interval '30 days'
+        WHERE ${PAID_STATUS_SQL} AND paid_at >= now() - interval '30 days'
         GROUP BY 1 ORDER BY 1`
     ))?.rows ?? [];
 
@@ -532,7 +537,7 @@ router.get("/kpis/overview", async (_req, res) => {
       `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
               COUNT(*)::int AS paid
          FROM payments
-        WHERE status='paid' AND paid_at IS NOT NULL
+        WHERE ${PAID_STATUS_SQL} AND paid_at IS NOT NULL
         GROUP BY 1 ORDER BY 1`
     ))?.rows ?? [];
 
@@ -543,7 +548,7 @@ router.get("/kpis/overview", async (_req, res) => {
               COUNT(*)::int               AS orders
          FROM payments p
          JOIN users u ON u.id=p.user_id
-        WHERE p.status='paid'
+        WHERE ${PAID_STATUS_P_SQL}
         GROUP BY u.id, u.name, u.email
         ORDER BY gmv_cents DESC
         LIMIT 20`
@@ -555,7 +560,7 @@ router.get("/kpis/overview", async (_req, res) => {
               COALESCE(SUM(p.amount_cents),0)::bigint AS gmv_cents,
               COUNT(p.*)::int                         AS paid_orders
          FROM draws d
-         LEFT JOIN payments p ON p.draw_id=d.id AND p.status='paid'
+         LEFT JOIN payments p ON p.draw_id=d.id AND ${PAID_STATUS_P_SQL}
         GROUP BY d.id, d.product_name, d.status
         ORDER BY gmv_cents DESC
         LIMIT 20`
@@ -569,7 +574,7 @@ router.get("/kpis/overview", async (_req, res) => {
          percentile_disc(0.75) WITHIN GROUP (ORDER BY amount_cents)::bigint AS p75,
          percentile_disc(0.90) WITHIN GROUP (ORDER BY amount_cents)::bigint AS p90
        FROM payments
-       WHERE status='paid'`
+       WHERE ${PAID_STATUS_SQL}`
     ))?.rows?.[0] || { p25: 0, p50: 0, p75: 0, p90: 0 };
 
     res.json({
@@ -601,7 +606,7 @@ router.get("/sales/daily", async (req, res) => {
               SUM(amount_cents)::bigint  AS gmv_cents,
               COUNT(*)::int              AS orders
          FROM payments
-        WHERE status='paid' AND paid_at >= now() - ($1 || ' days')::interval
+        WHERE ${PAID_STATUS_SQL} AND paid_at >= now() - ($1 || ' days')::interval
         GROUP BY 1 ORDER BY 1`,
       [days]
     ))?.rows ?? [];
@@ -622,7 +627,7 @@ router.get("/buyers/top", async (req, res) => {
               COUNT(*)::int               AS orders
          FROM payments p
          JOIN users u ON u.id=p.user_id
-        WHERE p.status='paid'
+        WHERE ${PAID_STATUS_P_SQL}
         GROUP BY u.id, u.name, u.email, u.phone
         ORDER BY gmv_cents DESC
         LIMIT $1`,
@@ -649,7 +654,7 @@ router.get("/draws/leaderboard", async (req, res) => {
                 SUM(amount_cents) AS gmv_cents,
                 AVG(amount_cents) AS avg_ticket_cents,
                 COUNT(*)          AS paid_orders
-         FROM payments WHERE status='paid' GROUP BY draw_id
+         FROM payments WHERE ${PAID_STATUS_SQL} GROUP BY draw_id
        )
        SELECT d.id, d.product_name, d.status,
               COALESCE(sc.sold,0) AS sold,
@@ -671,17 +676,17 @@ router.get("/draws/leaderboard", async (req, res) => {
 });
 
 // --- OVERVIEW GERAL (todos os sorteios) -------------------------------------
-router.get("/overview", async (req, res) => {
+async function handleOverview(req, res) {
   const days = Math.min(Number(req.query.days) || 30, 365);
 
   try {
     // Totais por status
     const totalsRow = (await q(
       `SELECT
-         COALESCE(SUM(CASE WHEN status='paid' THEN amount_cents END),0)         AS gmv_paid_cents,
-         COUNT(*) FILTER (WHERE status='paid')                                  AS orders_paid,
-         COALESCE(AVG(amount_cents) FILTER (WHERE status='paid'),0)             AS avg_ticket_paid_cents,
-         COUNT(DISTINCT user_id) FILTER (WHERE status='paid')                   AS unique_buyers_paid,
+         COALESCE(SUM(CASE WHEN ${PAID_STATUS_SQL} THEN amount_cents END),0)    AS gmv_paid_cents,
+         COUNT(*) FILTER (WHERE ${PAID_STATUS_SQL})                             AS orders_paid,
+         COALESCE(AVG(amount_cents) FILTER (WHERE ${PAID_STATUS_SQL}),0)        AS avg_ticket_paid_cents,
+         COUNT(DISTINCT user_id) FILTER (WHERE ${PAID_STATUS_SQL})              AS unique_buyers_paid,
          COALESCE(SUM(CASE WHEN status IN ('pending','processing') THEN amount_cents END),0) AS gmv_intent_cents,
          COUNT(*) FILTER (WHERE status IN ('pending','processing'))             AS orders_intent,
          COALESCE(SUM(CASE WHEN status='expired' THEN amount_cents END),0)      AS gmv_expired_cents,
@@ -696,7 +701,7 @@ router.get("/overview", async (req, res) => {
       `WITH agg AS (
          SELECT user_id, COUNT(*) AS c
            FROM payments
-          WHERE status='paid'
+          WHERE ${PAID_STATUS_SQL}
           GROUP BY user_id
        ) SELECT COALESCE(AVG(c),0) AS avg_orders FROM agg`
     ))?.rows?.[0]?.avg_orders || 0;
@@ -709,7 +714,7 @@ router.get("/overview", async (req, res) => {
          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY amount_cents) AS p75,
          PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY amount_cents) AS p90
        FROM payments
-       WHERE status='paid'`
+       WHERE ${PAID_STATUS_SQL}`
     ))?.rows?.[0] || { p25: 0, p50: 0, p75: 0, p90: 0 };
 
     // séries últimas N days (paid/intent/expired)
@@ -720,10 +725,10 @@ router.get("/overview", async (req, res) => {
           WHERE created_at >= now() - ($1 || ' days')::interval
        )
        SELECT day,
-              SUM(amount_cents) FILTER (WHERE status='paid')                      AS gmv_paid_cents,
+              SUM(amount_cents) FILTER (WHERE ${PAID_STATUS_SQL})                 AS gmv_paid_cents,
               SUM(amount_cents) FILTER (WHERE status IN ('pending','processing')) AS gmv_intent_cents,
               SUM(amount_cents) FILTER (WHERE status='expired')                   AS gmv_expired_cents,
-              COUNT(*)        FILTER (WHERE status='paid')                        AS orders_paid,
+              COUNT(*)        FILTER (WHERE ${PAID_STATUS_SQL})                   AS orders_paid,
               COUNT(*)        FILTER (WHERE status IN ('pending','processing'))   AS orders_intent,
               COUNT(*)        FILTER (WHERE status='expired')                     AS orders_expired
          FROM base
@@ -737,7 +742,7 @@ router.get("/overview", async (req, res) => {
       `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
               COUNT(*) AS paid
          FROM payments
-        WHERE status='paid'
+        WHERE ${PAID_STATUS_SQL}
           AND paid_at >= now() - interval '90 days'
           AND paid_at IS NOT NULL
         GROUP BY 1 ORDER BY 1`
@@ -750,7 +755,7 @@ router.get("/overview", async (req, res) => {
               AVG(p.amount_cents) AS avg_ticket_cents
          FROM payments p
          JOIN users u ON u.id=p.user_id
-        WHERE p.status='paid'
+        WHERE ${PAID_STATUS_P_SQL}
         GROUP BY u.id, u.name, u.email
         ORDER BY gmv_cents DESC NULLS LAST
         LIMIT 20`
@@ -782,17 +787,9 @@ router.get("/overview", async (req, res) => {
     console.error("[analytics/overview]", e);
     res.status(500).json({ error: "Falha ao obter overview" });
   }
-});
+}
 
-// alias simples se seu front já chama /stats
-router.get("/stats", async (req, res) => {
-  try {
-    const o = await (await fetch(req.protocol + "://" + req.get("host") + `/api/admin/analytics/overview${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`)).json();
-    res.json(o);
-  } catch (e) {
-    console.error("[analytics/stats alias]", e);
-    res.status(500).json({ error: "Falha ao obter stats" });
-  }
-});
+router.get("/overview", handleOverview);
+router.get("/stats", handleOverview);
 
 export default router;

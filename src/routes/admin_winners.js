@@ -48,7 +48,7 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
       };
     });
 
-    return res.json({ winners });
+    return res.json({ ok: true, winners, data: winners });
   } catch (e) {
     console.error("[admin/winners] error:", e);
     return res.status(500).json({ error: "list_failed" });

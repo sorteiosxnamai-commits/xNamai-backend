@@ -3,8 +3,11 @@
 
 import express from "express";
 import { query, getPool } from "../db.js";
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = express.Router();
+
+router.use(requireAuth, requireAdmin);
 
 /* =============== helpers =============== */
 
@@ -27,17 +30,19 @@ const toInt = (v, def = 0) => {
 
 // Normaliza "numbers": aceita array ou CSV e retorna int[] 0..99 (mantém 00 como 0)
 function parseNumbers(input) {
+  const normalize = (values) => [...new Set(values)];
+
   if (Array.isArray(input)) {
-    return input
+    return normalize(input
       .map((n) => Number(n))
-      .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99);
+      .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99));
   }
   const s = String(input || "");
   if (!s) return [];
-  return s
+  return normalize(s
     .split(/[,\s;]+/).map((t) => t.trim()).filter(Boolean)
     .map((t) => Number(t))
-    .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99);
+    .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99));
 }
 
 /* =============== LISTAR (com busca/paginação) =============== */
@@ -235,7 +240,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
     const user_id = Number(req.params.id);
     const draw_id = Number(req.body?.draw_id);
     const numbers = parseNumbers(req.body?.numbers);
-    const amount_cents = Number.isFinite(+req.body?.amount_cents)
+    let amount_cents = Number.isFinite(+req.body?.amount_cents)
       ? Math.max(0, +req.body.amount_cents)
       : 0;
 
@@ -253,10 +258,51 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
     }
 
     // garante sorteio existente
-    const d = await client.query("SELECT id FROM public.draws WHERE id = $1", [draw_id]);
+    const d = await client.query(
+      "SELECT id, COALESCE(ticket_price_cents, 5500)::int AS ticket_price_cents FROM public.draws WHERE id = $1",
+      [draw_id]
+    );
     if (!d.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "draw_not_found" });
+    }
+
+    if (amount_cents <= 0) {
+      amount_cents = numbers.length * Number(d.rows[0].ticket_price_cents || 5500);
+    }
+
+    await client.query(
+      `INSERT INTO public.numbers (draw_id, n, status)
+       SELECT $1, x.n, 'available'
+         FROM unnest($2::int4[]) AS x(n)
+        WHERE NOT EXISTS (
+          SELECT 1
+            FROM public.numbers n
+           WHERE n.draw_id = $1
+             AND n.n = x.n
+        )`,
+      [draw_id, numbers]
+    );
+
+    const numberConf = await client.query(
+      `SELECT n::int, status
+         FROM public.numbers
+        WHERE draw_id = $1
+          AND n = ANY ($2::int4[])
+          AND lower(trim(coalesce(status, ''))) IN (
+            'sold','paid','approved','pago','vendido','aprovado',
+            'reserved','pending','reservado','pendente'
+          )
+        ORDER BY n`,
+      [draw_id, numbers]
+    );
+    if (numberConf.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "numbers_taken",
+        where: "numbers",
+        conflicts: numberConf.rows.map((r) => Number(r.n)),
+      });
     }
 
     // conflitos em payments aprovados
@@ -266,7 +312,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
            SELECT unnest(p.numbers) AS n
            FROM public.payments p
            WHERE p.draw_id = $1
-             AND LOWER(p.status) IN ('approved','paid','pago')
+             AND lower(trim(coalesce(p.status, ''))) IN ('approved','paid','pago')
              AND p.numbers && $2::int4[]
          ) s
          WHERE n = ANY ($2::int4[])`,
@@ -288,7 +334,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
            SELECT unnest(r.numbers) AS n
            FROM public.reservations r
            WHERE r.draw_id = $1
-             AND LOWER(r.status) IN ('active','pending','paid')
+             AND lower(trim(coalesce(r.status, ''))) IN ('active','pending','paid','approved','pago')
              AND r.numbers && $2::int4[]
          ) x
          WHERE n = ANY ($2::int4[])`,
@@ -324,10 +370,24 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
       [user_id, draw_id, numbers]
     );
 
+    await client.query(
+      `UPDATE public.numbers
+          SET status = 'sold',
+              user_id = $3,
+              payment_id = $4,
+              reservation_id = $5,
+              purchased_at = NOW()
+        WHERE draw_id = $1
+          AND n = ANY ($2::int4[])`,
+      [draw_id, numbers, user_id, pay.rows[0].id, resv.rows[0]?.id || null]
+    );
+
     await client.query("COMMIT");
     res.status(201).json({
+      ok: true,
       payment: pay.rows[0],
       reservation_id: resv.rows[0]?.id || null,
+      numbers,
     });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}

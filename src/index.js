@@ -142,6 +142,8 @@ app.use("/api/config", configRouter);           // GET: preço, banner, max_sele
 app.use("/api/admin/config", adminConfigRouter);
 
 app.use("/api/admin/analytics", adminAnalyticsRouter);
+app.use("/api/admin/users", adminUsersRouter);
+app.use("/api/admin/autopay", autopayRunnerRoute);
 
 // ── Router ADMIN genérico (DEIXAR POR ÚLTIMO) ──────────────
 app.use("/api/admin", adminRoutes);
@@ -156,14 +158,10 @@ app.use("/api/coupons", couponsRouter);
 app.use("/tray", trayRouter);       // /tray/callback/auth
 app.use("/api/tray", trayRouter);   // /api/tray/health
 
-app.use("/api/admin/users", adminUsersRouter);
-
 app.use("/api", autopayRouter);
 app.use("/api/autopay", autopayVindiRouter);
 
 app.use("/api/me/draws", meDraws);
-
-app.use("/api/admin/autopay", autopayRunnerRoute);
 
 app.use("/api/mercadopago", mercadoPagoRouter);
 app.use("/api/payments/mercadopago", mercadoPagoRouter);

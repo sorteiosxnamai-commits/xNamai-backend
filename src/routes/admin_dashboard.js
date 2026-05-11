@@ -1,28 +1,11 @@
 // src/routes/admin_dashboard.js
 import express from "express";
 import { getPool, query } from "../db/pg.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = express.Router();
 
-router.use(requireAuth);
-
-async function requireAdminDb(req, res, next) {
-  try {
-    const userId = req?.user?.id;
-    if (!userId) return res.status(401).json({ error: "unauthorized" });
-    const r = await query("SELECT is_admin FROM users WHERE id = $1", [userId]);
-    if (!r.rows.length || !r.rows[0].is_admin) {
-      return res.status(403).json({ error: "forbidden" });
-    }
-    return next();
-  } catch (e) {
-    console.error("[admin.dashboard] admin check", e);
-    return res.status(500).json({ error: "admin_check_failed" });
-  }
-}
-
-router.use(requireAdminDb);
+router.use(requireAuth, requireAdmin);
 
 const OPEN_STATUSES = ["open", "active", "aberto", "ativo"];
 const SOLD_STATUSES = ["paid", "sold", "approved", "pago", "vendido", "aprovado"];
@@ -171,10 +154,26 @@ async function handleSummary(_req, res) {
   try {
     const config = await getConfigObject();
     const draw = await getActiveDraw();
+    const priceCents = toInt(config.ticket_price_cents ?? config.price_cents, 5500);
+    const maxNumbers = toInt(
+      config.max_numbers_per_selection ?? config.max_numbers_per_user,
+      5
+    );
+    const promoText = String(config.promo_text || config.banner_title || "");
+    const bannerTitle = String(config.banner_title || config.promo_text || "");
 
     if (!draw) {
       return res.json({
         ok: true,
+        draw_id: null,
+        sold: 0,
+        remaining: 0,
+        price_cents: priceCents,
+        ticket_price_cents: priceCents,
+        max_numbers_per_selection: maxNumbers,
+        max_numbers_per_user: maxNumbers,
+        promo_text: promoText,
+        banner_title: bannerTitle,
         draw: null,
         current_draw: null,
         currentDraw: null,
@@ -204,6 +203,15 @@ async function handleSummary(_req, res) {
 
     return res.json({
       ok: true,
+      draw_id: normalizedDraw.id,
+      sold,
+      remaining,
+      price_cents: normalizedDraw.ticket_price_cents,
+      ticket_price_cents: normalizedDraw.ticket_price_cents,
+      max_numbers_per_selection: config.max_numbers_per_selection,
+      max_numbers_per_user: normalizedDraw.max_numbers_per_user,
+      promo_text: normalizedDraw.promo_text || promoText,
+      banner_title: normalizedDraw.banner_title || bannerTitle,
       draw: normalizedDraw,
       current_draw: normalizedDraw,
       currentDraw: normalizedDraw,
@@ -231,18 +239,22 @@ router.patch("/config", async (req, res) => {
 
   try {
     await ensureAdminSchema();
+    const currentConfig = await getConfigObject();
 
     const ticketPriceCents = toCents(
       req.body.ticket_price_cents ?? req.body.price_cents ?? req.body.pix_price,
-      5500
+      currentConfig.ticket_price_cents
     );
 
     const maxNumbers = toInt(
       req.body.max_numbers_per_selection ?? req.body.max_numbers_per_user,
-      5
+      currentConfig.max_numbers_per_selection
     );
 
-    const promoText = normalizeText(req.body.promo_text ?? req.body.banner_title, "");
+    const promoText = normalizeText(
+      req.body.promo_text ?? req.body.banner_title,
+      currentConfig.promo_text || currentConfig.banner_title || ""
+    );
 
     await client.query("BEGIN");
 
@@ -293,17 +305,21 @@ router.post("/new", async (req, res) => {
 
   try {
     await ensureAdminSchema();
+    const currentConfig = await getConfigObject();
 
     const title = normalizeText(req.body.title, "");
     const prizeTitle = normalizeText(req.body.prize_title ?? req.body.prizeTitle, "");
-    const promoText = normalizeText(req.body.promo_text ?? req.body.banner_title, "");
+    const promoText = normalizeText(
+      req.body.promo_text ?? req.body.banner_title,
+      currentConfig.promo_text || currentConfig.banner_title || ""
+    );
     const ticketPriceCents = toCents(
       req.body.ticket_price_cents ?? req.body.price_cents ?? req.body.pix_price,
-      5500
+      currentConfig.ticket_price_cents
     );
     const maxNumbers = toInt(
       req.body.max_numbers_per_selection ?? req.body.max_numbers_per_user,
-      5
+      currentConfig.max_numbers_per_selection
     );
 
     const finalTitle = title || prizeTitle || `Sorteio ${new Date().toLocaleDateString("pt-BR")}`;
@@ -365,6 +381,7 @@ router.post("/new", async (req, res) => {
     return res.status(201).json({
       ok: true,
       message: "Sorteio criado com sucesso.",
+      draw_id: draw.id,
       draw: {
         ...draw,
         total_numbers: 100,

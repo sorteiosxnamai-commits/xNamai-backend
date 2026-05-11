@@ -1,5 +1,6 @@
 // src/middleware/auth.js
 import jwt from 'jsonwebtoken';
+import { query } from '../db.js';
 
 
 const JWT_SECRET =
@@ -68,12 +69,36 @@ export function requireAuth(req, res, next) {
   }
 }
 
-export function requireAdmin(req, res, next) {
-  const u = req.user;
-  if (!u || !(u.role === 'admin' || u.is_admin === true)) {
+export async function requireAdmin(req, res, next) {
+  try {
+    const u = req.user;
+    if (!u?.id) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    if (u.role === 'admin' || u.is_admin === true) {
+      return next();
+    }
+
+    const r = await query(
+      'SELECT is_admin FROM public.users WHERE id = $1 LIMIT 1',
+      [u.id]
+    );
+
+    if (!r.rows.length || r.rows[0].is_admin !== true) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    req.user = {
+      ...u,
+      is_admin: true,
+    };
+
+    return next();
+  } catch (e) {
+    console.error('[auth] admin check failed:', e?.message || e);
     return res.status(403).json({ error: 'forbidden' });
   }
-  return next();
 }
 
 

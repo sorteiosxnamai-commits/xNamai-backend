@@ -1,28 +1,11 @@
 // src/routes/admin_draws.js
 import express from "express";
 import { getPool, query } from "../db/pg.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = express.Router();
 
-router.use(requireAuth);
-
-async function requireAdminDb(req, res, next) {
-  try {
-    const userId = req?.user?.id;
-    if (!userId) return res.status(401).json({ error: "unauthorized" });
-    const r = await query("SELECT is_admin FROM users WHERE id = $1", [userId]);
-    if (!r.rows.length || !r.rows[0].is_admin) {
-      return res.status(403).json({ error: "forbidden" });
-    }
-    return next();
-  } catch (e) {
-    console.error("[admin.draws] admin check", e);
-    return res.status(500).json({ error: "admin_check_failed" });
-  }
-}
-
-router.use(requireAdminDb);
+router.use(requireAuth, requireAdmin);
 
 let schemaReady = false;
 
@@ -334,6 +317,7 @@ router.get("/history", async (req, res) => {
     return res.json({
       ok: true,
       draws,
+      history: draws,
     });
   } catch (err) {
     console.error("[admin.draws.history]", err);
@@ -345,7 +329,7 @@ router.get("/history", async (req, res) => {
   }
 });
 
-router.get("/:id/buyers", async (req, res) => {
+async function handleDrawBuyers(req, res) {
   try {
     await ensureAdminSchemaCompat();
 
@@ -364,20 +348,23 @@ router.get("/:id/buyers", async (req, res) => {
         COALESCE(u.id, 0) AS user_id,
         COALESCE(u.name, 'Sem usuário') AS name,
         COALESCE(u.email, '') AS email,
+        COALESCE(u.phone, '') AS phone,
         COUNT(*)::int AS qtd,
+        COUNT(*)::int AS quantity,
         COALESCE(
           json_agg(LPAD(num.n::text, 2, '0') ORDER BY num.n)
           FILTER (WHERE num.n IS NOT NULL),
           '[]'::json
         ) AS numbers,
-        (COUNT(*)::int * COALESCE(d.ticket_price_cents, 5500))::int AS value_cents
+        (COUNT(*)::int * COALESCE(d.ticket_price_cents, 5500))::int AS value_cents,
+        (COUNT(*)::int * COALESCE(d.ticket_price_cents, 5500))::int AS amount_cents
       FROM payments p
       JOIN draws d ON d.id = p.draw_id
       JOIN users u ON u.id = p.user_id
       CROSS JOIN LATERAL unnest(p.numbers) AS num(n)
       WHERE p.draw_id = $1
         AND lower(trim(coalesce(p.status, ''))) = ANY($2)
-      GROUP BY u.id, u.name, u.email, d.ticket_price_cents
+      GROUP BY u.id, u.name, u.email, u.phone, d.ticket_price_cents
       ORDER BY qtd DESC, name ASC
       `,
       [drawId, PAID_PAYMENT_STATUSES]
@@ -386,6 +373,8 @@ router.get("/:id/buyers", async (req, res) => {
     return res.json({
       ok: true,
       buyers: rows,
+      participants: rows,
+      players: rows,
     });
   } catch (err) {
     console.error("[admin.draws.buyers]", err);
@@ -395,7 +384,11 @@ router.get("/:id/buyers", async (req, res) => {
       message: err.message,
     });
   }
-});
+}
+
+router.get("/:id/buyers", handleDrawBuyers);
+router.get("/:id/participants", handleDrawBuyers);
+router.get("/:id/players", handleDrawBuyers);
 
 router.get("/:id/numbers", async (req, res) => {
   try {

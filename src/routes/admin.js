@@ -1,22 +1,9 @@
 import { Router } from 'express';
 import { query } from '../db.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireAdmin } from '../middleware/auth.js';
 import { getTicketPriceCents } from '../services/config.js';
 
 const router = Router();
-
-async function requireAdmin(req, res, next) {
-  try {
-    const userId = req.user.id;
-    const r = await query('select is_admin from users where id=$1', [userId]);
-    if (!r.rows.length || !r.rows[0].is_admin) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-    return next();
-  } catch (e) {
-    return res.status(500).json({ error: 'admin_check_failed' });
-  }
-}
 
 router.get('/reservations', requireAuth, requireAdmin, async (req, res) => {
   try {
