@@ -7,6 +7,8 @@ function dbQuery(client, text, params = []) {
 }
 
 export async function ensurePromotionalSchema(client = null) {
+  await dbQuery(client, `CREATE EXTENSION IF NOT EXISTS pgcrypto`);
+
   await dbQuery(client, `
     CREATE TABLE IF NOT EXISTS public.promotional_draws (
       id BIGSERIAL PRIMARY KEY,
@@ -21,6 +23,7 @@ export async function ensurePromotionalSchema(client = null) {
       banner_url TEXT,
       starts_at TIMESTAMPTZ,
       ends_at TIMESTAMPTZ,
+      archived_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
@@ -45,6 +48,7 @@ export async function ensurePromotionalSchema(client = null) {
       payment_id TEXT,
       pix_qr_code TEXT,
       pix_qr_code_base64 TEXT,
+      pix_copy_paste TEXT,
       pix_ticket_url TEXT,
       paid_at TIMESTAMPTZ,
       expires_at TIMESTAMPTZ,
@@ -58,6 +62,7 @@ export async function ensurePromotionalSchema(client = null) {
       id BIGSERIAL PRIMARY KEY,
       draw_id BIGINT NOT NULL REFERENCES public.promotional_draws(id) ON DELETE CASCADE,
       n INTEGER NOT NULL,
+      number_value INTEGER,
       label TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'available',
       user_id INTEGER,
@@ -79,7 +84,7 @@ export async function ensurePromotionalSchema(client = null) {
     ON public.promotional_draws(status)
   `);
   await dbQuery(client, `
-    CREATE UNIQUE INDEX IF NOT EXISTS promotional_numbers_draw_n_uq
+    CREATE INDEX IF NOT EXISTS promotional_numbers_draw_n_idx
     ON public.promotional_numbers(draw_id, n)
   `);
   await dbQuery(client, `
@@ -113,6 +118,14 @@ export async function ensurePromotionalSchema(client = null) {
   `);
 
   await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS banner_url TEXT`);
+  await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''`);
+  await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS prize TEXT DEFAULT ''`);
+  await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'draft'`);
+  await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS price_cents INTEGER NOT NULL DEFAULT 0`);
+  await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS number_start INTEGER DEFAULT 0`);
+  await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS number_end INTEGER DEFAULT 99`);
+  await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+  await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
@@ -123,10 +136,48 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'public'`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_ticket_url TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ALTER COLUMN id SET DEFAULT gen_random_uuid()`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
-  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reservation_id UUID NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS n INTEGER NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS number_value INTEGER NULL`);
+  await dbQuery(client, `UPDATE public.promotional_numbers SET n = number_value WHERE n IS NULL AND number_value IS NOT NULL`);
+  await dbQuery(client, `UPDATE public.promotional_numbers SET number_value = n WHERE number_value IS NULL AND n IS NOT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS label TEXT`);
+  await dbQuery(client, `UPDATE public.promotional_numbers SET label = COALESCE(label, number_value::text, n::text) WHERE label IS NULL`);
+  await dbQuery(client, `
+    DO $$
+    DECLARE
+      reservation_type text;
+    BEGIN
+      SELECT udt_name
+        INTO reservation_type
+        FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'promotional_numbers'
+         AND column_name = 'reservation_id';
+
+      IF reservation_type IS NULL THEN
+        ALTER TABLE public.promotional_numbers ADD COLUMN reservation_id UUID NULL;
+      ELSIF reservation_type <> 'uuid' THEN
+        BEGIN
+          ALTER TABLE public.promotional_numbers DROP CONSTRAINT IF EXISTS promotional_numbers_reservation_id_fkey;
+        EXCEPTION WHEN OTHERS THEN
+          NULL;
+        END;
+
+        ALTER TABLE public.promotional_numbers
+          ALTER COLUMN reservation_id TYPE UUID
+          USING CASE
+            WHEN reservation_id::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              THEN reservation_id::text::uuid
+            ELSE NULL
+          END;
+      END IF;
+    END $$;
+  `);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_name TEXT NULL`);
@@ -154,6 +205,10 @@ export async function ensurePromotionalSchema(client = null) {
     ON public.promotional_numbers(payment_id)
   `);
   await dbQuery(client, `
+    CREATE INDEX IF NOT EXISTS promotional_numbers_draw_number_value_idx
+    ON public.promotional_numbers(draw_id, number_value)
+  `);
+  await dbQuery(client, `
     CREATE INDEX IF NOT EXISTS promotional_payments_payment_id_idx
     ON public.promotional_payments(payment_id)
   `);
@@ -178,21 +233,25 @@ function drawSelect() {
 }
 
 function normalizeNumberRow(row) {
+  const value = row.n ?? row.number_value;
   return {
     ...row,
-    n: Number(row.n),
-    label: row.label || formatPromotionalNumber(row.n),
+    n: Number(value),
+    number_value: Number(value),
+    label: row.label || formatPromotionalNumber(value),
     available: row.status === "available",
   };
 }
 
 function mapAdminNumberRow(row) {
   if (!row) return null;
+  const value = row.n ?? row.number_value;
   return {
     id: Number(row.id),
     draw_id: Number(row.draw_id),
-    n: Number(row.n),
-    label: row.label || formatPromotionalNumber(row.n),
+    n: Number(value),
+    number_value: Number(value),
+    label: row.label || formatPromotionalNumber(value),
     status: row.status,
     user_id: row.user_id != null ? Number(row.user_id) : null,
     reservation_id: row.reservation_id != null ? String(row.reservation_id) : null,
@@ -259,7 +318,8 @@ export async function getPromotionalNumbersAdmin(draw_id, client = null) {
     SELECT
       id,
       draw_id,
-      n,
+      COALESCE(n, number_value) AS n,
+      COALESCE(number_value, n) AS number_value,
       label,
       status,
       user_id,
@@ -363,7 +423,7 @@ export async function createPromotionalNumbers(draw_id, number_start, number_end
   const rows = [];
 
   for (let n = number_start; n <= number_end; n += 1) {
-    rows.push([draw_id, n, formatPromotionalNumber(n), "available"]);
+    rows.push([draw_id, n, n, formatPromotionalNumber(n), "available"]);
   }
 
   if (!rows.length) return [];
@@ -371,15 +431,24 @@ export async function createPromotionalNumbers(draw_id, number_start, number_end
   const values = [];
   const params = [];
   rows.forEach((row, index) => {
-    const offset = index * 4;
-    values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4})`);
+    const offset = index * 5;
+    values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`);
     params.push(...row);
   });
 
   const { rows: inserted } = await dbQuery(client, `
-    INSERT INTO public.promotional_numbers (draw_id, n, label, status)
-    VALUES ${values.join(", ")}
-    ON CONFLICT (draw_id, n) DO NOTHING
+    WITH input(draw_id, n, number_value, label, status) AS (
+      VALUES ${values.join(", ")}
+    )
+    INSERT INTO public.promotional_numbers (draw_id, n, number_value, label, status)
+    SELECT i.draw_id, i.n, i.number_value, i.label, i.status
+    FROM input i
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM public.promotional_numbers pn
+      WHERE pn.draw_id = i.draw_id
+        AND COALESCE(pn.n, pn.number_value) = i.n
+    )
     RETURNING *
   `, params);
 
@@ -571,6 +640,7 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
         payment_provider = 'mercadopago',
         pix_qr_code = $4,
         pix_qr_code_base64 = $5,
+        pix_copy_paste = $4,
         pix_ticket_url = $6,
         updated_at = NOW()
     WHERE id = $1
@@ -659,18 +729,27 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       const values = payload.numbers.map((n, index) => {
         const offset = index * 2;
         params.push(n, formatPromotionalNumber(n));
-        return `($1, $${offset + 2}, $${offset + 3}, 'available')`;
+        return `($1, $${offset + 2}, $${offset + 2}, $${offset + 3}, 'available')`;
       });
 
       await client.query(`
-        INSERT INTO public.promotional_numbers (draw_id, n, label, status)
-        VALUES ${values.join(", ")}
-        ON CONFLICT (draw_id, n) DO NOTHING
+        WITH input(draw_id, n, number_value, label, status) AS (
+          VALUES ${values.join(", ")}
+        )
+        INSERT INTO public.promotional_numbers (draw_id, n, number_value, label, status)
+        SELECT i.draw_id, i.n, i.number_value, i.label, i.status
+        FROM input i
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM public.promotional_numbers pn
+          WHERE pn.draw_id = i.draw_id
+            AND COALESCE(pn.n, pn.number_value) = i.n
+        )
       `, params);
     }
 
     const locked = await client.query(`
-      SELECT id, n, status
+      SELECT id, n, status, payment_status
       FROM public.promotional_numbers
       WHERE draw_id = $1
         AND n = ANY($2::int[])
@@ -689,7 +768,11 @@ export async function reservePromotionalNumbers(draw_id, payload) {
     }
 
     const unavailable = locked.rows
-      .filter((row) => row.status !== "available")
+      .filter((row) => {
+        const status = String(row.status || "").toLowerCase();
+        const paymentStatus = String(row.payment_status || "").toLowerCase();
+        return status !== "available" || ["paid", "approved", "pago"].includes(paymentStatus);
+      })
       .map((row) => Number(row.n));
     if (unavailable.length) {
       const err = new Error("Um ou mais números já estão reservados.");
@@ -697,6 +780,16 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       err.code = "PROMOTIONAL_NUMBER_ALREADY_RESERVED";
       err.conflicts = unavailable;
       throw err;
+    }
+
+    const selectedNumberIds = [];
+    const selectedByNumber = new Set();
+    for (const row of locked.rows) {
+      const number = Number(row.n);
+      if (!selectedByNumber.has(number)) {
+        selectedByNumber.add(number);
+        selectedNumberIds.push(Number(row.id));
+      }
     }
 
     const reservation = await client.query(`
@@ -741,6 +834,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         UPDATE public.promotional_numbers
         SET
           status = 'reserved',
+          number_value = COALESCE(number_value, n),
           reservation_id = $3,
           user_id = $4,
           buyer_name = $5,
@@ -752,6 +846,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         WHERE draw_id = $1
           AND n = ANY($2::int[])
           AND status = 'available'
+          AND id = ANY($8::bigint[])
       `, [
         draw_id,
         payload.numbers,
@@ -760,6 +855,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         payload.name,
         payload.email,
         payload.phone || null,
+        selectedNumberIds,
       ]);
     } catch (updateErr) {
       console.error("[PROMOTIONAL_RESERVE_NUMBER_UPDATE_ERROR]", {

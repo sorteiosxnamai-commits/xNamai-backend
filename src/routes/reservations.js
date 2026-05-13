@@ -10,6 +10,11 @@ const router = Router();
 
 async function ensureReservationPaymentColumns() {
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL`);
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT`);
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
@@ -103,6 +108,8 @@ router.post('/', requireAuth, async (req, res) => {
     );
     if (!dr.rows.length) return res.status(400).json({ error: 'no_open_draw' });
     const drawId = dr.rows[0].id;
+    const priceCents = await getTicketPriceCents();
+    const amountCents = nums.length * priceCents;
 
     // === INÍCIO TX ===========================================================
     await query('BEGIN');
@@ -218,9 +225,10 @@ router.post('/', requireAuth, async (req, res) => {
         payment_status,
         buyer_name,
         buyer_email,
+        amount_cents,
         expires_at
       )
-       VALUES ($1, $2, $3, $4::int[], 'reserved', 'pending', $5, $6, $7)`,
+       VALUES ($1, $2, $3, $4::int[], 'reserved', 'pending', $5, $6, $7, $8)`,
       [
         reservationId,
         req.user.id,
@@ -228,6 +236,7 @@ router.post('/', requireAuth, async (req, res) => {
         nums,
         req.user?.name || req.user?.nome || req.user?.email || null,
         req.user?.email || null,
+        amountCents,
         expiresAt,
       ]
     );
@@ -262,6 +271,7 @@ router.post('/', requireAuth, async (req, res) => {
         drawId,
         expiresAt,
         numbers: nums,
+        amount_cents: amountCents,
         payment_status: 'pending',
         status: 'reserved',
         can_pay: true,
@@ -374,9 +384,12 @@ router.post('/:reservationId/pix', requireAuth, async (req, res) => {
       `UPDATE reservations
           SET payment_id = $2,
               payment_status = 'pending',
+              pix_qr_code = $3,
+              pix_qr_code_base64 = $4,
+              pix_copy_paste = $3,
               updated_at = NOW()
         WHERE id = $1`,
-      [reservationId, pix.payment_id]
+      [reservationId, pix.payment_id, pix.qr_code || null, pix.qr_code_base64 || null]
     );
 
     return res.json({
@@ -385,6 +398,7 @@ router.post('/:reservationId/pix', requireAuth, async (req, res) => {
       reservation_id: reservationId,
       qr_code: pix.qr_code,
       qr_code_base64: pix.qr_code_base64,
+      copy_paste: pix.qr_code,
       ticket_url: pix.ticket_url,
       amount: pix.amount,
       payment_status: 'pending',

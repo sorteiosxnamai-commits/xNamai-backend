@@ -217,7 +217,11 @@ export async function reserveNumbers(draw_id, payload, user = null) {
   const totalCents = data.numbers.length * priceCents;
 
   if (!Number.isFinite(priceCents) || priceCents <= 0 || totalCents <= 0) {
-    throw httpError(422, "promotional_amount_invalid", "Valor do sorteio promocional inválido.");
+    throw httpError(
+      422,
+      "promotional_amount_invalid",
+      "Valor do sorteio promocional inválido. Configure o valor no painel admin."
+    );
   }
 
   return reservePromotionalNumbers(draw.id, {
@@ -263,7 +267,11 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
   const savedTotalCents = Number(reservation.total_cents || reservation.amount_cents || 0);
   const amountCents = savedTotalCents > 0 ? savedTotalCents : numbers.length * priceCents;
   if (!Number.isFinite(amountCents) || amountCents <= 0) {
-    throw httpError(422, "promotional_amount_invalid", "Valor do sorteio promocional inválido.");
+    throw httpError(
+      422,
+      "promotional_amount_invalid",
+      "Valor do sorteio promocional inválido. Configure o valor no painel admin."
+    );
   }
 
   const description = `Sorteio promocional xNaMai - ${reservation.title || reservation.prize || reservation.draw_id}`;
@@ -294,6 +302,13 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
 
   return {
     ok: true,
+    success: true,
+    pix: {
+      payment_id: pix.payment_id,
+      qr_code: pix.qr_code,
+      qr_code_base64: pix.qr_code_base64,
+      copy_paste: pix.qr_code,
+    },
     payment: {
       id: pix.payment_id,
       status: pix.status || "pending",

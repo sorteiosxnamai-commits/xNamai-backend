@@ -32,6 +32,11 @@ function isDebugMpEnabled() {
 
 async function ensureReservationPaymentColumns() {
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
+  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL`);
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT`);
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
@@ -281,7 +286,7 @@ router.post('/pix', requireAuth, async (req, res) => {
     if (String(rs.payment_status || 'pending').toLowerCase() !== 'pending') {
       return res.status(400).json({ error: 'payment_not_pending' });
     }
-    if (new Date(rs.expires_at).getTime() < Date.now()) {
+    if (rs.expires_at && new Date(rs.expires_at).getTime() < Date.now()) {
       return res.status(400).json({ error: 'reservation_expired' });
     }
 
@@ -367,9 +372,13 @@ router.post('/pix', requireAuth, async (req, res) => {
       `UPDATE reservations
           SET payment_id = $2,
               payment_status = 'pending',
+              amount_cents = COALESCE(amount_cents, $3),
+              pix_qr_code = $4,
+              pix_qr_code_base64 = $5,
+              pix_copy_paste = $4,
               updated_at = NOW()
         WHERE id = $1`,
-      [reservationId, String(id)]
+      [reservationId, String(id), rs.numbers.length * priceCents, qr_code || null, qr_code_base64 || null]
     );
 
     return res.json({
@@ -380,6 +389,7 @@ router.post('/pix', requireAuth, async (req, res) => {
       status,
       qr_code,
       qr_code_base64,
+      copy_paste: qr_code,
       ticket_url,
       amount,
       payment_status: 'pending',
