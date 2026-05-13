@@ -6,6 +6,7 @@ import { query, getPool } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = express.Router();
+const ADMIN_ASSIGN_RESERVATION_TTL_MINUTES = 30;
 
 router.use(requireAuth, requireAdmin);
 
@@ -43,6 +44,18 @@ function parseNumbers(input) {
     .split(/[,\s;]+/).map((t) => t.trim()).filter(Boolean)
     .map((t) => Number(t))
     .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99));
+}
+
+async function ensureAdminAssignColumns(client) {
+  await client.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
 }
 
 /* =============== LISTAR (com busca/paginação) =============== */
@@ -229,9 +242,7 @@ router.delete("/:id", async (req, res, next) => {
  * POST /api/admin/users/:id/assign-numbers
  * body: { draw_id: number, numbers: number[] | "csv", amount_cents?: number }
  * - Checa conflitos em payments aprovados e reservas ativas
- * - Se ok, cria:
- *    - payments(status='approved')
- *    - reservations(status='paid')
+ * - Se ok, cria reserva pending/reserved e marca números como reserved.
  */
 router.post("/:id/assign-numbers", async (req, res, next) => {
   const pool = await getPool();
@@ -249,6 +260,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
     }
 
     await client.query("BEGIN");
+    await ensureAdminAssignColumns(client);
 
     // garante que o usuário existe
     const u = await client.query("SELECT id FROM public.users WHERE id = $1", [user_id]);
@@ -334,7 +346,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
            SELECT unnest(r.numbers) AS n
            FROM public.reservations r
            WHERE r.draw_id = $1
-             AND lower(trim(coalesce(r.status, ''))) IN ('active','pending','paid','approved','pago')
+             AND lower(trim(coalesce(r.status, ''))) IN ('active','reserved','pending','paid','approved','pago')
              AND r.numbers && $2::int4[]
          ) x
          WHERE n = ANY ($2::int4[])`,
@@ -350,44 +362,49 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
     }
 
     // --------- INSERTS ---------
-    // payments.id é NOT NULL (tipo text); usamos epoch ms (13 dígitos) como nos seus dados atuais
-    const payId = Date.now().toString();
-
-    const pay = await client.query(
-      `INSERT INTO public.payments
-         (id, user_id, draw_id, numbers, amount_cents, status, created_at)
-       VALUES ($1, $2, $3, $4::int4[], $5, 'approved', NOW())
-       RETURNING id, user_id, draw_id, numbers, amount_cents, status, created_at`,
-      [payId, user_id, draw_id, numbers, amount_cents]
-    );
-
-    // reserva paga; PK uuid gerada pelo banco
+    // Reserva pendente: o número fica amarelo/reservado até o cliente pagar.
     const resv = await client.query(
       `INSERT INTO public.reservations
-         (id, user_id, draw_id, numbers, status, created_at, expires_at)
-       VALUES (gen_random_uuid(), $1, $2, $3::int4[], 'paid', NOW(), NOW() + INTERVAL '30 minutes')
+         (id, user_id, draw_id, numbers, amount_cents, status, payment_status, payment_id, created_at, expires_at, updated_at)
+       VALUES (
+         gen_random_uuid(),
+         $1,
+         $2,
+         $3::int4[],
+         $4,
+         'reserved',
+         'pending',
+         NULL,
+         NOW(),
+         NOW() + ($5::text || ' minutes')::interval,
+         NOW()
+       )
        RETURNING id`,
-      [user_id, draw_id, numbers]
+      [user_id, draw_id, numbers, amount_cents, ADMIN_ASSIGN_RESERVATION_TTL_MINUTES]
     );
 
     await client.query(
       `UPDATE public.numbers
-          SET status = 'sold',
+          SET status = 'reserved',
               user_id = $3,
-              payment_id = $4,
-              reservation_id = $5,
-              purchased_at = NOW()
+              reserved_until = NOW() + ($5::text || ' minutes')::interval,
+              payment_id = NULL,
+              reservation_id = $4,
+              updated_at = NOW()
         WHERE draw_id = $1
-          AND n = ANY ($2::int4[])`,
-      [draw_id, numbers, user_id, pay.rows[0].id, resv.rows[0]?.id || null]
+          AND n = ANY ($2::int4[])
+          AND lower(trim(coalesce(status, ''))) <> 'sold'`,
+      [draw_id, numbers, user_id, resv.rows[0]?.id || null, ADMIN_ASSIGN_RESERVATION_TTL_MINUTES]
     );
 
     await client.query("COMMIT");
     res.status(201).json({
       ok: true,
-      payment: pay.rows[0],
+      payment: null,
       reservation_id: resv.rows[0]?.id || null,
       numbers,
+      status: "reserved",
+      payment_status: "pending",
     });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}

@@ -171,11 +171,15 @@ function sendReservationCreated(res, reservation) {
 
 async function createReservationHandler(req, res) {
   const drawId = req.params.drawId || req.params.id;
-  const numbers = req.body?.numbers;
+  const numbers = Array.isArray(req.body?.numbers)
+    ? req.body.numbers
+    : Array.isArray(req.body?.selectedNumbers)
+      ? req.body.selectedNumbers
+      : [];
   const userId = req.user?.id;
 
   try {
-    const reservation = await reserveNumbers(drawId, req.body || {}, req.user);
+    const reservation = await reserveNumbers(drawId, { ...(req.body || {}), numbers }, req.user);
     console.log("[PROMOTIONAL_RESERVATION_CREATE]", {
       reservationId: reservation.id,
       drawId,
@@ -210,40 +214,7 @@ async function createReservationHandler(req, res) {
 
 router.post("/:drawId/reservations", requirePromotionalAuth, createReservationHandler);
 
-router.post("/:id/reserve", requirePromotionalAuth, async (req, res) => {
-  try {
-    const reservation = await reserveNumbers(req.params.id, req.body || {}, req.user);
-    console.log("[PROMOTIONAL_RESERVATION_CREATE]", {
-      reservationId: reservation.id,
-      drawId: req.params.id,
-      userId: req.user?.id,
-      numbers: reservation.numbers,
-      amount_cents: reservation.amount_cents || reservation.total_cents || 0,
-    });
-    return sendReservationCreated(res, reservation);
-  } catch (err) {
-    console.error("[PROMOTIONAL_RESERVATION_ERROR]", {
-      message: err?.message,
-      code: err?.code,
-      stack: err?.stack,
-      drawId: req.params.id,
-      userId: req.user?.id,
-      numbers: req.body?.numbers,
-    });
-    console.error("[promotional.reserve] error", {
-      message: err?.message,
-      code: err?.code,
-      stack: err?.stack,
-      drawId: req.params.id,
-      userId: req.user?.id,
-      numbers: req.body?.numbers,
-    });
-
-    return handleError(res, err, {
-      tag: "[PROMOTIONAL_RESERVE_ERROR]",
-    });
-  }
-});
+router.post("/:id/reserve", requirePromotionalAuth, createReservationHandler);
 
 router.post("/:drawId/reservations/:reservationId/pix", requirePromotionalAuth, async (req, res) => {
   try {

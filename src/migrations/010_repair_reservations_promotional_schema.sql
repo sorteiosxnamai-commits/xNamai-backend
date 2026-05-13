@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS public.promotional_numbers (
   payment_status TEXT DEFAULT 'pending',
   payment_id TEXT NULL,
   reserved_at TIMESTAMPTZ NULL,
+  expires_at TIMESTAMPTZ NULL,
   sold_at TIMESTAMPTZ NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -107,6 +108,7 @@ ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_phone TEXT
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending';
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL;
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL;
+ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS sold_at TIMESTAMPTZ NULL;
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
@@ -160,6 +162,11 @@ ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL;
 ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL;
 ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL;
 ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL;
+ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL;
+ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL;
+ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
 -- Usuários: garante timestamps básicos sem assumir colunas sensíveis.
 ALTER TABLE public.users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();

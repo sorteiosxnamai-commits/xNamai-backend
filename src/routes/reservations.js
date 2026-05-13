@@ -7,6 +7,7 @@ import { getTicketPriceCents } from '../services/config.js';
 import { mpCreatePixPayment } from '../services/mercadopago.js';
 
 const router = Router();
+const RESERVATION_TTL_MINUTES = 30;
 
 async function ensureReservationPaymentColumns() {
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
@@ -19,6 +20,10 @@ async function ensureReservationPaymentColumns() {
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
   await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
 }
 
 function getBaseUrl(req) {
@@ -96,7 +101,7 @@ router.post('/', requireAuth, async (req, res) => {
     );
     if (!nums.length) return res.status(400).json({ error: 'numbers_invalid' });
 
-    const ttlMin = Number(process.env.RESERVATION_TTL_MIN || 5);
+    const ttlMin = RESERVATION_TTL_MINUTES;
 
     // draw aberto
     const dr = await query(
@@ -244,10 +249,14 @@ router.post('/', requireAuth, async (req, res) => {
     await query(
       `UPDATE numbers
           SET status = 'reserved',
-              reservation_id = $3
+              reservation_id = $3,
+              user_id = $4,
+              reserved_until = $5,
+              payment_id = NULL,
+              updated_at = NOW()
         WHERE draw_id = $1
           AND n = ANY($2)`,
-      [drawId, nums, reservationId]
+      [drawId, nums, reservationId, req.user.id, expiresAt]
     );
 
     await query('COMMIT');

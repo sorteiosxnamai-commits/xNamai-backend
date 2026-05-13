@@ -2,6 +2,8 @@ import { randomUUID } from "crypto";
 import { getPool, query } from "../../db.js";
 import { formatPromotionalNumber } from "./promotional.utils.js";
 
+const PROMOTIONAL_RESERVATION_TTL_MINUTES = 30;
+
 function dbQuery(client, text, params = []) {
   return client ? client.query(text, params) : query(text, params);
 }
@@ -73,6 +75,7 @@ export async function ensurePromotionalSchema(client = null) {
       buyer_email TEXT,
       buyer_phone TEXT,
       reserved_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ,
       sold_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -184,6 +187,7 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_email TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_phone TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL`);
 
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_provider TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
@@ -194,6 +198,7 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS sold_at TIMESTAMPTZ NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
 
   await dbQuery(client, `
@@ -718,7 +723,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
   const pool = await getPool();
   const client = await pool.connect();
   const reservationId = randomUUID();
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  const expiresAt = new Date(Date.now() + PROMOTIONAL_RESERVATION_TTL_MINUTES * 60 * 1000).toISOString();
 
   try {
     await client.query("BEGIN");
@@ -842,6 +847,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
           buyer_phone = $7,
           payment_status = 'pending',
           reserved_at = NOW(),
+          expires_at = $9,
           updated_at = NOW()
         WHERE draw_id = $1
           AND n = ANY($2::int[])
@@ -856,6 +862,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         payload.email,
         payload.phone || null,
         selectedNumberIds,
+        expiresAt,
       ]);
     } catch (updateErr) {
       console.error("[PROMOTIONAL_RESERVE_NUMBER_UPDATE_ERROR]", {
