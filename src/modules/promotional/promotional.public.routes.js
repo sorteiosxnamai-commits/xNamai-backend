@@ -73,6 +73,12 @@ function handleError(res, err, options = {}) {
   logPromotionalError(tag, err);
 
   if (status >= 500) {
+    if (options.code === "PROMOTIONAL_RESERVE_ERROR") {
+      return res.status(500).json({
+        ok: false,
+        error: "Erro ao processar número promocional.",
+      });
+    }
     return res.status(500).json({
       ok: false,
       error: options.error || "Erro ao carregar campanhas promocionais",
@@ -160,7 +166,7 @@ router.post("/:id/reserve", requirePromotionalAuth, async (req, res) => {
   } catch (err) {
     return handleError(res, err, {
       tag: "[PROMOTIONAL_RESERVE_ERROR]",
-      error: "Erro ao processar participação promocional.",
+      error: "Erro ao processar número promocional.",
       code: "PROMOTIONAL_RESERVE_ERROR",
     });
   }

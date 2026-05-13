@@ -122,6 +122,28 @@ function normalizeNumberRow(row) {
   };
 }
 
+function mapAdminNumberRow(row) {
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    draw_id: Number(row.draw_id),
+    n: Number(row.n),
+    label: row.label || formatPromotionalNumber(row.n),
+    status: row.status,
+    user_id: row.user_id != null ? Number(row.user_id) : null,
+    reservation_id: row.reservation_id != null ? String(row.reservation_id) : null,
+    buyer_name: row.buyer_name ?? null,
+    buyer_email: row.buyer_email ?? null,
+    buyer_phone: row.buyer_phone ?? null,
+    payment_status: row.payment_status ?? "pending",
+    payment_id: row.payment_id ?? null,
+    reserved_at: row.reserved_at ?? null,
+    sold_at: row.sold_at ?? null,
+    created_at: row.created_at ?? null,
+    updated_at: row.updated_at ?? null,
+  };
+}
+
 export async function listActivePromotionalDraws() {
   await ensurePromotionalSchema();
   const { rows } = await query(`
@@ -165,6 +187,33 @@ export async function getPromotionalNumbers(draw_id, client = null) {
     ORDER BY n ASC
   `, [draw_id]);
   return rows.map(normalizeNumberRow);
+}
+
+export async function getPromotionalNumbersAdmin(draw_id, client = null) {
+  await ensurePromotionalSchema(client);
+  const { rows } = await dbQuery(client, `
+    SELECT
+      id,
+      draw_id,
+      n,
+      label,
+      status,
+      user_id,
+      reservation_id,
+      buyer_name,
+      buyer_email,
+      buyer_phone,
+      payment_status,
+      payment_id,
+      reserved_at,
+      sold_at,
+      created_at,
+      updated_at
+    FROM public.promotional_numbers
+    WHERE draw_id = $1
+    ORDER BY n ASC
+  `, [draw_id]);
+  return rows.map(mapAdminNumberRow);
 }
 
 export async function createPromotionalDraw(payload, client = null) {
@@ -275,37 +324,64 @@ export async function createPromotionalNumbers(draw_id, number_start, number_end
 
 export async function updatePromotionalNumberStatus(draw_id, n, status) {
   await ensurePromotionalSchema();
-  const { rows } = await query(`
-    UPDATE public.promotional_numbers
-    SET status = $3,
-        reservation_id = CASE WHEN $3 = 'available' THEN NULL ELSE reservation_id END,
-        payment_id = CASE WHEN $3 = 'available' THEN NULL ELSE payment_id END,
-        payment_status = CASE
-          WHEN $3 = 'available' THEN 'pending'
-          WHEN $3 = 'sold' THEN 'paid'
-          ELSE payment_status
-        END,
-        user_id = CASE WHEN $3 = 'available' THEN NULL ELSE user_id END,
-        buyer_name = CASE WHEN $3 = 'available' THEN NULL ELSE buyer_name END,
-        buyer_email = CASE WHEN $3 = 'available' THEN NULL ELSE buyer_email END,
-        buyer_phone = CASE WHEN $3 = 'available' THEN NULL ELSE buyer_phone END,
-        reserved_at = CASE
-          WHEN $3 = 'available' THEN NULL
-          WHEN $3 = 'reserved' THEN NOW()
-          ELSE reserved_at
-        END,
-        sold_at = CASE
-          WHEN $3 = 'available' THEN NULL
-          WHEN $3 = 'sold' THEN NOW()
-          ELSE sold_at
-        END,
-        updated_at = NOW()
-    WHERE draw_id = $1
-      AND n = $2
-    RETURNING *
-  `, [draw_id, n, status]);
+  const s = String(status || "").toLowerCase();
 
-  return rows[0] ? normalizeNumberRow(rows[0]) : null;
+  let sql;
+  const params = [draw_id, n];
+
+  if (s === "available") {
+    sql = `
+      UPDATE public.promotional_numbers
+      SET
+        status = 'available',
+        user_id = NULL,
+        reservation_id = NULL,
+        payment_id = NULL,
+        payment_status = 'pending',
+        buyer_name = NULL,
+        buyer_email = NULL,
+        buyer_phone = NULL,
+        reserved_at = NULL,
+        sold_at = NULL,
+        updated_at = NOW()
+      WHERE draw_id = $1 AND n = $2
+      RETURNING *
+    `;
+  } else if (s === "sold") {
+    sql = `
+      UPDATE public.promotional_numbers
+      SET
+        status = 'sold',
+        sold_at = NOW(),
+        updated_at = NOW()
+      WHERE draw_id = $1 AND n = $2
+      RETURNING *
+    `;
+  } else if (s === "reserved") {
+    sql = `
+      UPDATE public.promotional_numbers
+      SET
+        status = 'reserved',
+        reserved_at = COALESCE(reserved_at, NOW()),
+        updated_at = NOW()
+      WHERE draw_id = $1 AND n = $2
+      RETURNING *
+    `;
+  } else if (s === "blocked") {
+    sql = `
+      UPDATE public.promotional_numbers
+      SET
+        status = 'blocked',
+        updated_at = NOW()
+      WHERE draw_id = $1 AND n = $2
+      RETURNING *
+    `;
+  } else {
+    return null;
+  }
+
+  const { rows } = await query(sql, params);
+  return rows[0] ? mapAdminNumberRow(rows[0]) : null;
 }
 
 export async function getPromotionalParticipants(draw_id) {
@@ -432,7 +508,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
     await ensurePromotionalSchema(client);
 
     const locked = await client.query(`
-      SELECT n, status
+      SELECT id, n, status
       FROM public.promotional_numbers
       WHERE draw_id = $1
         AND n = ANY($2::int[])
@@ -443,9 +519,9 @@ export async function reservePromotionalNumbers(draw_id, payload) {
     const found = new Set(locked.rows.map((row) => Number(row.n)));
     const missing = payload.numbers.filter((n) => !found.has(n));
     if (missing.length) {
-      const err = new Error("Número promocional não encontrado.");
-      err.status = 404;
-      err.code = "promotional_number_not_found";
+      const err = new Error("Um ou mais números já estão indisponíveis.");
+      err.status = 409;
+      err.code = "promotional_numbers_unavailable";
       err.conflicts = missing;
       throw err;
     }
@@ -454,9 +530,9 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       .filter((row) => row.status !== "available")
       .map((row) => Number(row.n));
     if (unavailable.length) {
-      const err = new Error("Número promocional indisponível.");
+      const err = new Error("Um ou mais números já estão indisponíveis.");
       err.status = 409;
-      err.code = "promotional_number_unavailable";
+      err.code = "promotional_numbers_unavailable";
       err.conflicts = unavailable;
       throw err;
     }
@@ -472,9 +548,11 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         buyer_phone,
         status,
         payment_status,
-        expires_at
+        expires_at,
+        created_at,
+        updated_at
       )
-      VALUES ($1,$2,$3,$4::int[],$5,$6,$7,'reserved','pending',$8)
+      VALUES ($1,$2,$3,$4::int[],$5,$6,$7,'reserved','pending',$8,NOW(),NOW())
       RETURNING *
     `, [
       reservationId,
@@ -483,13 +561,16 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       payload.numbers,
       payload.name,
       payload.email,
-      payload.phone,
+      payload.phone || "",
       expiresAt,
     ]);
 
-    await client.query(`
-      UPDATE public.promotional_numbers
-      SET status = 'reserved',
+    let updateResult;
+    try {
+      updateResult = await client.query(`
+        UPDATE public.promotional_numbers
+        SET
+          status = 'reserved',
           reservation_id = $3,
           user_id = $4,
           buyer_name = $5,
@@ -498,17 +579,47 @@ export async function reservePromotionalNumbers(draw_id, payload) {
           payment_status = 'pending',
           reserved_at = NOW(),
           updated_at = NOW()
-      WHERE draw_id = $1
-        AND n = ANY($2::int[])
-    `, [
-      draw_id,
-      payload.numbers,
-      reservationId,
-      payload.user_id,
-      payload.name,
-      payload.email,
-      payload.phone,
-    ]);
+        WHERE draw_id = $1
+          AND n = ANY($2::int[])
+          AND status = 'available'
+      `, [
+        draw_id,
+        payload.numbers,
+        reservationId,
+        payload.user_id,
+        payload.name,
+        payload.email,
+        payload.phone || null,
+      ]);
+    } catch (updateErr) {
+      console.error("[PROMOTIONAL_RESERVE_NUMBER_UPDATE_ERROR]", {
+        code: updateErr?.code,
+        message: updateErr?.message,
+        detail: updateErr?.detail,
+        hint: updateErr?.hint,
+        stack: updateErr?.stack,
+      });
+      const err = new Error("Erro ao processar número promocional.");
+      err.status = 500;
+      err.code = "promotional_reserve_number_update_failed";
+      err.cause = updateErr;
+      throw err;
+    }
+
+    const expected = payload.numbers.length;
+    if (Number(updateResult.rowCount) !== expected) {
+      console.error("[PROMOTIONAL_RESERVE_NUMBER_UPDATE_ERROR]", {
+        code: "ROWCOUNT_MISMATCH",
+        message: `Esperado ${expected} linhas, atualizadas ${updateResult.rowCount}`,
+        detail: { draw_id, numbers: payload.numbers },
+        hint: null,
+        stack: null,
+      });
+      const err = new Error("Um ou mais números já estão indisponíveis.");
+      err.status = 409;
+      err.code = "promotional_numbers_unavailable";
+      throw err;
+    }
 
     await client.query("COMMIT");
     return reservation.rows[0];

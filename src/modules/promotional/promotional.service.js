@@ -8,6 +8,7 @@ import {
   deletePromotionalDraw,
   getPromotionalDrawById,
   getPromotionalNumbers,
+  getPromotionalNumbersAdmin,
   getPromotionalParticipants,
   getPromotionalReservationForPayment,
   listActivePromotionalDraws,
@@ -72,7 +73,9 @@ export async function getNumbers(draw_id, { requireActive = false } = {}) {
   const draw = requireActive
     ? await getPublicDraw(draw_id)
     : await getAdminDraw(draw_id);
-  const numbers = await getPromotionalNumbers(draw.id);
+  const numbers = requireActive
+    ? await getPromotionalNumbers(draw.id)
+    : await getPromotionalNumbersAdmin(draw.id);
   return { draw, numbers };
 }
 

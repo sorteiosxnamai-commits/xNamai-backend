@@ -16,9 +16,10 @@ const router = Router();
 
 router.use(requireAuth, requireAdmin);
 
-function handleError(res, err) {
+function handleError(res, err, options = {}) {
   const status = err?.status || err?.statusCode || 500;
-  console.error("[PROMOTIONAL_ERROR]", {
+  const logTag = options.logTag || "[PROMOTIONAL_ERROR]";
+  console.error(logTag, {
     code: err?.code,
     message: err?.message,
     detail: err?.detail,
@@ -29,7 +30,7 @@ function handleError(res, err) {
   if (status >= 500) {
     return res.status(500).json({
       ok: false,
-      error: "Erro ao carregar campanhas promocionais",
+      error: options.friendlyError || "Erro ao carregar campanhas promocionais",
       code: err?.code || "PROMOTIONAL_ERROR",
     });
   }
@@ -70,7 +71,10 @@ router.get("/draws/:id/numbers", async (req, res) => {
     const { numbers } = await getNumbers(req.params.id);
     return res.json({ ok: true, numbers });
   } catch (err) {
-    return handleError(res, err);
+    return handleError(res, err, {
+      logTag: "[PROMOTIONAL_ADMIN_NUMBERS_ERROR]",
+      friendlyError: "Erro ao processar número promocional.",
+    });
   }
 });
 
@@ -83,7 +87,10 @@ router.patch("/draws/:id/numbers/:number", async (req, res) => {
     );
     return res.json({ ok: true, number });
   } catch (err) {
-    return handleError(res, err);
+    return handleError(res, err, {
+      logTag: "[PROMOTIONAL_ADMIN_NUMBERS_ERROR]",
+      friendlyError: "Erro ao processar número promocional.",
+    });
   }
 });
 
