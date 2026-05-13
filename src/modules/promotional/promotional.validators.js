@@ -93,7 +93,9 @@ export function validateCreatePromotionalDraw(payload = {}) {
     1
   );
 
-  if (price_cents < 0) throw validationError("price_cents deve ser maior ou igual a 0.");
+  if (price_cents <= 0) {
+    throw validationError("price_cents deve ser maior que 0 para permitir pagamento PIX.");
+  }
   if (max_numbers_per_user <= 0) {
     throw validationError("max_numbers_per_user deve ser maior que 0.");
   }
@@ -127,7 +129,9 @@ export function validateUpdatePromotionalDraw(payload = {}) {
   }
   if (payload.price_cents !== undefined) {
     patch.price_cents = toInt(payload.price_cents, "price_cents");
-    if (patch.price_cents < 0) throw validationError("price_cents deve ser maior ou igual a 0.");
+    if (patch.price_cents <= 0) {
+      throw validationError("price_cents deve ser maior que 0 para permitir pagamento PIX.");
+    }
   }
   if (payload.max_numbers_per_user !== undefined) {
     patch.max_numbers_per_user = toInt(payload.max_numbers_per_user, "max_numbers_per_user");

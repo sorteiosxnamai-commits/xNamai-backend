@@ -1,5 +1,6 @@
 import express from "express";
 import { Pool } from "pg";
+import { settlePromotionalPaymentByPaymentId } from "../modules/promotional/promotional.service.js";
 
 const router = express.Router();
 
@@ -311,6 +312,24 @@ async function mercadoPagoWebhookHandler(req, res) {
         payment,
       ]
     );
+
+    const paymentStatus = String(payment.status || "").toLowerCase();
+    const externalReference = String(payment.external_reference || "");
+
+    if (paymentStatus === "approved" && externalReference.startsWith("promotional:")) {
+      try {
+        const result = await settlePromotionalPaymentByPaymentId(String(payment.id));
+        console.log("[PROMOTIONAL_PAYMENT_SETTLED]", result);
+      } catch (settleError) {
+        console.error("[PROMOTIONAL_PAYMENT_SETTLE_FAILED]", {
+          paymentId: String(payment.id),
+          externalReference,
+          message: settleError?.message,
+          code: settleError?.code,
+          stack: settleError?.stack,
+        });
+      }
+    }
 
     return res.status(200).json({
       ok: true,

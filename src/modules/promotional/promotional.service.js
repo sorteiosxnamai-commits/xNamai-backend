@@ -15,6 +15,7 @@ import {
   listPromotionalDraws,
   listPromotionalParticipationsForUser,
   reservePromotionalNumbers,
+  settlePromotionalPaymentApproved,
   updatePromotionalDraw,
   updatePromotionalDrawStatus,
   updatePromotionalNumberStatus,
@@ -333,6 +334,8 @@ export async function listMyParticipations(user = null) {
 
   return rows.map((row) => {
     const numbers = Array.isArray(row.numbers) ? row.numbers.map(Number) : [];
+    const priceCents = Number(row.price_cents || 0);
+    const amountCents = numbers.length * priceCents;
     return {
       type: "promotional",
       draw_id: Number(row.draw_id),
@@ -349,6 +352,9 @@ export async function listMyParticipations(user = null) {
         String(row.payment_status || "pending").toLowerCase() === "pending" &&
         !["cancelled", "expired"].includes(String(row.reservation_status || "").toLowerCase()),
       reservation_id: row.reservation_id,
+      payment_id: row.payment_id || null,
+      price_cents: priceCents,
+      amount_cents: amountCents,
       created_at: row.created_at,
     };
   });
@@ -395,4 +401,15 @@ export function assertPromotionalAdminEmail(req) {
   if (!emails.includes(current)) {
     throw forbidden("E-mail sem permissão para o módulo promocional.", "promotional_email_forbidden");
   }
+}
+
+export async function settlePromotionalPaymentByPaymentId(paymentId) {
+  if (!paymentId) {
+    return {
+      ok: false,
+      reason: "missing_payment_id",
+    };
+  }
+
+  return settlePromotionalPaymentApproved(String(paymentId));
 }

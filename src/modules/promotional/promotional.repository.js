@@ -97,6 +97,26 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_email TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_phone TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
+
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_provider TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS sold_at TIMESTAMPTZ NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
+  await dbQuery(client, `
+    CREATE INDEX IF NOT EXISTS promotional_reservations_payment_id_idx
+    ON public.promotional_reservations(payment_id)
+  `);
+  await dbQuery(client, `
+    CREATE INDEX IF NOT EXISTS promotional_numbers_payment_id_idx
+    ON public.promotional_numbers(payment_id)
+  `);
 }
 
 function drawSelect() {
@@ -431,13 +451,17 @@ export async function listPromotionalParticipationsForUser(user_id, email) {
     SELECT
       r.id AS reservation_id,
       r.draw_id,
+      r.user_id,
       r.numbers,
       r.status AS reservation_status,
       r.payment_status,
       r.payment_id,
       r.created_at,
+      r.expires_at,
+      r.paid_at,
       d.title AS draw_title,
-      d.prize
+      d.prize,
+      d.price_cents
     FROM public.promotional_reservations r
     JOIN public.promotional_draws d ON d.id = r.draw_id
     WHERE
@@ -632,6 +656,90 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       stack: err?.stack,
     });
     await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function settlePromotionalPaymentApproved(payment_id) {
+  await ensurePromotionalSchema();
+
+  const pool = await getPool();
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const reservationResult = await client.query(`
+      SELECT
+        id,
+        draw_id,
+        user_id,
+        numbers,
+        payment_id,
+        payment_status,
+        status
+      FROM public.promotional_reservations
+      WHERE payment_id = $1
+      FOR UPDATE
+    `, [String(payment_id)]);
+
+    if (!reservationResult.rows.length) {
+      await client.query("COMMIT");
+      return {
+        ok: false,
+        reason: "promotional_reservation_not_found_for_payment",
+        payment_id: String(payment_id),
+      };
+    }
+
+    const reservation = reservationResult.rows[0];
+
+    await client.query(`
+      UPDATE public.promotional_reservations
+      SET
+        status = 'paid',
+        payment_status = 'paid',
+        paid_at = COALESCE(paid_at, NOW()),
+        updated_at = NOW()
+      WHERE id = $1
+    `, [reservation.id]);
+
+    await client.query(`
+      UPDATE public.promotional_numbers
+      SET
+        status = 'sold',
+        payment_status = 'paid',
+        payment_id = $3,
+        sold_at = COALESCE(sold_at, NOW()),
+        updated_at = NOW()
+      WHERE draw_id = $1
+        AND reservation_id = $2
+    `, [
+      reservation.draw_id,
+      reservation.id,
+      String(payment_id),
+    ]);
+
+    await client.query("COMMIT");
+
+    return {
+      ok: true,
+      payment_id: String(payment_id),
+      reservation_id: reservation.id,
+      draw_id: reservation.draw_id,
+      numbers: reservation.numbers,
+    };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[PROMOTIONAL_SETTLE_PAYMENT_ERROR]", {
+      payment_id: String(payment_id),
+      code: err?.code,
+      message: err?.message,
+      detail: err?.detail,
+      stack: err?.stack,
+    });
     throw err;
   } finally {
     client.release();
