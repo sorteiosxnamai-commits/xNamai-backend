@@ -224,6 +224,7 @@ export async function reserveNumbers(draw_id, payload, user = null) {
     ...data,
     price_cents: priceCents,
     total_cents: totalCents,
+    amount_cents: totalCents,
     source: "public",
   });
 }
@@ -259,7 +260,7 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
 
   const numbers = Array.isArray(reservation.numbers) ? reservation.numbers.map(Number) : [];
   const priceCents = Number(reservation.price_cents || 0);
-  const savedTotalCents = Number(reservation.total_cents || 0);
+  const savedTotalCents = Number(reservation.total_cents || reservation.amount_cents || 0);
   const amountCents = savedTotalCents > 0 ? savedTotalCents : numbers.length * priceCents;
   if (!Number.isFinite(amountCents) || amountCents <= 0) {
     throw httpError(422, "promotional_amount_invalid", "Valor do sorteio promocional inválido.");
@@ -327,7 +328,7 @@ export async function listMyParticipations(user = null) {
   return rows.map((row) => {
     const numbers = Array.isArray(row.numbers) ? row.numbers.map(Number) : [];
     const priceCents = Number(row.price_cents || 0);
-    const amountCents = Number(row.total_cents || 0) || numbers.length * priceCents;
+    const amountCents = Number(row.amount_cents || row.total_cents || 0) || numbers.length * priceCents;
     return {
       type: "promotional",
       draw_id: Number(row.draw_id),

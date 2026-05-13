@@ -37,6 +37,7 @@ export async function ensurePromotionalSchema(client = null) {
       buyer_phone TEXT NOT NULL DEFAULT '',
       price_cents INTEGER NOT NULL DEFAULT 0,
       total_cents INTEGER NOT NULL DEFAULT 0,
+      amount_cents INTEGER NOT NULL DEFAULT 0,
       source TEXT DEFAULT 'public',
       status TEXT NOT NULL DEFAULT 'pending',
       payment_status TEXT DEFAULT 'pending',
@@ -118,6 +119,7 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_provider TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS price_cents INTEGER NOT NULL DEFAULT 0`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS total_cents INTEGER NOT NULL DEFAULT 0`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER NOT NULL DEFAULT 0`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'public'`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
@@ -499,7 +501,8 @@ export async function listPromotionalParticipationsForUser(user_id, email) {
       r.payment_status,
       r.payment_id,
       COALESCE(NULLIF(r.price_cents, 0), d.price_cents, 0)::int AS price_cents,
-      COALESCE(NULLIF(r.total_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS total_cents,
+      COALESCE(NULLIF(r.total_cents, 0), NULLIF(r.amount_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS total_cents,
+      COALESCE(NULLIF(r.amount_cents, 0), NULLIF(r.total_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS amount_cents,
       r.created_at,
       r.expires_at,
       r.paid_at,
@@ -529,7 +532,8 @@ export async function getPromotionalReservationForPayment(draw_id, reservation_i
       r.status,
       r.payment_status,
       COALESCE(NULLIF(r.price_cents, 0), d.price_cents, 0)::int AS price_cents,
-      COALESCE(NULLIF(r.total_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS total_cents,
+      COALESCE(NULLIF(r.total_cents, 0), NULLIF(r.amount_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS total_cents,
+      COALESCE(NULLIF(r.amount_cents, 0), NULLIF(r.total_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS amount_cents,
       r.payment_provider,
       r.payment_id,
       r.pix_qr_code,
@@ -677,9 +681,9 @@ export async function reservePromotionalNumbers(draw_id, payload) {
     const found = new Set(locked.rows.map((row) => Number(row.n)));
     const missing = payload.numbers.filter((n) => !found.has(n));
     if (missing.length) {
-      const err = new Error("Um ou mais números já estão indisponíveis.");
+      const err = new Error("Um ou mais números já estão reservados.");
       err.status = 409;
-      err.code = "promotional_numbers_unavailable";
+      err.code = "PROMOTIONAL_NUMBER_ALREADY_RESERVED";
       err.conflicts = missing;
       throw err;
     }
@@ -688,9 +692,9 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       .filter((row) => row.status !== "available")
       .map((row) => Number(row.n));
     if (unavailable.length) {
-      const err = new Error("Um ou mais números já estão indisponíveis.");
+      const err = new Error("Um ou mais números já estão reservados.");
       err.status = 409;
-      err.code = "promotional_numbers_unavailable";
+      err.code = "PROMOTIONAL_NUMBER_ALREADY_RESERVED";
       err.conflicts = unavailable;
       throw err;
     }
@@ -706,6 +710,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         buyer_phone,
         price_cents,
         total_cents,
+        amount_cents,
         source,
         status,
         payment_status,
@@ -713,7 +718,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         created_at,
         updated_at
       )
-      VALUES ($1,$2,$3,$4::int[],$5,$6,$7,$8,$9,$10,'reserved','pending',$11,NOW(),NOW())
+      VALUES ($1,$2,$3,$4::int[],$5,$6,$7,$8,$9,$10,$11,'reserved','pending',$12,NOW(),NOW())
       RETURNING *
     `, [
       reservationId,
@@ -725,6 +730,7 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       payload.phone || "",
       payload.price_cents || 0,
       payload.total_cents || 0,
+      payload.amount_cents || payload.total_cents || 0,
       payload.source || "public",
       expiresAt,
     ]);
@@ -779,9 +785,9 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         hint: null,
         stack: null,
       });
-      const err = new Error("Um ou mais números já estão indisponíveis.");
+      const err = new Error("Um ou mais números já estão reservados.");
       err.status = 409;
-      err.code = "promotional_numbers_unavailable";
+      err.code = "PROMOTIONAL_NUMBER_ALREADY_RESERVED";
       throw err;
     }
 

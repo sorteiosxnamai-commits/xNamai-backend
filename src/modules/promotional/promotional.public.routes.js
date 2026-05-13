@@ -71,21 +71,32 @@ function getBaseUrl(req) {
 }
 
 function handleError(res, err, options = {}) {
-  const isUnavailable = ["promotional_numbers_unavailable", "number_unavailable"].includes(err?.code);
+  const isUnavailable = [
+    "PROMOTIONAL_NUMBER_ALREADY_RESERVED",
+    "promotional_numbers_unavailable",
+    "number_unavailable",
+  ].includes(err?.code);
   const status = isUnavailable ? 400 : (err?.status || err?.statusCode || 500);
   const tag = options.tag || "[PROMOTIONAL_ERROR]";
+  const responseCode = isUnavailable
+    ? "PROMOTIONAL_NUMBER_ALREADY_RESERVED"
+    : err?.code === "validation_error"
+      ? "invalid_number"
+      : (err?.code || "promotional_error");
   logPromotionalError(tag, err);
 
   if (status >= 500) {
     return res.status(500).json({
       ok: false,
-      error: "unexpected_error",
+      code: "unexpected_error",
+      message: "Erro inesperado ao processar a solicitação.",
     });
   }
 
   return res.status(status).json({
     ok: false,
-    error: isUnavailable ? "number_unavailable" : (err?.code || "promotional_error"),
+    code: responseCode,
+    error: responseCode,
     message: err?.message || "Erro no módulo promocional.",
     ...(err?.conflicts && { conflicts: err.conflicts }),
     ...(err?.details && { details: err.details }),
@@ -134,30 +145,69 @@ router.get("/:id/numbers", async (req, res) => {
   }
 });
 
+function sendReservationCreated(res, reservation) {
+  const amountCents = Number(reservation.amount_cents || reservation.total_cents || 0);
+  const numbers = Array.isArray(reservation.numbers)
+    ? reservation.numbers.map((n) => Number(n))
+    : [];
+
+  return res.status(201).json({
+    ok: true,
+    reservation: {
+      reservation_id: reservation.id,
+      id: reservation.id,
+      draw_id: Number(reservation.draw_id),
+      numbers,
+      status: reservation.status || "reserved",
+      payment_status: reservation.payment_status || "pending",
+      price_cents: Number(reservation.price_cents || 0),
+      amount_cents: amountCents,
+      total_cents: amountCents,
+      type: "promotional",
+    },
+  });
+}
+
+async function createReservationHandler(req, res) {
+  const drawId = req.params.drawId || req.params.id;
+  const numbers = req.body?.numbers;
+  const userId = req.user?.id;
+
+  try {
+    const reservation = await reserveNumbers(drawId, req.body || {}, req.user);
+    return sendReservationCreated(res, reservation);
+  } catch (err) {
+    console.error("[promotional.reserve] error", {
+      message: err?.message,
+      code: err?.code,
+      stack: err?.stack,
+      drawId,
+      userId,
+      numbers,
+    });
+
+    return handleError(res, err, {
+      tag: "[PROMOTIONAL_RESERVE_ERROR]",
+    });
+  }
+}
+
+router.post("/:drawId/reservations", requirePromotionalAuth, createReservationHandler);
+
 router.post("/:id/reserve", requirePromotionalAuth, async (req, res) => {
   try {
     const reservation = await reserveNumbers(req.params.id, req.body || {}, req.user);
-    return res.status(201).json({
-      ok: true,
-      reservation: {
-        id: reservation.id,
-        draw_id: Number(reservation.draw_id),
-        numbers: Array.isArray(reservation.numbers) ? reservation.numbers.map((n) => String(n)) : [],
-        status: reservation.status || "reserved",
-        payment_status: reservation.payment_status || "pending",
-        total_cents: Number(reservation.total_cents || 0),
-      },
-      reservation_id: reservation.id,
-      draw_id: Number(req.params.id),
-      user_id: reservation.user_id,
-      buyer_email: reservation.buyer_email,
-      numbers: reservation.numbers,
-      payment_status: reservation.payment_status || "pending",
-      status: reservation.status || "reserved",
-      can_pay: true,
-      message: "Números promocionais reservados com sucesso.",
-    });
+    return sendReservationCreated(res, reservation);
   } catch (err) {
+    console.error("[promotional.reserve] error", {
+      message: err?.message,
+      code: err?.code,
+      stack: err?.stack,
+      drawId: req.params.id,
+      userId: req.user?.id,
+      numbers: req.body?.numbers,
+    });
+
     return handleError(res, err, {
       tag: "[PROMOTIONAL_RESERVE_ERROR]",
     });
