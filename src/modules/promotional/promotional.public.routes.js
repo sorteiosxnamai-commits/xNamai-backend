@@ -5,6 +5,7 @@ import {
   getNumbers,
   getPublicDraw,
   listMyParticipations,
+  listMyReservations,
   listPublicDraws,
   reserveNumbers,
 } from "./promotional.service.js";
@@ -31,7 +32,8 @@ function requirePromotionalAuth(req, res, next) {
     if (statusCode === 401) {
       return originalStatus(401).json({
         ok: false,
-        error: "Entre ou crie uma conta para reservar números promocionais.",
+        error: "login_required",
+        message: "Entre ou crie uma conta para reservar números promocionais.",
       });
     }
     return originalStatus(statusCode).json(payload);
@@ -44,7 +46,8 @@ function requirePromotionalAuth(req, res, next) {
 }
 
 function logPromotionalError(tag, err) {
-  console.error(tag, {
+  console.error("[promotional] error:", {
+    tag,
     code: err?.code,
     message: err?.message,
     detail: err?.detail,
@@ -68,49 +71,21 @@ function getBaseUrl(req) {
 }
 
 function handleError(res, err, options = {}) {
-  const status = err?.status || err?.statusCode || 500;
+  const isUnavailable = ["promotional_numbers_unavailable", "number_unavailable"].includes(err?.code);
+  const status = isUnavailable ? 400 : (err?.status || err?.statusCode || 500);
   const tag = options.tag || "[PROMOTIONAL_ERROR]";
   logPromotionalError(tag, err);
 
   if (status >= 500) {
-    if (options.code === "PROMOTIONAL_RESERVE_ERROR") {
-      return res.status(500).json({
-        ok: false,
-        error: "Erro ao processar número promocional.",
-      });
-    }
     return res.status(500).json({
       ok: false,
-      error: options.error || "Erro ao carregar campanhas promocionais",
-      code: options.code || err?.code || "PROMOTIONAL_ERROR",
-    });
-  }
-
-  if (options.code === "PROMOTIONAL_RESERVE_ERROR") {
-    if (status === 409) {
-      return res.status(409).json({
-        ok: false,
-        error: "Um ou mais números já estão indisponíveis.",
-      });
-    }
-
-    if (status === 401) {
-      return res.status(401).json({
-        ok: false,
-        error: err?.message || "Usuário não autenticado.",
-      });
-    }
-
-    return res.status(status).json({
-      ok: false,
-      error: err?.message || "Erro ao reservar números promocionais.",
-      ...(err?.conflicts && { conflicts: err.conflicts }),
+      error: "unexpected_error",
     });
   }
 
   return res.status(status).json({
     ok: false,
-    error: err?.code || "promotional_error",
+    error: isUnavailable ? "number_unavailable" : (err?.code || "promotional_error"),
     message: err?.message || "Erro no módulo promocional.",
     ...(err?.conflicts && { conflicts: err.conflicts }),
     ...(err?.details && { details: err.details }),
@@ -126,7 +101,7 @@ router.get("/", async (_req, res) => {
   }
 });
 
-router.get("/me/participations", requireAuth, async (req, res) => {
+router.get("/me/participations", requirePromotionalAuth, async (req, res) => {
   try {
     const participations = await listMyParticipations(req.user);
     return res.json({ ok: true, participations });
@@ -135,6 +110,17 @@ router.get("/me/participations", requireAuth, async (req, res) => {
       tag: "[PROMOTIONAL_PARTICIPATIONS_ERROR]",
       error: "Erro ao processar participação promocional.",
       code: "PROMOTIONAL_PARTICIPATIONS_ERROR",
+    });
+  }
+});
+
+router.get("/me/reservations", requirePromotionalAuth, async (req, res) => {
+  try {
+    const items = await listMyReservations(req.user);
+    return res.json({ ok: true, items });
+  } catch (err) {
+    return handleError(res, err, {
+      tag: "[PROMOTIONAL_MY_RESERVATIONS_ERROR]",
     });
   }
 });
@@ -153,6 +139,14 @@ router.post("/:id/reserve", requirePromotionalAuth, async (req, res) => {
     const reservation = await reserveNumbers(req.params.id, req.body || {}, req.user);
     return res.status(201).json({
       ok: true,
+      reservation: {
+        id: reservation.id,
+        draw_id: Number(reservation.draw_id),
+        numbers: Array.isArray(reservation.numbers) ? reservation.numbers.map((n) => String(n)) : [],
+        status: reservation.status || "reserved",
+        payment_status: reservation.payment_status || "pending",
+        total_cents: Number(reservation.total_cents || 0),
+      },
       reservation_id: reservation.id,
       draw_id: Number(req.params.id),
       user_id: reservation.user_id,
@@ -166,13 +160,11 @@ router.post("/:id/reserve", requirePromotionalAuth, async (req, res) => {
   } catch (err) {
     return handleError(res, err, {
       tag: "[PROMOTIONAL_RESERVE_ERROR]",
-      error: "Erro ao processar número promocional.",
-      code: "PROMOTIONAL_RESERVE_ERROR",
     });
   }
 });
 
-router.post("/:drawId/reservations/:reservationId/pix", requireAuth, async (req, res) => {
+router.post("/:drawId/reservations/:reservationId/pix", requirePromotionalAuth, async (req, res) => {
   try {
     const pix = await createPromotionalPix(
       req.params.drawId,
@@ -184,21 +176,8 @@ router.post("/:drawId/reservations/:reservationId/pix", requireAuth, async (req,
     );
     return res.json(pix);
   } catch (err) {
-    logPromotionalError("[PROMOTIONAL_PIX_ERROR]", err);
-
-    if (err?.status === 403) {
-      return res.status(403).json({
-        ok: false,
-        error: "Você não tem permissão para pagar esta reserva.",
-      });
-    }
-
-    const status = err?.status && err.status < 500 ? err.status : 500;
-
-    return res.status(status).json({
-      ok: false,
-      error: err?.message || "Erro ao gerar PIX promocional.",
-      ...(status >= 500 ? {} : { code: err?.code || "PROMOTIONAL_PIX_ERROR" }),
+    return handleError(res, err, {
+      tag: "[PROMOTIONAL_PIX_ERROR]",
     });
   }
 });

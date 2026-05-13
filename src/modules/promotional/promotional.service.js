@@ -35,6 +35,13 @@ function notFound(message, code) {
   return err;
 }
 
+function httpError(status, code, message) {
+  const err = new Error(message || code);
+  err.status = status;
+  err.code = code;
+  return err;
+}
+
 function forbidden(message, code) {
   const err = new Error(message);
   err.status = 403;
@@ -43,7 +50,9 @@ function forbidden(message, code) {
 }
 
 function isPubliclyAvailable(draw) {
-  if (!draw || draw.status !== "active") return false;
+  if (!draw || !["active", "published", "open"].includes(String(draw.status || "").toLowerCase())) {
+    return false;
+  }
 
   const now = Date.now();
   if (draw.starts_at && new Date(draw.starts_at).getTime() > now) return false;
@@ -59,6 +68,7 @@ export async function listPublicDraws() {
 export async function getPublicDraw(id) {
   const draw = await getPromotionalDrawById(Number(id));
   if (!draw || !isPubliclyAvailable(draw)) {
+    if (draw) throw httpError(400, "promotional_draw_closed", "Sorteio promocional fechado.");
     throw notFound("Sorteio promocional não encontrado.", "promotional_draw_not_found");
   }
   return draw;
@@ -159,10 +169,7 @@ export async function reserveNumbers(draw_id, payload, user = null) {
   const userName = String(user?.name || user?.nome || userEmail).trim();
 
   if (!Number.isInteger(userId) || !userEmail) {
-    const err = new Error("Usuário não autenticado.");
-    err.status = 401;
-    err.code = "unauthorized";
-    throw err;
+    throw httpError(401, "login_required", "Usuário não autenticado.");
   }
 
   const draw = await getPublicDraw(draw_id);
@@ -184,10 +191,7 @@ export async function reserveNumbers(draw_id, payload, user = null) {
   );
 
   if (data.numbers.length > Number(draw.max_numbers_per_user || 1)) {
-    const err = new Error("Quantidade de números acima do limite permitido.");
-    err.status = 400;
-    err.code = "promotional_limit_exceeded";
-    throw err;
+    throw httpError(400, "invalid_number", "Quantidade de números acima do limite permitido.");
   }
 
   const alreadyReserved = await countPromotionalNumbersByContact(
@@ -197,87 +201,70 @@ export async function reserveNumbers(draw_id, payload, user = null) {
     data.user_id
   );
   if (alreadyReserved + data.numbers.length > Number(draw.max_numbers_per_user || 1)) {
-    const err = new Error("Quantidade de números acima do limite por participante.");
-    err.status = 400;
-    err.code = "promotional_user_limit_exceeded";
-    throw err;
+    throw httpError(400, "number_unavailable", "Quantidade de números acima do limite por participante.");
   }
 
   const outOfRange = data.numbers.filter(
     (n) => n < Number(draw.number_start) || n > Number(draw.number_end)
   );
   if (outOfRange.length) {
-    const err = new Error("Número fora do intervalo do sorteio promocional.");
-    err.status = 400;
-    err.code = "promotional_number_out_of_range";
+    const err = httpError(400, "invalid_number", "Número fora do intervalo do sorteio promocional.");
     err.conflicts = outOfRange;
     throw err;
   }
 
-  return reservePromotionalNumbers(draw.id, data);
+  const priceCents = Number(draw.price_cents || 0);
+  const totalCents = data.numbers.length * priceCents;
+
+  if (!Number.isFinite(priceCents) || priceCents <= 0 || totalCents <= 0) {
+    throw httpError(422, "promotional_amount_invalid", "Valor do sorteio promocional inválido.");
+  }
+
+  return reservePromotionalNumbers(draw.id, {
+    ...data,
+    price_cents: priceCents,
+    total_cents: totalCents,
+    source: "public",
+  });
 }
 
 export async function createPromotionalPix(draw_id, reservation_id, user = null, options = {}) {
   const userId = Number(user?.id);
   if (!Number.isInteger(userId)) {
-    const err = new Error("Usuário não autenticado.");
-    err.status = 401;
-    err.code = "unauthorized";
-    throw err;
+    throw httpError(401, "login_required", "Usuário não autenticado.");
   }
 
   const reservation = await getPromotionalReservationForPayment(
     Number(draw_id),
-    reservation_id
+    reservation_id,
+    userId
   );
 
   if (!reservation) {
-    throw notFound("Reserva promocional não encontrada.", "promotional_reservation_not_found");
-  }
-
-  const userEmail = String(user?.email || "").trim().toLowerCase();
-  const ownerEmail = String(reservation.buyer_email || "").trim().toLowerCase();
-  const isOwner = Number(reservation.user_id) === userId || (userEmail && ownerEmail === userEmail);
-
-  if (!isOwner) {
-    const err = new Error("Você não tem permissão para pagar esta reserva.");
-    err.status = 403;
-    err.code = "promotional_reservation_forbidden";
-    throw err;
+    throw notFound("Reserva promocional não encontrada.", "reservation_not_found");
   }
 
   const paymentStatus = String(reservation.payment_status || "pending").toLowerCase();
   if (paymentStatus === "paid") {
-    const err = new Error("Esta reserva já está paga.");
-    err.status = 400;
-    err.code = "promotional_payment_already_paid";
-    throw err;
+    throw httpError(400, "already_paid", "Esta reserva já está paga.");
   }
 
   if (paymentStatus !== "pending") {
-    const err = new Error("Esta reserva promocional não está pendente de pagamento.");
-    err.status = 400;
-    err.code = "promotional_payment_not_pending";
-    throw err;
+    throw httpError(400, "promotional_payment_not_pending", "Esta reserva promocional não está pendente de pagamento.");
   }
 
   if (["cancelled", "expired"].includes(String(reservation.status || "").toLowerCase())) {
-    const err = new Error("Esta reserva promocional não pode ser paga.");
-    err.status = 400;
-    err.code = "promotional_reservation_not_payable";
-    throw err;
+    throw httpError(400, "promotional_draw_closed", "Esta reserva promocional não pode ser paga.");
   }
 
   const numbers = Array.isArray(reservation.numbers) ? reservation.numbers.map(Number) : [];
   const priceCents = Number(reservation.price_cents || 0);
-  if (!Number.isFinite(priceCents) || priceCents <= 0) {
-    const err = new Error("Preço do sorteio promocional inválido.");
-    err.status = 400;
-    err.code = "invalid_promotional_price";
-    throw err;
+  const savedTotalCents = Number(reservation.total_cents || 0);
+  const amountCents = savedTotalCents > 0 ? savedTotalCents : numbers.length * priceCents;
+  if (!Number.isFinite(amountCents) || amountCents <= 0) {
+    throw httpError(422, "promotional_amount_invalid", "Valor do sorteio promocional inválido.");
   }
 
-  const amountCents = numbers.length * priceCents;
   const description = `Sorteio promocional xNaMai - ${reservation.title || reservation.prize || reservation.draw_id}`;
   const notificationUrl = options.notification_url || undefined;
 
@@ -301,11 +288,19 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
   await attachPromotionalPixPayment(
     Number(draw_id),
     reservation.reservation_id,
-    pix.payment_id
+    pix
   );
 
   return {
     ok: true,
+    payment: {
+      id: pix.payment_id,
+      status: pix.status || "pending",
+      qr_code: pix.qr_code,
+      qr_code_base64: pix.qr_code_base64,
+      ticket_url: pix.ticket_url,
+      amount_cents: amountCents,
+    },
     payment_id: pix.payment_id,
     reservation_id: reservation.reservation_id,
     draw_id: Number(reservation.draw_id),
@@ -321,10 +316,7 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
 export async function listMyParticipations(user = null) {
   const userId = Number(user?.id);
   if (!Number.isInteger(userId)) {
-    const err = new Error("Usuário não autenticado.");
-    err.status = 401;
-    err.code = "unauthorized";
-    throw err;
+    throw httpError(401, "login_required", "Usuário não autenticado.");
   }
 
   const rows = await listPromotionalParticipationsForUser(
@@ -335,7 +327,7 @@ export async function listMyParticipations(user = null) {
   return rows.map((row) => {
     const numbers = Array.isArray(row.numbers) ? row.numbers.map(Number) : [];
     const priceCents = Number(row.price_cents || 0);
-    const amountCents = numbers.length * priceCents;
+    const amountCents = Number(row.total_cents || 0) || numbers.length * priceCents;
     return {
       type: "promotional",
       draw_id: Number(row.draw_id),
@@ -355,9 +347,25 @@ export async function listMyParticipations(user = null) {
       payment_id: row.payment_id || null,
       price_cents: priceCents,
       amount_cents: amountCents,
+      total_cents: amountCents,
       created_at: row.created_at,
     };
   });
+}
+
+export async function listMyReservations(user = null) {
+  const participations = await listMyParticipations(user);
+  return participations.map((item) => ({
+    type: "promotional",
+    reservation_id: item.reservation_id,
+    draw_id: item.draw_id,
+    draw_title: item.draw_title,
+    numbers: item.numbers.map((n) => String(n)),
+    status: item.status,
+    payment_status: item.payment_status,
+    total_cents: item.total_cents,
+    created_at: item.created_at,
+  }));
 }
 
 export async function updateNumberStatus(draw_id, number, status) {

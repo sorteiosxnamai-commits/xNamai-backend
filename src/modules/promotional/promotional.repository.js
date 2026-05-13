@@ -35,9 +35,16 @@ export async function ensurePromotionalSchema(client = null) {
       buyer_name TEXT NOT NULL DEFAULT '',
       buyer_email TEXT NOT NULL DEFAULT '',
       buyer_phone TEXT NOT NULL DEFAULT '',
+      price_cents INTEGER NOT NULL DEFAULT 0,
+      total_cents INTEGER NOT NULL DEFAULT 0,
+      source TEXT DEFAULT 'public',
       status TEXT NOT NULL DEFAULT 'pending',
       payment_status TEXT DEFAULT 'pending',
+      payment_provider TEXT,
       payment_id TEXT,
+      pix_qr_code TEXT,
+      pix_qr_code_base64 TEXT,
+      pix_ticket_url TEXT,
       paid_at TIMESTAMPTZ,
       expires_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -83,11 +90,38 @@ export async function ensurePromotionalSchema(client = null) {
     ON public.promotional_reservations(draw_id, created_at DESC)
   `);
 
+  await dbQuery(client, `
+    CREATE TABLE IF NOT EXISTS public.promotional_payments (
+      id BIGSERIAL PRIMARY KEY,
+      reservation_id UUID REFERENCES public.promotional_reservations(id) ON DELETE CASCADE,
+      draw_id BIGINT REFERENCES public.promotional_draws(id) ON DELETE CASCADE,
+      user_id INTEGER,
+      provider TEXT NOT NULL DEFAULT 'mercadopago',
+      payment_id TEXT UNIQUE,
+      external_reference TEXT,
+      status TEXT DEFAULT 'pending',
+      status_detail TEXT,
+      amount_cents INTEGER NOT NULL DEFAULT 0,
+      qr_code TEXT,
+      qr_code_base64 TEXT,
+      ticket_url TEXT,
+      raw JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
   await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS banner_url TEXT`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_provider TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS price_cents INTEGER NOT NULL DEFAULT 0`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS total_cents INTEGER NOT NULL DEFAULT 0`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'public'`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_ticket_url TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reservation_id UUID NULL`);
@@ -116,6 +150,14 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `
     CREATE INDEX IF NOT EXISTS promotional_numbers_payment_id_idx
     ON public.promotional_numbers(payment_id)
+  `);
+  await dbQuery(client, `
+    CREATE INDEX IF NOT EXISTS promotional_payments_payment_id_idx
+    ON public.promotional_payments(payment_id)
+  `);
+  await dbQuery(client, `
+    CREATE INDEX IF NOT EXISTS promotional_payments_reservation_idx
+    ON public.promotional_payments(reservation_id)
   `);
 }
 
@@ -168,7 +210,7 @@ export async function listActivePromotionalDraws() {
   await ensurePromotionalSchema();
   const { rows } = await query(`
     ${drawSelect()}
-    WHERE d.status = 'active'
+    WHERE d.status IN ('active', 'published', 'open')
       AND (d.starts_at IS NULL OR d.starts_at <= NOW())
       AND (d.ends_at IS NULL OR d.ends_at >= NOW())
     GROUP BY d.id
@@ -456,12 +498,13 @@ export async function listPromotionalParticipationsForUser(user_id, email) {
       r.status AS reservation_status,
       r.payment_status,
       r.payment_id,
+      COALESCE(NULLIF(r.price_cents, 0), d.price_cents, 0)::int AS price_cents,
+      COALESCE(NULLIF(r.total_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS total_cents,
       r.created_at,
       r.expires_at,
       r.paid_at,
       d.title AS draw_title,
-      d.prize,
-      d.price_cents
+      d.prize
     FROM public.promotional_reservations r
     JOIN public.promotional_draws d ON d.id = r.draw_id
     WHERE
@@ -472,7 +515,7 @@ export async function listPromotionalParticipationsForUser(user_id, email) {
   return rows;
 }
 
-export async function getPromotionalReservationForPayment(draw_id, reservation_id) {
+export async function getPromotionalReservationForPayment(draw_id, reservation_id, user_id = null) {
   await ensurePromotionalSchema();
   const { rows } = await query(`
     SELECT
@@ -485,31 +528,50 @@ export async function getPromotionalReservationForPayment(draw_id, reservation_i
       r.buyer_phone,
       r.status,
       r.payment_status,
+      COALESCE(NULLIF(r.price_cents, 0), d.price_cents, 0)::int AS price_cents,
+      COALESCE(NULLIF(r.total_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS total_cents,
+      r.payment_provider,
       r.payment_id,
+      r.pix_qr_code,
+      r.pix_qr_code_base64,
+      r.pix_ticket_url,
       r.expires_at,
       d.title,
-      d.prize,
-      d.price_cents
+      d.prize
     FROM public.promotional_reservations r
     JOIN public.promotional_draws d ON d.id = r.draw_id
     WHERE r.id = $1
       AND r.draw_id = $2
+      AND ($3::integer IS NULL OR r.user_id = $3::integer)
     LIMIT 1
-  `, [reservation_id, draw_id]);
+  `, [reservation_id, draw_id, user_id]);
   return rows[0] || null;
 }
 
-export async function attachPromotionalPixPayment(draw_id, reservation_id, payment_id) {
+export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) {
   await ensurePromotionalSchema();
+  const paymentId = typeof pix === "object" ? pix.payment_id : pix;
+  const status = typeof pix === "object" ? pix.status : "pending";
+  const statusDetail = typeof pix === "object" ? pix.status_detail : null;
+  const amountCents = typeof pix === "object" ? pix.amount_cents : 0;
+  const qrCode = typeof pix === "object" ? pix.qr_code : null;
+  const qrCodeBase64 = typeof pix === "object" ? pix.qr_code_base64 : null;
+  const ticketUrl = typeof pix === "object" ? pix.ticket_url : null;
+  const externalReference = typeof pix === "object" ? pix.external_reference : null;
+  const raw = typeof pix === "object" ? pix.raw : null;
+
   await query(`
     UPDATE public.promotional_reservations
     SET payment_id = $3,
         payment_status = 'pending',
         payment_provider = 'mercadopago',
+        pix_qr_code = $4,
+        pix_qr_code_base64 = $5,
+        pix_ticket_url = $6,
         updated_at = NOW()
     WHERE id = $1
       AND draw_id = $2
-  `, [reservation_id, draw_id, payment_id]);
+  `, [reservation_id, draw_id, paymentId, qrCode, qrCodeBase64, ticketUrl]);
 
   await query(`
     UPDATE public.promotional_numbers
@@ -518,7 +580,64 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, payme
         updated_at = NOW()
     WHERE draw_id = $1
       AND reservation_id = $2
-  `, [draw_id, reservation_id, payment_id]);
+  `, [draw_id, reservation_id, paymentId]);
+
+  await query(`
+    INSERT INTO public.promotional_payments (
+      reservation_id,
+      draw_id,
+      user_id,
+      provider,
+      payment_id,
+      external_reference,
+      status,
+      status_detail,
+      amount_cents,
+      qr_code,
+      qr_code_base64,
+      ticket_url,
+      raw
+    )
+    SELECT
+      r.id,
+      r.draw_id,
+      r.user_id,
+      'mercadopago',
+      $3,
+      $4,
+      $5,
+      $6,
+      $7,
+      $8,
+      $9,
+      $10,
+      $11::jsonb
+    FROM public.promotional_reservations r
+    WHERE r.id = $1
+      AND r.draw_id = $2
+    ON CONFLICT (payment_id)
+    DO UPDATE SET
+      status = EXCLUDED.status,
+      status_detail = EXCLUDED.status_detail,
+      amount_cents = EXCLUDED.amount_cents,
+      qr_code = EXCLUDED.qr_code,
+      qr_code_base64 = EXCLUDED.qr_code_base64,
+      ticket_url = EXCLUDED.ticket_url,
+      raw = EXCLUDED.raw,
+      updated_at = NOW()
+  `, [
+    reservation_id,
+    draw_id,
+    paymentId,
+    externalReference,
+    status || "pending",
+    statusDetail,
+    amountCents || 0,
+    qrCode,
+    qrCodeBase64,
+    ticketUrl,
+    raw ? JSON.stringify(raw) : null,
+  ]);
 }
 
 export async function reservePromotionalNumbers(draw_id, payload) {
@@ -530,6 +649,21 @@ export async function reservePromotionalNumbers(draw_id, payload) {
   try {
     await client.query("BEGIN");
     await ensurePromotionalSchema(client);
+
+    if (payload.numbers.length) {
+      const params = [draw_id];
+      const values = payload.numbers.map((n, index) => {
+        const offset = index * 2;
+        params.push(n, formatPromotionalNumber(n));
+        return `($1, $${offset + 2}, $${offset + 3}, 'available')`;
+      });
+
+      await client.query(`
+        INSERT INTO public.promotional_numbers (draw_id, n, label, status)
+        VALUES ${values.join(", ")}
+        ON CONFLICT (draw_id, n) DO NOTHING
+      `, params);
+    }
 
     const locked = await client.query(`
       SELECT id, n, status
@@ -570,13 +704,16 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         buyer_name,
         buyer_email,
         buyer_phone,
+        price_cents,
+        total_cents,
+        source,
         status,
         payment_status,
         expires_at,
         created_at,
         updated_at
       )
-      VALUES ($1,$2,$3,$4::int[],$5,$6,$7,'reserved','pending',$8,NOW(),NOW())
+      VALUES ($1,$2,$3,$4::int[],$5,$6,$7,$8,$9,$10,'reserved','pending',$11,NOW(),NOW())
       RETURNING *
     `, [
       reservationId,
@@ -586,6 +723,9 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       payload.name,
       payload.email,
       payload.phone || "",
+      payload.price_cents || 0,
+      payload.total_cents || 0,
+      payload.source || "public",
       expiresAt,
     ]);
 
@@ -721,6 +861,14 @@ export async function settlePromotionalPaymentApproved(payment_id) {
       reservation.id,
       String(payment_id),
     ]);
+
+    await client.query(`
+      UPDATE public.promotional_payments
+      SET
+        status = 'approved',
+        updated_at = NOW()
+      WHERE payment_id = $1
+    `, [String(payment_id)]);
 
     await client.query("COMMIT");
 
