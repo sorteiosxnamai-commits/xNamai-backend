@@ -134,7 +134,9 @@ async function isNumberFree(client, draw_id, n) {
     r as (
       select 1 from public.reservations
        where draw_id=$1
-         and lower(status) in ('active','pending','paid')
+         and lower(coalesce(status,'')) in ('active','pending','reserved','reservado','pendente','hold')
+         and lower(coalesce(payment_status, 'pending')) not in ('paid','approved','pago','expired','cancelled','canceled')
+         and (expires_at is null or expires_at > now())
          and (
            $2 = any(numbers)
            or n = $2

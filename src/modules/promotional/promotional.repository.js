@@ -316,8 +316,8 @@ export async function releaseExpiredPromotionalReservations(client = null, drawI
            reserved_until = NULL,
            updated_at = NOW()
      WHERE LOWER(COALESCE(pn.status, 'available')) = 'reserved'
-       AND pn.expires_at IS NOT NULL
-       AND pn.expires_at <= NOW()
+       AND COALESCE(pn.expires_at, pn.reserved_until) IS NOT NULL
+       AND COALESCE(pn.expires_at, pn.reserved_until) <= NOW()
        AND NOT EXISTS (
          SELECT 1
            FROM public.promotional_reservations pr
@@ -355,7 +355,7 @@ export async function releaseExpiredPromotionalReservations(client = null, drawI
            updated_at = NOW()
       FROM expired e
      WHERE pn.draw_id = e.draw_id
-       AND pn.reservation_id = COALESCE(e.reservation_id, e.id)
+       AND pn.reservation_id::text = COALESCE(e.reservation_id::text, e.id::text)
        AND pn.status = 'reserved'
        AND COALESCE(pn.payment_status, 'pending') NOT IN ('paid', 'approved', 'pago')
   `, params);
@@ -1490,6 +1490,7 @@ export async function settlePromotionalPaymentApproved(payment_id) {
     const reservationResult = await client.query(`
       SELECT
         id,
+        reservation_id,
         draw_id,
         user_id,
         numbers,
@@ -1527,14 +1528,15 @@ export async function settlePromotionalPaymentApproved(payment_id) {
       SET
         status = 'sold',
         payment_status = 'paid',
-        payment_id = $3,
+        payment_id = $4,
         sold_at = COALESCE(sold_at, NOW()),
         updated_at = NOW()
       WHERE draw_id = $1
-        AND reservation_id = $2
+        AND (reservation_id::text = $2::text OR reservation_id::text = $3::text)
     `, [
       reservation.draw_id,
       reservation.id,
+      reservation.reservation_id || reservation.id,
       String(payment_id),
     ]);
 
@@ -1551,7 +1553,7 @@ export async function settlePromotionalPaymentApproved(payment_id) {
     return {
       ok: true,
       payment_id: String(payment_id),
-      reservation_id: reservation.id,
+      reservation_id: reservation.reservation_id || reservation.id,
       draw_id: reservation.draw_id,
       numbers: reservation.numbers,
     };

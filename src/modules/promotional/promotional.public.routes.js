@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../../middleware/auth.js";
+import { query } from "../../db.js";
 import {
   createPromotionalPix,
   getNumbers,
@@ -288,6 +289,77 @@ router.post("/:drawId/reservations/:reservationId/pix", requirePromotionalAuth, 
     });
     return handleError(res, err, {
       tag: "[PROMOTIONAL_PIX_ERROR]",
+    });
+  }
+});
+
+router.post("/reservations/:reservationId/pix", requirePromotionalAuth, async (req, res) => {
+  const reservationId = String(req.params.reservationId || "").trim();
+
+  try {
+    if (!reservationId) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_reservation_id",
+        message: "Reserva promocional não informada.",
+      });
+    }
+
+    const reservationResult = await query(
+      `SELECT id, reservation_id, draw_id, user_id
+         FROM public.promotional_reservations
+        WHERE id::text = $1::text
+           OR reservation_id::text = $1::text
+        LIMIT 1`,
+      [reservationId]
+    );
+
+    const reservation = reservationResult.rows?.[0];
+
+    if (!reservation) {
+      return res.status(404).json({
+        ok: false,
+        error: "reservation_not_found",
+        message: "Reserva promocional não encontrada.",
+      });
+    }
+
+    if (Number(reservation.user_id) !== Number(req.user?.id)) {
+      return res.status(403).json({
+        ok: false,
+        error: "forbidden",
+        message: "Você não tem permissão para pagar esta reserva promocional.",
+      });
+    }
+
+    console.log("[PROMOTIONAL_PIX_CREATE_ALIAS]", {
+      drawId: reservation.draw_id,
+      reservationId,
+      userId: req.user?.id,
+    });
+
+    const pix = await createPromotionalPix(
+      reservation.draw_id,
+      reservationId,
+      req.user,
+      {
+        notification_url: `${getBaseUrl(req)}/api/payments/webhook/mercadopago`,
+      }
+    );
+
+    return res.json(pix);
+  } catch (err) {
+    console.error("[PROMOTIONAL_PIX_ALIAS_ERROR]", {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      stack: err?.stack,
+      reservationId,
+      userId: req.user?.id,
+    });
+
+    return handleError(res, err, {
+      tag: "[PROMOTIONAL_PIX_ALIAS_ERROR]",
     });
   }
 });

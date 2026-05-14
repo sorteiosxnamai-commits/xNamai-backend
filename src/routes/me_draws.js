@@ -54,7 +54,9 @@ router.get("/:id/board", requireAuth, async (req, res) => {
       `SELECT unnest(r.numbers)::int AS n
          FROM public.reservations r
         WHERE r.draw_id = $1
-          AND LOWER(r.status) IN ('active','pending','paid')`,
+          AND LOWER(COALESCE(r.status, '')) IN ('active','pending','reserved','reservado','pendente','hold')
+          AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN ('paid','approved','pago','expired','cancelled','canceled')
+          AND (r.expires_at IS NULL OR r.expires_at > NOW())`,
       [drawId]
     );
 
