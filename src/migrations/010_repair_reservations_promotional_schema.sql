@@ -31,6 +31,7 @@ ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS archived_at TIMEST
 -- Reservas promocionais
 CREATE TABLE IF NOT EXISTS public.promotional_reservations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  reservation_id UUID UNIQUE,
   draw_id BIGINT NOT NULL,
   user_id INTEGER NULL,
   buyer_email TEXT NULL,
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS public.promotional_reservations (
   payment_status TEXT NOT NULL DEFAULT 'pending',
   payment_provider TEXT NULL,
   payment_id TEXT NULL,
+  preference_id TEXT NULL,
   pix_qr_code TEXT NULL,
   pix_qr_code_base64 TEXT NULL,
   pix_copy_paste TEXT NULL,
@@ -55,6 +57,7 @@ CREATE TABLE IF NOT EXISTS public.promotional_reservations (
 );
 
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS user_id INTEGER NULL;
+ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS reservation_id UUID NULL;
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT NULL;
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT NULL;
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT NULL;
@@ -66,6 +69,7 @@ ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS status TEXT
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_provider TEXT NULL;
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL;
+ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS preference_id TEXT NULL;
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL;
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL;
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL;
@@ -75,11 +79,20 @@ ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS source TEXT
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
+UPDATE public.promotional_reservations
+   SET reservation_id = CASE
+     WHEN id::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       THEN id::text::uuid
+     ELSE gen_random_uuid()
+   END
+ WHERE reservation_id IS NULL;
+
 -- Números promocionais: suporta tanto number_value quanto n.
 CREATE TABLE IF NOT EXISTS public.promotional_numbers (
   id BIGSERIAL PRIMARY KEY,
   draw_id BIGINT NOT NULL,
   n INTEGER NULL,
+  number INTEGER NULL,
   number_value INTEGER NULL,
   label TEXT NULL,
   status TEXT DEFAULT 'available',
@@ -92,12 +105,14 @@ CREATE TABLE IF NOT EXISTS public.promotional_numbers (
   payment_id TEXT NULL,
   reserved_at TIMESTAMPTZ NULL,
   expires_at TIMESTAMPTZ NULL,
+  reserved_until TIMESTAMPTZ NULL,
   sold_at TIMESTAMPTZ NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS n INTEGER NULL;
+ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS number INTEGER NULL;
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS number_value INTEGER NULL;
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS label TEXT NULL;
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'available';
@@ -109,6 +124,7 @@ ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_status T
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL;
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL;
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;
+ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL;
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS sold_at TIMESTAMPTZ NULL;
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
@@ -143,15 +159,19 @@ BEGIN
 END $$;
 
 UPDATE public.promotional_numbers
-   SET n = number_value
- WHERE n IS NULL AND number_value IS NOT NULL;
+   SET n = COALESCE(number_value, number)
+ WHERE n IS NULL AND COALESCE(number_value, number) IS NOT NULL;
 
 UPDATE public.promotional_numbers
-   SET number_value = n
- WHERE number_value IS NULL AND n IS NOT NULL;
+   SET number = COALESCE(n, number_value)
+ WHERE number IS NULL AND COALESCE(n, number_value) IS NOT NULL;
 
 UPDATE public.promotional_numbers
-   SET label = COALESCE(label, number_value::text, n::text)
+   SET number_value = COALESCE(n, number)
+ WHERE number_value IS NULL AND COALESCE(n, number) IS NOT NULL;
+
+UPDATE public.promotional_numbers
+   SET label = COALESCE(label, number_value::text, n::text, number::text)
  WHERE label IS NULL;
 
 -- Reservas normais
@@ -179,8 +199,14 @@ CREATE INDEX IF NOT EXISTS promotional_numbers_draw_n_idx
 CREATE INDEX IF NOT EXISTS promotional_numbers_draw_number_value_idx
   ON public.promotional_numbers(draw_id, number_value);
 
+CREATE INDEX IF NOT EXISTS promotional_numbers_draw_number_idx
+  ON public.promotional_numbers(draw_id, number);
+
 CREATE INDEX IF NOT EXISTS promotional_reservations_user_idx
   ON public.promotional_reservations(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS promotional_reservations_reservation_id_idx
+  ON public.promotional_reservations(reservation_id);
 
 CREATE INDEX IF NOT EXISTS reservations_user_idx
   ON public.reservations(user_id, created_at DESC);

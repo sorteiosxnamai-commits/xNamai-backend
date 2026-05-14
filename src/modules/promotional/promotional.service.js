@@ -2,6 +2,8 @@ import { getPool } from "../../db.js";
 import { mpCreatePixPayment } from "../../services/mercadopago.js";
 import {
   attachPromotionalPixPayment,
+  attachPaymentToPromotionalReservation,
+  assignPromotionalNumbersToUser,
   createPromotionalReservation,
   createPromotionalDraw,
   createPromotionalNumbers,
@@ -245,8 +247,23 @@ export async function reserveNumbers(draw_id, payloadOrUserId, userOrPayload = n
   return result;
 }
 
+export async function assignNumbersToUser(draw_id, payload = {}) {
+  return assignPromotionalNumbersToUser({
+    drawId: draw_id,
+    userId: payload.user_id || payload.userId || payload.client_id || payload.clientId,
+    numbers: payload.numbers || payload.selectedNumbers || [],
+    buyer: {
+      buyer_name: payload.buyer_name || payload.name,
+      buyer_email: payload.buyer_email || payload.email,
+      buyer_phone: payload.buyer_phone || payload.phone,
+    },
+    status: payload.status || "reserved",
+  });
+}
+
 export async function createPromotionalPix(draw_id, reservation_id, user = null, options = {}) {
-  const userId = Number(user?.id);
+  const userObject = typeof user === "number" || typeof user === "string" ? { id: user } : (user || {});
+  const userId = Number(userObject?.id);
   if (!Number.isInteger(userId)) {
     throw httpError(401, "login_required", "Usuário não autenticado.");
   }
@@ -301,8 +318,8 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
   const pix = await mpCreatePixPayment({
     amount_cents: amountCents,
     description,
-    payer_email: reservation.buyer_email || user.email,
-    payer_name: reservation.buyer_name || user.name || user.email,
+    payer_email: reservation.buyer_email || userObject.email,
+    payer_name: reservation.buyer_name || userObject.name || userObject.email,
     external_reference: `promotional:${reservation.reservation_id}`,
     notification_url: notificationUrl,
     metadata: {
@@ -462,3 +479,5 @@ export async function settlePromotionalPaymentByPaymentId(paymentId) {
 
   return settlePromotionalPaymentApproved(String(paymentId));
 }
+
+export { attachPaymentToPromotionalReservation };

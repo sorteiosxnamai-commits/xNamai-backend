@@ -145,7 +145,7 @@ router.get("/:id/numbers", async (req, res) => {
   }
 });
 
-function sendReservationCreated(res, reservation) {
+function sendReservationCreated(res, reservation, pix = null) {
   const amountCents = Number(reservation.amount_cents || reservation.total_cents || 0);
   const numbers = Array.isArray(reservation.numbers)
     ? reservation.numbers.map((n) => Number(n))
@@ -171,6 +171,8 @@ function sendReservationCreated(res, reservation) {
     payment_status: paymentStatus,
     can_pay: canPay,
     canPay,
+    pix,
+    payment: pix?.payment || pix || null,
     reservation: {
       reservation_id: reservationId,
       id: reservationId,
@@ -201,6 +203,27 @@ async function createReservationHandler(req, res) {
 
   try {
     const reservation = await reserveNumbers(drawId, { ...(req.body || {}), numbers }, req.user);
+    let pix = null;
+    try {
+      pix = await createPromotionalPix(
+        drawId,
+        reservation.reservation_id || reservation.id,
+        req.user,
+        {
+          notification_url: `${getBaseUrl(req)}/api/payments/webhook/mercadopago`,
+        }
+      );
+    } catch (pixError) {
+      console.error("[promotional.reservation.pix] PIX failed but reservation was kept:", {
+        message: pixError?.message,
+        code: pixError?.code,
+        detail: pixError?.detail,
+        stack: pixError?.stack,
+        drawId,
+        reservationId: reservation.reservation_id || reservation.id,
+        userId,
+      });
+    }
     console.log("[PROMOTIONAL_RESERVATION_CREATE]", {
       reservationId: reservation.id || reservation.reservation_id,
       drawId,
@@ -208,7 +231,7 @@ async function createReservationHandler(req, res) {
       numbers: reservation.numbers,
       amount_cents: reservation.amount_cents || reservation.total_cents || 0,
     });
-    return sendReservationCreated(res, reservation);
+    return sendReservationCreated(res, reservation, pix);
   } catch (err) {
     console.error("[PROMOTIONAL_RESERVATION_ERROR]", {
       message: err?.message,

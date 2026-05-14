@@ -117,7 +117,7 @@ router.get('/reservations', requireAuth, async (req, res) => {
     try {
       const promotional = await query(
         `SELECT
-            r.id AS reservation_id,
+            COALESCE(r.reservation_id::text, r.id::text) AS reservation_id,
             r.draw_id,
             d.title AS draw_title,
             r.numbers,
@@ -125,7 +125,10 @@ router.get('/reservations', requireAuth, async (req, res) => {
             r.payment_status,
             COALESCE(NULLIF(r.amount_cents, 0), NULLIF(r.total_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS amount_cents,
             r.created_at,
-            r.expires_at
+            r.expires_at,
+            r.pix_qr_code,
+            r.pix_qr_code_base64,
+            r.pix_ticket_url
            FROM public.promotional_reservations r
            JOIN public.promotional_draws d ON d.id = r.draw_id
           WHERE r.user_id = $1
@@ -145,6 +148,9 @@ router.get('/reservations', requireAuth, async (req, res) => {
           .map((n) => String(n).padStart(2, "0"))
           .join(", "),
         amount_cents: Number(row.amount_cents || 0),
+        pix_qr_code: row.pix_qr_code || null,
+        pix_qr_code_base64: row.pix_qr_code_base64 || null,
+        pix_ticket_url: row.pix_ticket_url || null,
         status: row.status || "reserved",
         status_label: statusLabel(row.status),
         payment_status: row.payment_status || "pending",

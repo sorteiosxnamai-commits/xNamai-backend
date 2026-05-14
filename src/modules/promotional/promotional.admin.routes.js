@@ -2,6 +2,7 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../../middleware/auth.js";
 import {
   archiveDraw,
+  assignNumbersToUser,
   changeDrawStatus,
   createDraw,
   getAdminDraw,
@@ -90,6 +91,21 @@ router.patch("/draws/:id/numbers/:number", async (req, res) => {
     return handleError(res, err, {
       logTag: "[PROMOTIONAL_ADMIN_NUMBERS_ERROR]",
       friendlyError: "Erro ao processar número promocional.",
+    });
+  }
+});
+
+router.post("/draws/:id/assign-numbers", async (req, res) => {
+  try {
+    const result = await assignNumbersToUser(req.params.id, req.body || {});
+    return res.status(201).json({
+      ok: true,
+      ...result,
+    });
+  } catch (err) {
+    return handleError(res, err, {
+      logTag: "[PROMOTIONAL_ADMIN_ASSIGN_NUMBERS_ERROR]",
+      friendlyError: "Erro ao atribuir número promocional.",
     });
   }
 });

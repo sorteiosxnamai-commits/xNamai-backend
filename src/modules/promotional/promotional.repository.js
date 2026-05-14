@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { getPool, query } from "../../db.js";
 import { formatPromotionalNumber } from "./promotional.utils.js";
 
@@ -37,6 +38,7 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `
     CREATE TABLE IF NOT EXISTS public.promotional_reservations (
       id UUID PRIMARY KEY,
+      reservation_id UUID UNIQUE,
       draw_id BIGINT NOT NULL REFERENCES public.promotional_draws(id) ON DELETE CASCADE,
       user_id INTEGER,
       numbers INTEGER[] NOT NULL DEFAULT '{}',
@@ -51,6 +53,7 @@ export async function ensurePromotionalSchema(client = null) {
       payment_status TEXT DEFAULT 'pending',
       payment_provider TEXT,
       payment_id TEXT,
+      preference_id TEXT,
       pix_qr_code TEXT,
       pix_qr_code_base64 TEXT,
       pix_copy_paste TEXT,
@@ -133,8 +136,19 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
   await dbQuery(client, `ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS reservation_id UUID NULL`);
+  await dbQuery(client, `
+    UPDATE public.promotional_reservations
+       SET reservation_id = CASE
+         WHEN id::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+           THEN id::text::uuid
+         ELSE gen_random_uuid()
+       END
+     WHERE reservation_id IS NULL
+  `);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS preference_id TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_provider TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS price_cents INTEGER NOT NULL DEFAULT 0`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS total_cents INTEGER NOT NULL DEFAULT 0`);
@@ -144,7 +158,23 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS pix_ticket_url TEXT NULL`);
-  await dbQuery(client, `ALTER TABLE public.promotional_reservations ALTER COLUMN id SET DEFAULT gen_random_uuid()`);
+  await dbQuery(client, `
+    DO $$
+    DECLARE
+      id_type text;
+    BEGIN
+      SELECT udt_name
+        INTO id_type
+        FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'promotional_reservations'
+         AND column_name = 'id';
+
+      IF id_type = 'uuid' THEN
+        ALTER TABLE public.promotional_reservations ALTER COLUMN id SET DEFAULT gen_random_uuid();
+      END IF;
+    END $$;
+  `);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS n INTEGER NULL`);
@@ -197,6 +227,7 @@ export async function ensurePromotionalSchema(client = null) {
 
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_provider TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS preference_id TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
@@ -211,6 +242,10 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `
     CREATE INDEX IF NOT EXISTS promotional_reservations_payment_id_idx
     ON public.promotional_reservations(payment_id)
+  `);
+  await dbQuery(client, `
+    CREATE INDEX IF NOT EXISTS promotional_reservations_reservation_id_idx
+    ON public.promotional_reservations(reservation_id)
   `);
   await dbQuery(client, `
     CREATE INDEX IF NOT EXISTS promotional_numbers_payment_id_idx
@@ -234,8 +269,14 @@ export async function ensurePromotionalSchema(client = null) {
   `);
 }
 
-export async function releaseExpiredPromotionalReservations(client = null) {
+export async function releaseExpiredPromotionalReservations(client = null, drawId = null) {
   const db = getDbRunner(client);
+  const params = [];
+  let drawFilter = "";
+  if (drawId != null && drawId !== "") {
+    params.push(Number(drawId));
+    drawFilter = `AND pr.draw_id = $${params.length}`;
+  }
 
   const result = await db.query(`
     WITH expired AS (
@@ -243,11 +284,12 @@ export async function releaseExpiredPromotionalReservations(client = null) {
          SET status = 'expired',
              payment_status = 'expired',
              updated_at = NOW()
-       WHERE pr.status IN ('reserved', 'pending', 'active')
-         AND COALESCE(pr.payment_status, 'pending') NOT IN ('paid', 'approved', 'pago')
+       WHERE pr.status = 'reserved'
+         AND COALESCE(pr.payment_status, 'pending') IN ('pending', 'waiting', 'open')
          AND pr.expires_at IS NOT NULL
-         AND pr.expires_at <= NOW()
-       RETURNING pr.id, pr.draw_id
+         AND pr.expires_at < NOW()
+         ${drawFilter}
+       RETURNING pr.id, pr.reservation_id, pr.draw_id
     )
     UPDATE public.promotional_numbers pn
        SET status = 'available',
@@ -264,11 +306,38 @@ export async function releaseExpiredPromotionalReservations(client = null) {
            updated_at = NOW()
       FROM expired e
      WHERE pn.draw_id = e.draw_id
-       AND pn.reservation_id = e.id
-       AND pn.status IN ('reserved', 'pending')
+       AND pn.reservation_id = COALESCE(e.reservation_id, e.id)
+       AND pn.status = 'reserved'
        AND COALESCE(pn.payment_status, 'pending') NOT IN ('paid', 'approved', 'pago')
-  `);
+  `, params);
   return Number(result.rowCount || 0);
+}
+
+export async function expirePromotionalReservations(drawId = null) {
+  await ensurePromotionalSchema();
+  const pool = await getPool();
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const expired = await releaseExpiredPromotionalReservations(client, drawId);
+    await client.query("COMMIT");
+    return {
+      ok: true,
+      expired,
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[promotional.expireReservations] error:", {
+      message: error?.message,
+      code: error?.code,
+      detail: error?.detail,
+      stack: error?.stack,
+    });
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 function drawSelect() {
@@ -589,7 +658,7 @@ export async function getPromotionalParticipants(draw_id) {
   await releaseExpiredPromotionalReservations();
   const { rows } = await query(`
     SELECT
-      r.id AS reservation_id,
+      COALESCE(r.reservation_id::text, r.id::text) AS reservation_id,
       r.user_id,
       r.buyer_name,
       r.buyer_email,
@@ -632,7 +701,7 @@ export async function listPromotionalParticipationsForUser(user_id, email) {
   await releaseExpiredPromotionalReservations();
   const { rows } = await query(`
     SELECT
-      r.id AS reservation_id,
+      COALESCE(r.reservation_id::text, r.id::text) AS reservation_id,
       r.draw_id,
       r.user_id,
       r.numbers,
@@ -659,10 +728,11 @@ export async function listPromotionalParticipationsForUser(user_id, email) {
 
 export async function getPromotionalReservationForPayment(draw_id, reservation_id, user_id = null) {
   await ensurePromotionalSchema();
-  await releaseExpiredPromotionalReservations();
+  await releaseExpiredPromotionalReservations(null, draw_id);
   const { rows } = await query(`
     SELECT
-      r.id AS reservation_id,
+      COALESCE(r.reservation_id::text, r.id::text) AS reservation_id,
+      r.id,
       r.draw_id,
       r.user_id,
       r.numbers,
@@ -684,17 +754,18 @@ export async function getPromotionalReservationForPayment(draw_id, reservation_i
       d.prize
     FROM public.promotional_reservations r
     JOIN public.promotional_draws d ON d.id = r.draw_id
-    WHERE r.id = $1
+    WHERE (r.id::text = $1::text OR r.reservation_id::text = $1::text)
       AND r.draw_id = $2
       AND ($3::integer IS NULL OR r.user_id = $3::integer)
     LIMIT 1
-  `, [reservation_id, draw_id, user_id]);
+  `, [String(reservation_id), draw_id, user_id]);
   return rows[0] || null;
 }
 
 export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) {
   await ensurePromotionalSchema();
   const paymentId = typeof pix === "object" ? pix.payment_id : pix;
+  const preferenceId = typeof pix === "object" ? pix.preference_id : null;
   const status = typeof pix === "object" ? pix.status : "pending";
   const statusDetail = typeof pix === "object" ? pix.status_detail : null;
   const amountCents = typeof pix === "object" ? pix.amount_cents : 0;
@@ -707,6 +778,7 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
   await query(`
     UPDATE public.promotional_reservations
     SET payment_id = $3,
+        preference_id = COALESCE($7, preference_id),
         payment_status = 'pending',
         status = 'reserved',
         payment_provider = 'mercadopago',
@@ -715,9 +787,9 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
         pix_copy_paste = $4,
         pix_ticket_url = $6,
         updated_at = NOW()
-    WHERE id = $1
+    WHERE (id::text = $1::text OR reservation_id::text = $1::text)
       AND draw_id = $2
-  `, [reservation_id, draw_id, paymentId, qrCode, qrCodeBase64, ticketUrl]);
+  `, [String(reservation_id), draw_id, paymentId, qrCode, qrCodeBase64, ticketUrl, preferenceId]);
 
   await query(`
     UPDATE public.promotional_numbers
@@ -726,8 +798,8 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
         status = 'reserved',
         updated_at = NOW()
     WHERE draw_id = $1
-      AND reservation_id = $2
-  `, [draw_id, reservation_id, paymentId]);
+      AND reservation_id::text = $2::text
+  `, [draw_id, String(reservation_id), paymentId]);
 
   await query(`
     INSERT INTO public.promotional_payments (
@@ -760,7 +832,7 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
       $10,
       $11::jsonb
     FROM public.promotional_reservations r
-    WHERE r.id = $1
+    WHERE (r.id::text = $1::text OR r.reservation_id::text = $1::text)
       AND r.draw_id = $2
     ON CONFLICT (payment_id)
     DO UPDATE SET
@@ -773,7 +845,7 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
       raw = EXCLUDED.raw,
       updated_at = NOW()
   `, [
-    reservation_id,
+    String(reservation_id),
     draw_id,
     paymentId,
     externalReference,
@@ -787,10 +859,65 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
   ]);
 }
 
+export async function attachPaymentToPromotionalReservation({
+  reservationId,
+  paymentId = null,
+  preferenceId = null,
+  pixQrCode = null,
+  pixQrCodeBase64 = null,
+  pixTicketUrl = null,
+} = {}) {
+  await ensurePromotionalSchema();
+  const result = await query(
+    `
+    UPDATE public.promotional_reservations
+    SET payment_id = COALESCE($2, payment_id),
+        preference_id = COALESCE($3, preference_id),
+        payment_provider = COALESCE(payment_provider, 'mercadopago'),
+        payment_status = 'pending',
+        status = 'reserved',
+        pix_qr_code = COALESCE($4, pix_qr_code),
+        pix_qr_code_base64 = COALESCE($5, pix_qr_code_base64),
+        pix_copy_paste = COALESCE($4, pix_copy_paste),
+        pix_ticket_url = COALESCE($6, pix_ticket_url),
+        updated_at = NOW()
+    WHERE id::text = $1::text OR reservation_id::text = $1::text
+    RETURNING *
+    `,
+    [
+      String(reservationId || ""),
+      paymentId,
+      preferenceId,
+      pixQrCode,
+      pixQrCodeBase64,
+      pixTicketUrl,
+    ]
+  );
+
+  const reservation = result.rows[0] || null;
+  if (reservation) {
+    await query(
+      `
+      UPDATE public.promotional_numbers
+      SET payment_id = COALESCE($2, payment_id),
+          payment_status = 'pending',
+          status = 'reserved',
+          updated_at = NOW()
+      WHERE reservation_id::text = $1::text
+      `,
+      [String(reservation.reservation_id || reservation.id), paymentId]
+    );
+  }
+
+  return reservation;
+}
+
 export async function createPromotionalReservation({
   drawId,
   userId,
   numbers,
+  user = null,
+  buyer = null,
   buyerName = "",
   buyerEmail = "",
   buyerPhone = "",
@@ -802,10 +929,11 @@ export async function createPromotionalReservation({
   try {
     await client.query("BEGIN");
     await ensurePromotionalSchema(client);
-    await releaseExpiredPromotionalReservations(client);
+    await releaseExpiredPromotionalReservations(client, drawId);
 
     const normalizedDrawId = Number.parseInt(drawId, 10);
-    const normalizedUserId = Number.parseInt(userId, 10);
+    const resolvedUserId = userId ?? user?.id ?? buyer?.user_id;
+    const normalizedUserId = Number.parseInt(resolvedUserId, 10);
 
     if (!Number.isFinite(normalizedDrawId)) {
       const err = new Error("Sorteio promocional inválido.");
@@ -833,6 +961,7 @@ export async function createPromotionalReservation({
         number_end
       FROM public.promotional_draws
       WHERE id = $1
+        AND archived_at IS NULL
       FOR UPDATE
     `, [normalizedDrawId]);
 
@@ -875,6 +1004,9 @@ export async function createPromotionalReservation({
       throw err;
     }
 
+    const resolvedBuyerName = buyerName || buyer?.buyer_name || buyer?.name || user?.name || user?.nome || "";
+    const resolvedBuyerEmail = buyerEmail || buyer?.buyer_email || buyer?.email || user?.email || "";
+    const resolvedBuyerPhone = buyerPhone || buyer?.buyer_phone || buyer?.phone || user?.phone || "";
     const priceCents = Number.parseInt(draw.price_cents, 10);
     const amountCents = priceCents * cleanNumbers.length;
     if (!Number.isFinite(priceCents) || priceCents <= 0 || amountCents <= 0) {
@@ -943,8 +1075,11 @@ export async function createPromotionalReservation({
       }
     }
 
+    const reservationId = randomUUID();
     const reservation = await client.query(`
       INSERT INTO public.promotional_reservations (
+        id,
+        reservation_id,
         draw_id,
         user_id,
         numbers,
@@ -964,28 +1099,32 @@ export async function createPromotionalReservation({
       VALUES (
         $1,
         $2,
-        $3::int[],
+        $3,
         $4,
-        $5,
+        $5::int[],
         $6,
         $7,
         $8,
-        $8,
         $9,
+        $10,
+        $10,
+        $11,
         'reserved',
         'pending',
-        $10,
+        $12,
         NOW(),
         NOW()
       )
       RETURNING *
     `, [
+      reservationId,
+      reservationId,
       normalizedDrawId,
       normalizedUserId,
       cleanNumbers,
-      buyerName || buyerEmail || "",
-      buyerEmail || "",
-      buyerPhone || "",
+      resolvedBuyerName || resolvedBuyerEmail || "",
+      resolvedBuyerEmail || "",
+      resolvedBuyerPhone || "",
       priceCents,
       amountCents,
       source,
@@ -1019,11 +1158,11 @@ export async function createPromotionalReservation({
       `, [
         normalizedDrawId,
         cleanNumbers,
-        reservation.rows[0].id,
+        reservation.rows[0].reservation_id || reservation.rows[0].id,
         normalizedUserId,
-        buyerName || buyerEmail || "",
-        buyerEmail || "",
-        buyerPhone || null,
+        resolvedBuyerName || resolvedBuyerEmail || "",
+        resolvedBuyerEmail || "",
+        resolvedBuyerPhone || null,
         selectedNumberIds,
         reservation.rows[0].expires_at,
       ]);
@@ -1058,13 +1197,16 @@ export async function createPromotionalReservation({
     }
 
     await client.query("COMMIT");
+    const returnedReservationId = reservation.rows[0].reservation_id || reservation.rows[0].id;
     return {
       ok: true,
       reservation: reservation.rows[0],
-      reservation_id: reservation.rows[0].id,
-      reservationId: reservation.rows[0].id,
+      id: returnedReservationId,
+      reservation_id: returnedReservationId,
+      reservationId: returnedReservationId,
       draw_id: normalizedDrawId,
       drawId: normalizedDrawId,
+      draw_title: draw.title || "",
       numbers: cleanNumbers,
       price_cents: priceCents,
       priceCents,
@@ -1113,6 +1255,174 @@ export async function reservePromotionalNumbers(draw_id, userOrPayload, numbers 
   });
 
   return result;
+}
+
+export async function assignPromotionalNumbersToUser({
+  drawId,
+  userId,
+  numbers,
+  buyer = {},
+  status = "reserved",
+} = {}) {
+  const pool = await getPool();
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensurePromotionalSchema(client);
+
+    const normalizedDrawId = Number.parseInt(drawId, 10);
+    const normalizedUserId = Number.parseInt(userId, 10);
+    const normalizedNumbers = [...new Set(
+      (Array.isArray(numbers) ? numbers : [])
+        .map((n) => Number.parseInt(n, 10))
+        .filter((n) => Number.isInteger(n) && n >= 0)
+    )];
+
+    if (!Number.isInteger(normalizedDrawId) || !Number.isInteger(normalizedUserId) || !normalizedNumbers.length) {
+      const err = new Error("Dados inválidos para atribuir números promocionais.");
+      err.status = 400;
+      err.code = "invalid_promotional_assignment";
+      throw err;
+    }
+
+    const drawResult = await client.query(`
+      SELECT id, title, price_cents, number_start, number_end
+      FROM public.promotional_draws
+      WHERE id = $1
+      LIMIT 1
+    `, [normalizedDrawId]);
+
+    if (!drawResult.rowCount) {
+      const err = new Error("Sorteio promocional não encontrado.");
+      err.status = 404;
+      err.code = "promotional_draw_not_found";
+      throw err;
+    }
+
+    const draw = drawResult.rows[0];
+    const start = Number.parseInt(draw.number_start ?? 0, 10);
+    const end = Number.parseInt(draw.number_end ?? 99, 10);
+    const outsideRange = normalizedNumbers.filter((n) => n < start || n > end);
+    if (outsideRange.length) {
+      const err = new Error(`Número fora do intervalo permitido: ${start} até ${end}.`);
+      err.status = 400;
+      err.code = "invalid_number";
+      err.conflicts = outsideRange;
+      throw err;
+    }
+
+    await createPromotionalNumbers(normalizedDrawId, start, end, client);
+
+    const buyerName = buyer.buyer_name || buyer.name || "";
+    const buyerEmail = buyer.buyer_email || buyer.email || "";
+    const buyerPhone = buyer.buyer_phone || buyer.phone || "";
+    const finalStatus = String(status || "reserved").toLowerCase() === "unavailable" ? "unavailable" : "reserved";
+    const amountCents = Math.max(0, Number(draw.price_cents || 0)) * normalizedNumbers.length;
+    const reservationId = randomUUID();
+
+    const reservationResult = await client.query(`
+      INSERT INTO public.promotional_reservations (
+        id,
+        reservation_id,
+        draw_id,
+        user_id,
+        numbers,
+        buyer_name,
+        buyer_email,
+        buyer_phone,
+        price_cents,
+        total_cents,
+        amount_cents,
+        source,
+        status,
+        payment_status,
+        expires_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $1,
+        $2,
+        $3,
+        $4::int[],
+        $5,
+        $6,
+        $7,
+        $8,
+        $9,
+        $9,
+        'admin',
+        $10,
+        'pending',
+        NULL,
+        NOW(),
+        NOW()
+      )
+      RETURNING *
+    `, [
+      reservationId,
+      normalizedDrawId,
+      normalizedUserId,
+      normalizedNumbers,
+      buyerName || buyerEmail,
+      buyerEmail,
+      buyerPhone,
+      Number(draw.price_cents || 0),
+      amountCents,
+      finalStatus,
+    ]);
+
+    await client.query(`
+      UPDATE public.promotional_numbers
+      SET status = $3,
+          reservation_id = $4,
+          buyer_name = $5,
+          buyer_email = $6,
+          buyer_phone = $7,
+          user_id = $8,
+          payment_status = 'pending',
+          reserved_at = NOW(),
+          expires_at = NULL,
+          reserved_until = NULL,
+          updated_at = NOW()
+      WHERE draw_id = $1
+        AND COALESCE(n, number_value, number) = ANY($2::int[])
+        AND COALESCE(payment_status, 'pending') NOT IN ('paid', 'approved', 'pago')
+        AND status NOT IN ('sold', 'paid', 'blocked')
+    `, [
+      normalizedDrawId,
+      normalizedNumbers,
+      finalStatus,
+      reservationId,
+      buyerName || buyerEmail,
+      buyerEmail,
+      buyerPhone,
+      normalizedUserId,
+    ]);
+
+    await client.query("COMMIT");
+    return {
+      ok: true,
+      reservation_id: reservationResult.rows[0].reservation_id || reservationResult.rows[0].id,
+      draw_id: normalizedDrawId,
+      numbers: normalizedNumbers,
+      status: finalStatus,
+      payment_status: "pending",
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[promotional.assignNumbers] error:", {
+      message: error?.message,
+      code: error?.code,
+      detail: error?.detail,
+      stack: error?.stack,
+    });
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function settlePromotionalPaymentApproved(payment_id) {
