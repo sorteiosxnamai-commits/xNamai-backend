@@ -1,4 +1,3 @@
-import { randomUUID } from "crypto";
 import { getPool, query } from "../../db.js";
 import { formatPromotionalNumber } from "./promotional.utils.js";
 
@@ -6,6 +5,10 @@ const PROMOTIONAL_RESERVATION_TTL_MINUTES = 30;
 
 function dbQuery(client, text, params = []) {
   return client ? client.query(text, params) : query(text, params);
+}
+
+function getDbRunner(client) {
+  return client && typeof client.query === "function" ? client : { query };
 }
 
 export async function ensurePromotionalSchema(client = null) {
@@ -223,6 +226,41 @@ export async function ensurePromotionalSchema(client = null) {
   `);
 }
 
+export async function releaseExpiredPromotionalReservations(client = null) {
+  const db = getDbRunner(client);
+
+  await db.query(`
+    WITH expired AS (
+      UPDATE public.promotional_reservations pr
+         SET status = 'expired',
+             payment_status = 'expired',
+             updated_at = NOW()
+       WHERE pr.status IN ('reserved', 'pending', 'active')
+         AND COALESCE(pr.payment_status, 'pending') NOT IN ('paid', 'approved', 'pago')
+         AND pr.expires_at IS NOT NULL
+         AND pr.expires_at <= NOW()
+       RETURNING pr.id, pr.draw_id
+    )
+    UPDATE public.promotional_numbers pn
+       SET status = 'available',
+           user_id = NULL,
+           reservation_id = NULL,
+           payment_id = NULL,
+           payment_status = 'pending',
+           buyer_name = NULL,
+           buyer_email = NULL,
+           buyer_phone = NULL,
+           reserved_at = NULL,
+           expires_at = NULL,
+           updated_at = NOW()
+      FROM expired e
+     WHERE pn.draw_id = e.draw_id
+       AND pn.reservation_id = e.id
+       AND pn.status IN ('reserved', 'pending')
+       AND COALESCE(pn.payment_status, 'pending') NOT IN ('paid', 'approved', 'pago')
+  `);
+}
+
 function drawSelect() {
   return `
     SELECT
@@ -274,6 +312,7 @@ function mapAdminNumberRow(row) {
 
 export async function listActivePromotionalDraws() {
   await ensurePromotionalSchema();
+  await releaseExpiredPromotionalReservations();
   const { rows } = await query(`
     ${drawSelect()}
     WHERE d.status IN ('active', 'published', 'open')
@@ -287,6 +326,7 @@ export async function listActivePromotionalDraws() {
 
 export async function listPromotionalDraws() {
   await ensurePromotionalSchema();
+  await releaseExpiredPromotionalReservations();
   const { rows } = await query(`
     ${drawSelect()}
     GROUP BY d.id
@@ -297,6 +337,7 @@ export async function listPromotionalDraws() {
 
 export async function getPromotionalDrawById(id, client = null) {
   await ensurePromotionalSchema(client);
+  await releaseExpiredPromotionalReservations(client);
   const { rows } = await dbQuery(client, `
     ${drawSelect()}
     WHERE d.id = $1
@@ -308,6 +349,7 @@ export async function getPromotionalDrawById(id, client = null) {
 
 export async function getPromotionalNumbers(draw_id, client = null) {
   await ensurePromotionalSchema(client);
+  await releaseExpiredPromotionalReservations(client);
   const { rows } = await dbQuery(client, `
     SELECT *
     FROM public.promotional_numbers
@@ -319,6 +361,7 @@ export async function getPromotionalNumbers(draw_id, client = null) {
 
 export async function getPromotionalNumbersAdmin(draw_id, client = null) {
   await ensurePromotionalSchema(client);
+  await releaseExpiredPromotionalReservations(client);
   const { rows } = await dbQuery(client, `
     SELECT
       id,
@@ -524,6 +567,7 @@ export async function updatePromotionalNumberStatus(draw_id, n, status) {
 
 export async function getPromotionalParticipants(draw_id) {
   await ensurePromotionalSchema();
+  await releaseExpiredPromotionalReservations();
   const { rows } = await query(`
     SELECT
       r.id AS reservation_id,
@@ -546,6 +590,7 @@ export async function getPromotionalParticipants(draw_id) {
 
 export async function countPromotionalNumbersByContact(draw_id, email, phone, user_id = null) {
   await ensurePromotionalSchema();
+  await releaseExpiredPromotionalReservations();
   const { rows } = await query(`
     SELECT COALESCE(SUM(cardinality(numbers)), 0)::int AS total
     FROM public.promotional_reservations
@@ -565,6 +610,7 @@ export async function countPromotionalNumbersByContact(draw_id, email, phone, us
 
 export async function listPromotionalParticipationsForUser(user_id, email) {
   await ensurePromotionalSchema();
+  await releaseExpiredPromotionalReservations();
   const { rows } = await query(`
     SELECT
       r.id AS reservation_id,
@@ -594,6 +640,7 @@ export async function listPromotionalParticipationsForUser(user_id, email) {
 
 export async function getPromotionalReservationForPayment(draw_id, reservation_id, user_id = null) {
   await ensurePromotionalSchema();
+  await releaseExpiredPromotionalReservations();
   const { rows } = await query(`
     SELECT
       r.id AS reservation_id,
@@ -642,6 +689,7 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
     UPDATE public.promotional_reservations
     SET payment_id = $3,
         payment_status = 'pending',
+        status = 'reserved',
         payment_provider = 'mercadopago',
         pix_qr_code = $4,
         pix_qr_code_base64 = $5,
@@ -656,6 +704,7 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
     UPDATE public.promotional_numbers
     SET payment_id = $3,
         payment_status = 'pending',
+        status = 'reserved',
         updated_at = NOW()
     WHERE draw_id = $1
       AND reservation_id = $2
@@ -719,19 +768,87 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
   ]);
 }
 
-export async function reservePromotionalNumbers(draw_id, payload) {
+export async function createPromotionalReservation({
+  drawId,
+  userId,
+  numbers,
+  buyerName = "",
+  buyerEmail = "",
+  buyerPhone = "",
+  source = "public",
+} = {}) {
   const pool = await getPool();
   const client = await pool.connect();
-  const reservationId = randomUUID();
-  const expiresAt = new Date(Date.now() + PROMOTIONAL_RESERVATION_TTL_MINUTES * 60 * 1000).toISOString();
 
   try {
     await client.query("BEGIN");
     await ensurePromotionalSchema(client);
+    await releaseExpiredPromotionalReservations(client);
 
-    if (payload.numbers.length) {
-      const params = [draw_id];
-      const values = payload.numbers.map((n, index) => {
+    const drawResult = await client.query(`
+      SELECT
+        id,
+        title,
+        price_cents,
+        status,
+        number_start,
+        number_end
+      FROM public.promotional_draws
+      WHERE id = $1
+      FOR UPDATE
+    `, [Number(drawId)]);
+
+    if (!drawResult.rowCount) {
+      const err = new Error("Sorteio promocional não encontrado.");
+      err.status = 404;
+      err.code = "promotional_draw_not_found";
+      throw err;
+    }
+
+    const draw = drawResult.rows[0];
+    if (!["active", "open", "published"].includes(String(draw.status || "").toLowerCase())) {
+      const err = new Error("Sorteio promocional não está aberto.");
+      err.status = 400;
+      err.code = "promotional_draw_closed";
+      throw err;
+    }
+
+    const cleanNumbers = [...new Set(
+      (numbers || [])
+        .map((n) => Number(n))
+        .filter((n) => Number.isInteger(n) && n >= 0)
+    )];
+
+    if (!cleanNumbers.length) {
+      const err = new Error("Selecione ao menos um número.");
+      err.status = 400;
+      err.code = "invalid_number";
+      throw err;
+    }
+
+    const start = Number(draw.number_start ?? 0);
+    const end = Number(draw.number_end ?? 99);
+    const outOfRange = cleanNumbers.filter((n) => n < start || n > end);
+    if (outOfRange.length) {
+      const err = new Error("Número fora do intervalo do sorteio promocional.");
+      err.status = 400;
+      err.code = "invalid_number";
+      err.conflicts = outOfRange;
+      throw err;
+    }
+
+    const priceCents = Number(draw.price_cents || 0);
+    const amountCents = priceCents * cleanNumbers.length;
+    if (!Number.isFinite(priceCents) || priceCents <= 0 || amountCents <= 0) {
+      const err = new Error("Valor do sorteio promocional inválido. Configure o valor no painel admin.");
+      err.status = 422;
+      err.code = "promotional_amount_invalid";
+      throw err;
+    }
+
+    if (cleanNumbers.length) {
+      const params = [Number(drawId)];
+      const values = cleanNumbers.map((n, index) => {
         const offset = index * 2;
         params.push(n, formatPromotionalNumber(n));
         return `($1, $${offset + 2}, $${offset + 2}, $${offset + 3}, 'available')`;
@@ -754,16 +871,22 @@ export async function reservePromotionalNumbers(draw_id, payload) {
     }
 
     const locked = await client.query(`
-      SELECT id, n, status, payment_status
+      SELECT
+        id,
+        COALESCE(n, number_value) AS number,
+        status,
+        payment_status,
+        reservation_id,
+        expires_at
       FROM public.promotional_numbers
       WHERE draw_id = $1
-        AND n = ANY($2::int[])
-      ORDER BY n ASC
+        AND COALESCE(n, number_value) = ANY($2::int[])
+      ORDER BY COALESCE(n, number_value) ASC
       FOR UPDATE
-    `, [draw_id, payload.numbers]);
+    `, [Number(drawId), cleanNumbers]);
 
-    const found = new Set(locked.rows.map((row) => Number(row.n)));
-    const missing = payload.numbers.filter((n) => !found.has(n));
+    const found = new Set(locked.rows.map((row) => Number(row.number)));
+    const missing = cleanNumbers.filter((n) => !found.has(n));
     if (missing.length) {
       const err = new Error("Um ou mais números já estão reservados.");
       err.status = 409;
@@ -772,25 +895,32 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       throw err;
     }
 
-    const unavailable = locked.rows
+    const conflicts = locked.rows
       .filter((row) => {
         const status = String(row.status || "").toLowerCase();
         const paymentStatus = String(row.payment_status || "").toLowerCase();
-        return status !== "available" || ["paid", "approved", "pago"].includes(paymentStatus);
+        const activeReservation = row.reservation_id && row.expires_at && new Date(row.expires_at).getTime() > Date.now();
+        return (
+          ["reserved", "sold", "blocked", "unavailable", "pending"].includes(status) ||
+          ["paid", "approved", "pago"].includes(paymentStatus) ||
+          activeReservation
+        );
       })
-      .map((row) => Number(row.n));
-    if (unavailable.length) {
-      const err = new Error("Um ou mais números já estão reservados.");
+      .map((row) => Number(row.number));
+    if (conflicts.length) {
+      const used = conflicts.map((n) => String(n).padStart(2, "0"));
+      const err = new Error(`Número(s) já reservado(s): ${used.join(", ")}`);
       err.status = 409;
+      err.statusCode = 409;
       err.code = "PROMOTIONAL_NUMBER_ALREADY_RESERVED";
-      err.conflicts = unavailable;
+      err.conflicts = conflicts;
       throw err;
     }
 
     const selectedNumberIds = [];
     const selectedByNumber = new Set();
     for (const row of locked.rows) {
-      const number = Number(row.n);
+      const number = Number(row.number);
       if (!selectedByNumber.has(number)) {
         selectedByNumber.add(number);
         selectedNumberIds.push(Number(row.id));
@@ -799,7 +929,6 @@ export async function reservePromotionalNumbers(draw_id, payload) {
 
     const reservation = await client.query(`
       INSERT INTO public.promotional_reservations (
-        id,
         draw_id,
         user_id,
         numbers,
@@ -816,21 +945,35 @@ export async function reservePromotionalNumbers(draw_id, payload) {
         created_at,
         updated_at
       )
-      VALUES ($1,$2,$3,$4::int[],$5,$6,$7,$8,$9,$10,$11,'reserved','pending',$12,NOW(),NOW())
+      VALUES (
+        $1,
+        $2,
+        $3::int[],
+        $4,
+        $5,
+        $6,
+        $7,
+        $8,
+        $8,
+        $9,
+        'reserved',
+        'pending',
+        $10,
+        NOW(),
+        NOW()
+      )
       RETURNING *
     `, [
-      reservationId,
-      draw_id,
-      payload.user_id,
-      payload.numbers,
-      payload.name,
-      payload.email,
-      payload.phone || "",
-      payload.price_cents || 0,
-      payload.total_cents || 0,
-      payload.amount_cents || payload.total_cents || 0,
-      payload.source || "public",
-      expiresAt,
+      Number(drawId),
+      Number(userId),
+      cleanNumbers,
+      buyerName || buyerEmail || "",
+      buyerEmail || "",
+      buyerPhone || "",
+      priceCents,
+      amountCents,
+      source,
+      new Date(Date.now() + PROMOTIONAL_RESERVATION_TTL_MINUTES * 60 * 1000).toISOString(),
     ]);
 
     let updateResult;
@@ -846,23 +989,24 @@ export async function reservePromotionalNumbers(draw_id, payload) {
           buyer_email = $6,
           buyer_phone = $7,
           payment_status = 'pending',
+          payment_id = NULL,
           reserved_at = NOW(),
           expires_at = $9,
           updated_at = NOW()
         WHERE draw_id = $1
-          AND n = ANY($2::int[])
+          AND COALESCE(n, number_value) = ANY($2::int[])
           AND status = 'available'
           AND id = ANY($8::bigint[])
       `, [
-        draw_id,
-        payload.numbers,
-        reservationId,
-        payload.user_id,
-        payload.name,
-        payload.email,
-        payload.phone || null,
+        Number(drawId),
+        cleanNumbers,
+        reservation.rows[0].id,
+        Number(userId),
+        buyerName || buyerEmail || "",
+        buyerEmail || "",
+        buyerPhone || null,
         selectedNumberIds,
-        expiresAt,
+        reservation.rows[0].expires_at,
       ]);
     } catch (updateErr) {
       console.error("[PROMOTIONAL_RESERVE_NUMBER_UPDATE_ERROR]", {
@@ -879,12 +1023,12 @@ export async function reservePromotionalNumbers(draw_id, payload) {
       throw err;
     }
 
-    const expected = payload.numbers.length;
+    const expected = cleanNumbers.length;
     if (Number(updateResult.rowCount) !== expected) {
       console.error("[PROMOTIONAL_RESERVE_NUMBER_UPDATE_ERROR]", {
         code: "ROWCOUNT_MISMATCH",
         message: `Esperado ${expected} linhas, atualizadas ${updateResult.rowCount}`,
-        detail: { draw_id, numbers: payload.numbers },
+        detail: { drawId, numbers: cleanNumbers },
         hint: null,
         stack: null,
       });
@@ -895,7 +1039,17 @@ export async function reservePromotionalNumbers(draw_id, payload) {
     }
 
     await client.query("COMMIT");
-    return reservation.rows[0];
+    return {
+      ok: true,
+      reservation: reservation.rows[0],
+      reservation_id: reservation.rows[0].id,
+      draw_id: Number(drawId),
+      numbers: cleanNumbers,
+      amount_cents: amountCents,
+      expires_at: reservation.rows[0].expires_at,
+      payment_status: "pending",
+      status: "reserved",
+    };
   } catch (err) {
     console.error("[PROMOTIONAL_RESERVE_ERROR]", {
       code: err?.code,
@@ -909,6 +1063,20 @@ export async function reservePromotionalNumbers(draw_id, payload) {
   } finally {
     client.release();
   }
+}
+
+export async function reservePromotionalNumbers(draw_id, payload) {
+  const result = await createPromotionalReservation({
+    drawId: draw_id,
+    userId: payload.user_id,
+    numbers: payload.numbers,
+    buyerName: payload.name,
+    buyerEmail: payload.email,
+    buyerPhone: payload.phone,
+    source: payload.source || "public",
+  });
+
+  return result.reservation;
 }
 
 export async function settlePromotionalPaymentApproved(payment_id) {

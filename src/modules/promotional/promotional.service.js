@@ -2,6 +2,7 @@ import { getPool } from "../../db.js";
 import { mpCreatePixPayment } from "../../services/mercadopago.js";
 import {
   attachPromotionalPixPayment,
+  createPromotionalReservation,
   createPromotionalDraw,
   createPromotionalNumbers,
   countPromotionalNumbersByContact,
@@ -14,7 +15,6 @@ import {
   listActivePromotionalDraws,
   listPromotionalDraws,
   listPromotionalParticipationsForUser,
-  reservePromotionalNumbers,
   settlePromotionalPaymentApproved,
   updatePromotionalDraw,
   updatePromotionalDrawStatus,
@@ -224,13 +224,16 @@ export async function reserveNumbers(draw_id, payload, user = null) {
     );
   }
 
-  return reservePromotionalNumbers(draw.id, {
-    ...data,
-    price_cents: priceCents,
-    total_cents: totalCents,
-    amount_cents: totalCents,
+  const result = await createPromotionalReservation({
+    drawId: draw.id,
+    userId: data.user_id,
+    numbers: data.numbers,
+    buyerName: data.name,
+    buyerEmail: data.email,
+    buyerPhone: data.phone,
     source: "public",
   });
+  return result.reservation;
 }
 
 export async function createPromotionalPix(draw_id, reservation_id, user = null, options = {}) {
@@ -249,6 +252,15 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
     throw notFound("Reserva promocional não encontrada.", "reservation_not_found");
   }
 
+  const reservationStatus = String(reservation.status || "").toLowerCase();
+  if (!["reserved", "pending", "active"].includes(reservationStatus)) {
+    throw httpError(400, "promotional_reservation_not_payable", "Reserva promocional inválida para pagamento.");
+  }
+
+  if (reservation.expires_at && new Date(reservation.expires_at).getTime() <= Date.now()) {
+    throw httpError(400, "promotional_reservation_expired", "Reserva promocional expirada.");
+  }
+
   const paymentStatus = String(reservation.payment_status || "pending").toLowerCase();
   if (paymentStatus === "paid") {
     throw httpError(400, "already_paid", "Esta reserva já está paga.");
@@ -256,10 +268,6 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
 
   if (paymentStatus !== "pending") {
     throw httpError(400, "promotional_payment_not_pending", "Esta reserva promocional não está pendente de pagamento.");
-  }
-
-  if (["cancelled", "expired"].includes(String(reservation.status || "").toLowerCase())) {
-    throw httpError(400, "promotional_draw_closed", "Esta reserva promocional não pode ser paga.");
   }
 
   const numbers = Array.isArray(reservation.numbers) ? reservation.numbers.map(Number) : [];

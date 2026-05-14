@@ -76,7 +76,7 @@ function handleError(res, err, options = {}) {
     "promotional_numbers_unavailable",
     "number_unavailable",
   ].includes(err?.code);
-  const status = isUnavailable ? 400 : (err?.status || err?.statusCode || 500);
+  const status = isUnavailable ? (err?.status || err?.statusCode || 409) : (err?.status || err?.statusCode || 500);
   const tag = options.tag || "[PROMOTIONAL_ERROR]";
   const responseCode = isUnavailable
     ? "PROMOTIONAL_NUMBER_ALREADY_RESERVED"
@@ -150,22 +150,35 @@ function sendReservationCreated(res, reservation) {
   const numbers = Array.isArray(reservation.numbers)
     ? reservation.numbers.map((n) => Number(n))
     : [];
+  const reservationId = reservation.id || reservation.reservation_id;
+  const drawId = Number(reservation.draw_id);
+  const status = reservation.status || "reserved";
+  const paymentStatus = reservation.payment_status || "pending";
 
   return res.status(201).json({
     ok: true,
     success: true,
+    reservation_id: reservationId,
+    draw_id: drawId,
+    numbers,
+    amount_cents: amountCents,
+    expires_at: reservation.expires_at || null,
+    status,
+    payment_status: paymentStatus,
     reservation: {
-      reservation_id: reservation.id,
-      id: reservation.id,
-      draw_id: Number(reservation.draw_id),
+      reservation_id: reservationId,
+      id: reservationId,
+      draw_id: drawId,
       numbers,
-      status: reservation.status || "reserved",
-      payment_status: reservation.payment_status || "pending",
+      status,
+      payment_status: paymentStatus,
       price_cents: Number(reservation.price_cents || 0),
       amount_cents: amountCents,
       total_cents: amountCents,
+      expires_at: reservation.expires_at || null,
       type: "promotional",
     },
+    message: "Números promocionais reservados com sucesso.",
   });
 }
 
