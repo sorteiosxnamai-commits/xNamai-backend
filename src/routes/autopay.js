@@ -12,6 +12,10 @@ import {
   mpSaveCard,
   mpChargeCard,
 } from "../services/mercadopago.js";
+import {
+  ensurePromotionalSchema,
+  releaseExpiredPromotionalReservations,
+} from "../modules/promotional/promotional.repository.js";
 
 const router = express.Router();
 
@@ -157,7 +161,64 @@ router.get("/autopay/claims", requireAuth, async (req, res) => {
       [userId]
     );
 
+    let promotionalClaims = [];
+    try {
+      await ensurePromotionalSchema();
+      await releaseExpiredPromotionalReservations();
+      const promotional = await query(
+        `
+        SELECT
+          r.id AS reservation_id,
+          r.draw_id,
+          d.title,
+          r.numbers,
+          r.payment_status,
+          r.status,
+          COALESCE(NULLIF(r.amount_cents, 0), NULLIF(r.total_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS amount_cents,
+          r.created_at,
+          r.expires_at
+        FROM public.promotional_reservations r
+        JOIN public.promotional_draws d ON d.id = r.draw_id
+        WHERE r.user_id = $1
+          AND r.status IN ('reserved', 'pending', 'active', 'paid')
+        ORDER BY r.created_at DESC
+        `,
+        [userId]
+      );
+
+      promotionalClaims = promotional.rows.map((row) => {
+        const status = row.status || "reserved";
+        const paymentStatus = row.payment_status || "pending";
+        return {
+          type: "promotional",
+          source: "promotional",
+          reservation_id: row.reservation_id,
+          draw_id: Number(row.draw_id),
+          title: row.title || "Sorteio Promocional",
+          numbers: Array.isArray(row.numbers) ? row.numbers.map(Number) : [],
+          payment_status: paymentStatus,
+          status,
+          can_pay:
+            String(paymentStatus).toLowerCase() === "pending" &&
+            String(status).toLowerCase() === "reserved",
+          amount_cents: Number(row.amount_cents || 0),
+          created_at: row.created_at,
+          expires_at: row.expires_at,
+        };
+      });
+    } catch (promoErr) {
+      console.error("[AUTOPAY_CLAIMS_PROMOTIONAL_ERROR]", {
+        message: promoErr?.message,
+        code: promoErr?.code,
+        detail: promoErr?.detail,
+        stack: promoErr?.stack,
+      });
+    }
+
     res.json({
+      success: true,
+      ok: true,
+      claims: promotionalClaims,
       taken: all.rows?.[0]?.taken || [],
       mine: mine.rows?.[0]?.mine || [],
     });

@@ -3,7 +3,10 @@ import { Router } from 'express';
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getTicketPriceCents } from '../services/config.js';
-import { ensurePromotionalSchema } from '../modules/promotional/promotional.repository.js';
+import {
+  ensurePromotionalSchema,
+  releaseExpiredPromotionalReservations,
+} from '../modules/promotional/promotional.repository.js';
 
 const router = Router();
 
@@ -76,6 +79,7 @@ router.get('/reservations', requireAuth, async (req, res) => {
     console.log("[ACCOUNT_RESERVATIONS]", { userId: req.user?.id });
     await ensureReservationPaymentColumns();
     await ensurePromotionalSchema();
+    await releaseExpiredPromotionalReservations();
     const userId = req.user.id;
     const r = await query(
       `select id, draw_id, numbers, status, payment_status, amount_cents, created_at, expires_at
@@ -120,7 +124,8 @@ router.get('/reservations', requireAuth, async (req, res) => {
             r.status,
             r.payment_status,
             COALESCE(NULLIF(r.amount_cents, 0), NULLIF(r.total_cents, 0), cardinality(r.numbers) * COALESCE(d.price_cents, 0), 0)::int AS amount_cents,
-            r.created_at
+            r.created_at,
+            r.expires_at
            FROM public.promotional_reservations r
            JOIN public.promotional_draws d ON d.id = r.draw_id
           WHERE r.user_id = $1
@@ -130,6 +135,7 @@ router.get('/reservations', requireAuth, async (req, res) => {
 
       promotionalItems = promotional.rows.map((row) => ({
         type: "promotional",
+        source: "promotional",
         id: row.reservation_id,
         reservation_id: row.reservation_id,
         draw_id: Number(row.draw_id),
@@ -145,9 +151,10 @@ router.get('/reservations', requireAuth, async (req, res) => {
         payment_label: paymentLabel(row.payment_status),
         can_pay:
           String(row.payment_status || "pending").toLowerCase() === "pending" &&
-          !["cancelled", "expired"].includes(String(row.status || "").toLowerCase()),
+          ["reserved", "pending", "active"].includes(String(row.status || "reserved").toLowerCase()),
         created_at: row.created_at,
         day: formatDay(row.created_at),
+        expires_at: row.expires_at,
       }));
     } catch (promoErr) {
       console.error("[ACCOUNT_RESERVATIONS] promotional error:", {

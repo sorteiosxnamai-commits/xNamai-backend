@@ -154,6 +154,10 @@ function sendReservationCreated(res, reservation) {
   const drawId = Number(reservation.draw_id);
   const status = reservation.status || "reserved";
   const paymentStatus = reservation.payment_status || "pending";
+  const canPay = reservation.can_pay ?? (
+    String(paymentStatus).toLowerCase() === "pending" &&
+    String(status).toLowerCase() === "reserved"
+  );
 
   return res.status(201).json({
     ok: true,
@@ -165,6 +169,8 @@ function sendReservationCreated(res, reservation) {
     expires_at: reservation.expires_at || null,
     status,
     payment_status: paymentStatus,
+    can_pay: canPay,
+    canPay,
     reservation: {
       reservation_id: reservationId,
       id: reservationId,
@@ -176,6 +182,8 @@ function sendReservationCreated(res, reservation) {
       amount_cents: amountCents,
       total_cents: amountCents,
       expires_at: reservation.expires_at || null,
+      can_pay: canPay,
+      canPay,
       type: "promotional",
     },
     message: "Números promocionais reservados com sucesso.",
@@ -194,7 +202,7 @@ async function createReservationHandler(req, res) {
   try {
     const reservation = await reserveNumbers(drawId, { ...(req.body || {}), numbers }, req.user);
     console.log("[PROMOTIONAL_RESERVATION_CREATE]", {
-      reservationId: reservation.id,
+      reservationId: reservation.id || reservation.reservation_id,
       drawId,
       userId,
       numbers: reservation.numbers,

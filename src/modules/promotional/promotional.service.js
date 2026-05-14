@@ -163,10 +163,19 @@ function formatDay(value) {
   }).format(new Date(value));
 }
 
-export async function reserveNumbers(draw_id, payload, user = null) {
+export async function reserveNumbers(draw_id, payloadOrUserId, userOrPayload = null) {
+  const calledWithUserId = typeof payloadOrUserId === "number" || typeof payloadOrUserId === "string";
+  const payload = calledWithUserId ? (userOrPayload || {}) : (payloadOrUserId || {});
+  const user = calledWithUserId
+    ? {
+        id: payloadOrUserId,
+        email: payload?.buyer_email || payload?.email || "",
+        name: payload?.buyer_name || payload?.name || payload?.email || "",
+      }
+    : userOrPayload;
   const userId = Number(user?.id);
-  const userEmail = String(user?.email || "").trim();
-  const userName = String(user?.name || user?.nome || userEmail).trim();
+  const userEmail = String(user?.email || payload?.buyer_email || payload?.email || "").trim();
+  const userName = String(user?.name || user?.nome || payload?.buyer_name || payload?.name || userEmail).trim();
 
   if (!Number.isInteger(userId) || !userEmail) {
     throw httpError(401, "login_required", "Usuário não autenticado.");
@@ -218,9 +227,9 @@ export async function reserveNumbers(draw_id, payload, user = null) {
 
   if (!Number.isFinite(priceCents) || priceCents <= 0 || totalCents <= 0) {
     throw httpError(
-      422,
+      400,
       "promotional_amount_invalid",
-      "Valor do sorteio promocional inválido. Configure o valor no painel admin."
+      "Sorteio promocional sem valor configurado. Defina o valor no admin."
     );
   }
 
@@ -233,7 +242,7 @@ export async function reserveNumbers(draw_id, payload, user = null) {
     buyerPhone: data.phone,
     source: "public",
   });
-  return result.reservation;
+  return result;
 }
 
 export async function createPromotionalPix(draw_id, reservation_id, user = null, options = {}) {
@@ -252,16 +261,20 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
     throw notFound("Reserva promocional não encontrada.", "reservation_not_found");
   }
 
+  const paymentStatus = String(reservation.payment_status || "pending").toLowerCase();
   const reservationStatus = String(reservation.status || "").toLowerCase();
+  if (
+    reservationStatus === "expired" ||
+    paymentStatus === "expired" ||
+    (reservation.expires_at && new Date(reservation.expires_at).getTime() <= Date.now())
+  ) {
+    throw httpError(410, "promotional_reservation_expired", "Reserva promocional expirada.");
+  }
+
   if (!["reserved", "pending", "active"].includes(reservationStatus)) {
     throw httpError(400, "promotional_reservation_not_payable", "Reserva promocional inválida para pagamento.");
   }
 
-  if (reservation.expires_at && new Date(reservation.expires_at).getTime() <= Date.now()) {
-    throw httpError(400, "promotional_reservation_expired", "Reserva promocional expirada.");
-  }
-
-  const paymentStatus = String(reservation.payment_status || "pending").toLowerCase();
   if (paymentStatus === "paid") {
     throw httpError(400, "already_paid", "Esta reserva já está paga.");
   }
@@ -276,9 +289,9 @@ export async function createPromotionalPix(draw_id, reservation_id, user = null,
   const amountCents = savedTotalCents > 0 ? savedTotalCents : numbers.length * priceCents;
   if (!Number.isFinite(amountCents) || amountCents <= 0) {
     throw httpError(
-      422,
+      400,
       "promotional_amount_invalid",
-      "Valor do sorteio promocional inválido. Configure o valor no painel admin."
+      "Sorteio promocional sem valor configurado. Defina o valor no admin."
     );
   }
 
@@ -366,7 +379,7 @@ export async function listMyParticipations(user = null) {
       status_label: mapReservationStatus(row.reservation_status),
       can_pay:
         String(row.payment_status || "pending").toLowerCase() === "pending" &&
-        !["cancelled", "expired"].includes(String(row.reservation_status || "").toLowerCase()),
+        ["reserved", "pending", "active"].includes(String(row.reservation_status || "reserved").toLowerCase()),
       reservation_id: row.reservation_id,
       payment_id: row.payment_id || null,
       price_cents: priceCents,
@@ -381,13 +394,17 @@ export async function listMyReservations(user = null) {
   const participations = await listMyParticipations(user);
   return participations.map((item) => ({
     type: "promotional",
+    source: "promotional",
     reservation_id: item.reservation_id,
     draw_id: item.draw_id,
+    title: item.draw_title,
     draw_title: item.draw_title,
     numbers: item.numbers.map((n) => String(n)),
     status: item.status,
     payment_status: item.payment_status,
+    amount_cents: item.amount_cents,
     total_cents: item.total_cents,
+    can_pay: item.can_pay,
     created_at: item.created_at,
   }));
 }

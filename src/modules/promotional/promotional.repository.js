@@ -148,11 +148,13 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS n INTEGER NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS number INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS number_value INTEGER NULL`);
-  await dbQuery(client, `UPDATE public.promotional_numbers SET n = number_value WHERE n IS NULL AND number_value IS NOT NULL`);
-  await dbQuery(client, `UPDATE public.promotional_numbers SET number_value = n WHERE number_value IS NULL AND n IS NOT NULL`);
+  await dbQuery(client, `UPDATE public.promotional_numbers SET n = COALESCE(number_value, number) WHERE n IS NULL AND COALESCE(number_value, number) IS NOT NULL`);
+  await dbQuery(client, `UPDATE public.promotional_numbers SET number = COALESCE(n, number_value) WHERE number IS NULL AND COALESCE(n, number_value) IS NOT NULL`);
+  await dbQuery(client, `UPDATE public.promotional_numbers SET number_value = COALESCE(n, number) WHERE number_value IS NULL AND COALESCE(n, number) IS NOT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS label TEXT`);
-  await dbQuery(client, `UPDATE public.promotional_numbers SET label = COALESCE(label, number_value::text, n::text) WHERE label IS NULL`);
+  await dbQuery(client, `UPDATE public.promotional_numbers SET label = COALESCE(label, number_value::text, n::text, number::text) WHERE label IS NULL`);
   await dbQuery(client, `
     DO $$
     DECLARE
@@ -191,6 +193,7 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_phone TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
 
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_provider TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
@@ -202,6 +205,7 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS sold_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
 
   await dbQuery(client, `
@@ -217,6 +221,10 @@ export async function ensurePromotionalSchema(client = null) {
     ON public.promotional_numbers(draw_id, number_value)
   `);
   await dbQuery(client, `
+    CREATE INDEX IF NOT EXISTS promotional_numbers_draw_number_idx
+    ON public.promotional_numbers(draw_id, number)
+  `);
+  await dbQuery(client, `
     CREATE INDEX IF NOT EXISTS promotional_payments_payment_id_idx
     ON public.promotional_payments(payment_id)
   `);
@@ -229,7 +237,7 @@ export async function ensurePromotionalSchema(client = null) {
 export async function releaseExpiredPromotionalReservations(client = null) {
   const db = getDbRunner(client);
 
-  await db.query(`
+  const result = await db.query(`
     WITH expired AS (
       UPDATE public.promotional_reservations pr
          SET status = 'expired',
@@ -252,6 +260,7 @@ export async function releaseExpiredPromotionalReservations(client = null) {
            buyer_phone = NULL,
            reserved_at = NULL,
            expires_at = NULL,
+           reserved_until = NULL,
            updated_at = NOW()
       FROM expired e
      WHERE pn.draw_id = e.draw_id
@@ -259,27 +268,29 @@ export async function releaseExpiredPromotionalReservations(client = null) {
        AND pn.status IN ('reserved', 'pending')
        AND COALESCE(pn.payment_status, 'pending') NOT IN ('paid', 'approved', 'pago')
   `);
+  return Number(result.rowCount || 0);
 }
 
 function drawSelect() {
   return `
     SELECT
       d.*,
-      COUNT(n.n)::int AS total_numbers,
-      COUNT(n.n) FILTER (WHERE n.status = 'available')::int AS available_numbers,
-      COUNT(n.n) FILTER (WHERE n.status = 'reserved')::int AS reserved_numbers,
-      COUNT(n.n) FILTER (WHERE n.status = 'sold')::int AS sold_numbers,
-      COUNT(n.n) FILTER (WHERE n.status = 'blocked')::int AS blocked_numbers
+      COUNT(COALESCE(n.n, n.number_value, n.number))::int AS total_numbers,
+      COUNT(COALESCE(n.n, n.number_value, n.number)) FILTER (WHERE n.status = 'available')::int AS available_numbers,
+      COUNT(COALESCE(n.n, n.number_value, n.number)) FILTER (WHERE n.status = 'reserved')::int AS reserved_numbers,
+      COUNT(COALESCE(n.n, n.number_value, n.number)) FILTER (WHERE n.status = 'sold')::int AS sold_numbers,
+      COUNT(COALESCE(n.n, n.number_value, n.number)) FILTER (WHERE n.status = 'blocked')::int AS blocked_numbers
     FROM public.promotional_draws d
     LEFT JOIN public.promotional_numbers n ON n.draw_id = d.id
   `;
 }
 
 function normalizeNumberRow(row) {
-  const value = row.n ?? row.number_value;
+  const value = row.n ?? row.number_value ?? row.number;
   return {
     ...row,
     n: Number(value),
+    number: Number(value),
     number_value: Number(value),
     label: row.label || formatPromotionalNumber(value),
     available: row.status === "available",
@@ -288,11 +299,12 @@ function normalizeNumberRow(row) {
 
 function mapAdminNumberRow(row) {
   if (!row) return null;
-  const value = row.n ?? row.number_value;
+  const value = row.n ?? row.number_value ?? row.number;
   return {
     id: Number(row.id),
     draw_id: Number(row.draw_id),
     n: Number(value),
+    number: Number(value),
     number_value: Number(value),
     label: row.label || formatPromotionalNumber(value),
     status: row.status,
@@ -304,6 +316,8 @@ function mapAdminNumberRow(row) {
     payment_status: row.payment_status ?? "pending",
     payment_id: row.payment_id ?? null,
     reserved_at: row.reserved_at ?? null,
+    reserved_until: row.reserved_until ?? row.expires_at ?? null,
+    expires_at: row.expires_at ?? row.reserved_until ?? null,
     sold_at: row.sold_at ?? null,
     created_at: row.created_at ?? null,
     updated_at: row.updated_at ?? null,
@@ -354,7 +368,7 @@ export async function getPromotionalNumbers(draw_id, client = null) {
     SELECT *
     FROM public.promotional_numbers
     WHERE draw_id = $1
-    ORDER BY n ASC
+    ORDER BY COALESCE(n, number_value, number) ASC
   `, [draw_id]);
   return rows.map(normalizeNumberRow);
 }
@@ -366,8 +380,9 @@ export async function getPromotionalNumbersAdmin(draw_id, client = null) {
     SELECT
       id,
       draw_id,
-      COALESCE(n, number_value) AS n,
-      COALESCE(number_value, n) AS number_value,
+      COALESCE(n, number_value, number) AS n,
+      COALESCE(n, number_value, number) AS number,
+      COALESCE(number_value, n, number) AS number_value,
       label,
       status,
       user_id,
@@ -378,12 +393,14 @@ export async function getPromotionalNumbersAdmin(draw_id, client = null) {
       payment_status,
       payment_id,
       reserved_at,
+      reserved_until,
+      expires_at,
       sold_at,
       created_at,
       updated_at
     FROM public.promotional_numbers
     WHERE draw_id = $1
-    ORDER BY n ASC
+    ORDER BY COALESCE(n, number_value, number) ASC
   `, [draw_id]);
   return rows.map(mapAdminNumberRow);
 }
@@ -471,7 +488,7 @@ export async function createPromotionalNumbers(draw_id, number_start, number_end
   const rows = [];
 
   for (let n = number_start; n <= number_end; n += 1) {
-    rows.push([draw_id, n, n, formatPromotionalNumber(n), "available"]);
+    rows.push([draw_id, n, n, n, formatPromotionalNumber(n), "available"]);
   }
 
   if (!rows.length) return [];
@@ -479,23 +496,23 @@ export async function createPromotionalNumbers(draw_id, number_start, number_end
   const values = [];
   const params = [];
   rows.forEach((row, index) => {
-    const offset = index * 5;
-    values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`);
+    const offset = index * 6;
+    values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6})`);
     params.push(...row);
   });
 
   const { rows: inserted } = await dbQuery(client, `
-    WITH input(draw_id, n, number_value, label, status) AS (
+    WITH input(draw_id, n, number_value, number, label, status) AS (
       VALUES ${values.join(", ")}
     )
-    INSERT INTO public.promotional_numbers (draw_id, n, number_value, label, status)
-    SELECT i.draw_id, i.n, i.number_value, i.label, i.status
+    INSERT INTO public.promotional_numbers (draw_id, n, number_value, number, label, status)
+    SELECT i.draw_id, i.n, i.number_value, i.number, i.label, i.status
     FROM input i
     WHERE NOT EXISTS (
       SELECT 1
       FROM public.promotional_numbers pn
       WHERE pn.draw_id = i.draw_id
-        AND COALESCE(pn.n, pn.number_value) = i.n
+        AND COALESCE(pn.n, pn.number_value, pn.number) = i.n
     )
     RETURNING *
   `, params);
@@ -523,9 +540,11 @@ export async function updatePromotionalNumberStatus(draw_id, n, status) {
         buyer_email = NULL,
         buyer_phone = NULL,
         reserved_at = NULL,
+        expires_at = NULL,
+        reserved_until = NULL,
         sold_at = NULL,
         updated_at = NOW()
-      WHERE draw_id = $1 AND n = $2
+      WHERE draw_id = $1 AND COALESCE(n, number_value, number) = $2
       RETURNING *
     `;
   } else if (s === "sold") {
@@ -535,7 +554,7 @@ export async function updatePromotionalNumberStatus(draw_id, n, status) {
         status = 'sold',
         sold_at = NOW(),
         updated_at = NOW()
-      WHERE draw_id = $1 AND n = $2
+      WHERE draw_id = $1 AND COALESCE(n, number_value, number) = $2
       RETURNING *
     `;
   } else if (s === "reserved") {
@@ -545,7 +564,7 @@ export async function updatePromotionalNumberStatus(draw_id, n, status) {
         status = 'reserved',
         reserved_at = COALESCE(reserved_at, NOW()),
         updated_at = NOW()
-      WHERE draw_id = $1 AND n = $2
+      WHERE draw_id = $1 AND COALESCE(n, number_value, number) = $2
       RETURNING *
     `;
   } else if (s === "blocked") {
@@ -554,7 +573,7 @@ export async function updatePromotionalNumberStatus(draw_id, n, status) {
       SET
         status = 'blocked',
         updated_at = NOW()
-      WHERE draw_id = $1 AND n = $2
+      WHERE draw_id = $1 AND COALESCE(n, number_value, number) = $2
       RETURNING *
     `;
   } else {
@@ -785,6 +804,25 @@ export async function createPromotionalReservation({
     await ensurePromotionalSchema(client);
     await releaseExpiredPromotionalReservations(client);
 
+    const normalizedDrawId = Number.parseInt(drawId, 10);
+    const normalizedUserId = Number.parseInt(userId, 10);
+
+    if (!Number.isFinite(normalizedDrawId)) {
+      const err = new Error("Sorteio promocional inválido.");
+      err.status = 400;
+      err.statusCode = 400;
+      err.code = "invalid_promotional_draw";
+      throw err;
+    }
+
+    if (!Number.isFinite(normalizedUserId)) {
+      const err = new Error("Usuário inválido.");
+      err.status = 401;
+      err.statusCode = 401;
+      err.code = "login_required";
+      throw err;
+    }
+
     const drawResult = await client.query(`
       SELECT
         id,
@@ -796,7 +834,7 @@ export async function createPromotionalReservation({
       FROM public.promotional_draws
       WHERE id = $1
       FOR UPDATE
-    `, [Number(drawId)]);
+    `, [normalizedDrawId]);
 
     if (!drawResult.rowCount) {
       const err = new Error("Sorteio promocional não encontrado.");
@@ -815,7 +853,7 @@ export async function createPromotionalReservation({
 
     const cleanNumbers = [...new Set(
       (numbers || [])
-        .map((n) => Number(n))
+        .map((n) => Number.parseInt(n, 10))
         .filter((n) => Number.isInteger(n) && n >= 0)
     )];
 
@@ -826,8 +864,8 @@ export async function createPromotionalReservation({
       throw err;
     }
 
-    const start = Number(draw.number_start ?? 0);
-    const end = Number(draw.number_end ?? 99);
+    const start = Number.parseInt(draw.number_start ?? 0, 10);
+    const end = Number.parseInt(draw.number_end ?? 99, 10);
     const outOfRange = cleanNumbers.filter((n) => n < start || n > end);
     if (outOfRange.length) {
       const err = new Error("Número fora do intervalo do sorteio promocional.");
@@ -837,53 +875,31 @@ export async function createPromotionalReservation({
       throw err;
     }
 
-    const priceCents = Number(draw.price_cents || 0);
+    const priceCents = Number.parseInt(draw.price_cents, 10);
     const amountCents = priceCents * cleanNumbers.length;
     if (!Number.isFinite(priceCents) || priceCents <= 0 || amountCents <= 0) {
-      const err = new Error("Valor do sorteio promocional inválido. Configure o valor no painel admin.");
-      err.status = 422;
+      const err = new Error("Sorteio promocional sem valor configurado. Defina o valor no admin.");
+      err.status = 400;
       err.code = "promotional_amount_invalid";
       throw err;
     }
 
-    if (cleanNumbers.length) {
-      const params = [Number(drawId)];
-      const values = cleanNumbers.map((n, index) => {
-        const offset = index * 2;
-        params.push(n, formatPromotionalNumber(n));
-        return `($1, $${offset + 2}, $${offset + 2}, $${offset + 3}, 'available')`;
-      });
-
-      await client.query(`
-        WITH input(draw_id, n, number_value, label, status) AS (
-          VALUES ${values.join(", ")}
-        )
-        INSERT INTO public.promotional_numbers (draw_id, n, number_value, label, status)
-        SELECT i.draw_id, i.n, i.number_value, i.label, i.status
-        FROM input i
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM public.promotional_numbers pn
-          WHERE pn.draw_id = i.draw_id
-            AND COALESCE(pn.n, pn.number_value) = i.n
-        )
-      `, params);
-    }
+    await createPromotionalNumbers(normalizedDrawId, start, end, client);
 
     const locked = await client.query(`
       SELECT
         id,
-        COALESCE(n, number_value) AS number,
+        COALESCE(n, number_value, number) AS number,
         status,
         payment_status,
         reservation_id,
-        expires_at
+        COALESCE(expires_at, reserved_until) AS expires_at
       FROM public.promotional_numbers
       WHERE draw_id = $1
-        AND COALESCE(n, number_value) = ANY($2::int[])
-      ORDER BY COALESCE(n, number_value) ASC
+        AND COALESCE(n, number_value, number) = ANY($2::int[])
+      ORDER BY COALESCE(n, number_value, number) ASC
       FOR UPDATE
-    `, [Number(drawId), cleanNumbers]);
+    `, [normalizedDrawId, cleanNumbers]);
 
     const found = new Set(locked.rows.map((row) => Number(row.number)));
     const missing = cleanNumbers.filter((n) => !found.has(n));
@@ -964,8 +980,8 @@ export async function createPromotionalReservation({
       )
       RETURNING *
     `, [
-      Number(drawId),
-      Number(userId),
+      normalizedDrawId,
+      normalizedUserId,
       cleanNumbers,
       buyerName || buyerEmail || "",
       buyerEmail || "",
@@ -982,7 +998,9 @@ export async function createPromotionalReservation({
         UPDATE public.promotional_numbers
         SET
           status = 'reserved',
-          number_value = COALESCE(number_value, n),
+          n = COALESCE(n, number_value, number),
+          number = COALESCE(number, n, number_value),
+          number_value = COALESCE(number_value, n, number),
           reservation_id = $3,
           user_id = $4,
           buyer_name = $5,
@@ -992,16 +1010,17 @@ export async function createPromotionalReservation({
           payment_id = NULL,
           reserved_at = NOW(),
           expires_at = $9,
+          reserved_until = $9,
           updated_at = NOW()
         WHERE draw_id = $1
-          AND COALESCE(n, number_value) = ANY($2::int[])
+          AND COALESCE(n, number_value, number) = ANY($2::int[])
           AND status = 'available'
           AND id = ANY($8::bigint[])
       `, [
-        Number(drawId),
+        normalizedDrawId,
         cleanNumbers,
         reservation.rows[0].id,
-        Number(userId),
+        normalizedUserId,
         buyerName || buyerEmail || "",
         buyerEmail || "",
         buyerPhone || null,
@@ -1043,12 +1062,21 @@ export async function createPromotionalReservation({
       ok: true,
       reservation: reservation.rows[0],
       reservation_id: reservation.rows[0].id,
-      draw_id: Number(drawId),
+      reservationId: reservation.rows[0].id,
+      draw_id: normalizedDrawId,
+      drawId: normalizedDrawId,
       numbers: cleanNumbers,
+      price_cents: priceCents,
+      priceCents,
       amount_cents: amountCents,
+      amountCents,
       expires_at: reservation.rows[0].expires_at,
+      expiresAt: reservation.rows[0].expires_at,
       payment_status: "pending",
+      paymentStatus: "pending",
       status: "reserved",
+      can_pay: true,
+      canPay: true,
     };
   } catch (err) {
     console.error("[PROMOTIONAL_RESERVE_ERROR]", {
@@ -1065,18 +1093,26 @@ export async function createPromotionalReservation({
   }
 }
 
-export async function reservePromotionalNumbers(draw_id, payload) {
+export async function reservePromotionalNumbers(draw_id, userOrPayload, numbers = null, buyer = {}) {
+  const payload = userOrPayload && typeof userOrPayload === "object" && !Array.isArray(userOrPayload)
+    ? userOrPayload
+    : {
+        user_id: userOrPayload,
+        numbers,
+        ...(buyer || {}),
+      };
+
   const result = await createPromotionalReservation({
     drawId: draw_id,
     userId: payload.user_id,
     numbers: payload.numbers,
-    buyerName: payload.name,
-    buyerEmail: payload.email,
-    buyerPhone: payload.phone,
+    buyerName: payload.name || payload.buyer_name,
+    buyerEmail: payload.email || payload.buyer_email,
+    buyerPhone: payload.phone || payload.buyer_phone,
     source: payload.source || "public",
   });
 
-  return result.reservation;
+  return result;
 }
 
 export async function settlePromotionalPaymentApproved(payment_id) {
