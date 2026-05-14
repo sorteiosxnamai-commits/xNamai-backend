@@ -1,6 +1,6 @@
 // Script para executar migrations
 import "dotenv/config";
-import { readFileSync } from "fs";
+import { readdirSync, readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { getPool } from "../db.js";
@@ -13,14 +13,20 @@ async function runMigration() {
   const client = await pool.connect();
 
   try {
-    console.log("Executando migration: 001_add_vindi_columns.sql");
-    
-    const migrationPath = join(__dirname, "../migrations/001_add_vindi_columns.sql");
-    const sql = readFileSync(migrationPath, "utf-8");
+    const migrationsDir = join(__dirname, "../migrations");
+    const migrations = readdirSync(migrationsDir)
+      .filter((file) => file.endsWith(".sql"))
+      .sort((a, b) => a.localeCompare(b));
 
-    await client.query("BEGIN");
-    await client.query(sql);
-    await client.query("COMMIT");
+    for (const migration of migrations) {
+      console.log(`Executando migration: ${migration}`);
+      const migrationPath = join(migrationsDir, migration);
+      const sql = readFileSync(migrationPath, "utf-8");
+
+      await client.query("BEGIN");
+      await client.query(sql);
+      await client.query("COMMIT");
+    }
 
     console.log("✓ Migration executada com sucesso!");
   } catch (e) {

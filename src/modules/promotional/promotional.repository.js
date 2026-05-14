@@ -71,10 +71,12 @@ export async function ensurePromotionalSchema(client = null) {
       draw_id BIGINT NOT NULL REFERENCES public.promotional_draws(id) ON DELETE CASCADE,
       n INTEGER NOT NULL,
       number_value INTEGER,
+      number TEXT,
       label TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'available',
       user_id INTEGER,
       reservation_id UUID REFERENCES public.promotional_reservations(id) ON DELETE SET NULL,
+      reserved_by TEXT,
       payment_id TEXT,
       payment_status TEXT DEFAULT 'pending',
       buyer_name TEXT,
@@ -178,11 +180,30 @@ export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS n INTEGER NULL`);
-  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS number INTEGER NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS number TEXT NULL`);
+  await dbQuery(client, `
+    DO $$
+    DECLARE
+      number_type text;
+    BEGIN
+      SELECT udt_name
+        INTO number_type
+        FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'promotional_numbers'
+         AND column_name = 'number';
+
+      IF number_type IS NOT NULL AND number_type <> 'text' THEN
+        ALTER TABLE public.promotional_numbers
+          ALTER COLUMN number TYPE TEXT
+          USING number::text;
+      END IF;
+    END $$;
+  `);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS number_value INTEGER NULL`);
-  await dbQuery(client, `UPDATE public.promotional_numbers SET n = COALESCE(number_value, number) WHERE n IS NULL AND COALESCE(number_value, number) IS NOT NULL`);
-  await dbQuery(client, `UPDATE public.promotional_numbers SET number = COALESCE(n, number_value) WHERE number IS NULL AND COALESCE(n, number_value) IS NOT NULL`);
-  await dbQuery(client, `UPDATE public.promotional_numbers SET number_value = COALESCE(n, number) WHERE number_value IS NULL AND COALESCE(n, number) IS NOT NULL`);
+  await dbQuery(client, `UPDATE public.promotional_numbers SET n = COALESCE(number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) WHERE n IS NULL AND COALESCE(number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) IS NOT NULL`);
+  await dbQuery(client, `UPDATE public.promotional_numbers SET number = LPAD(COALESCE(n, number_value)::text, 2, '0') WHERE (number IS NULL OR number = '') AND COALESCE(n, number_value) IS NOT NULL`);
+  await dbQuery(client, `UPDATE public.promotional_numbers SET number_value = COALESCE(n, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) WHERE number_value IS NULL AND COALESCE(n, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) IS NOT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS label TEXT`);
   await dbQuery(client, `UPDATE public.promotional_numbers SET label = COALESCE(label, number_value::text, n::text, number::text) WHERE label IS NULL`);
   await dbQuery(client, `
@@ -218,6 +239,7 @@ export async function ensurePromotionalSchema(client = null) {
   `);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS reserved_by TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_name TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_email TEXT NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS buyer_phone TEXT NULL`);
@@ -278,6 +300,32 @@ export async function releaseExpiredPromotionalReservations(client = null, drawI
     drawFilter = `AND pr.draw_id = $${params.length}`;
   }
 
+  await db.query(`
+    UPDATE public.promotional_numbers pn
+       SET status = 'available',
+           reservation_id = NULL,
+           reserved_by = NULL,
+           buyer_email = NULL,
+           buyer_name = NULL,
+           buyer_phone = NULL,
+           user_id = NULL,
+           payment_id = NULL,
+           payment_status = 'pending',
+           reserved_at = NULL,
+           expires_at = NULL,
+           reserved_until = NULL,
+           updated_at = NOW()
+     WHERE LOWER(COALESCE(pn.status, 'available')) = 'reserved'
+       AND pn.expires_at IS NOT NULL
+       AND pn.expires_at <= NOW()
+       AND NOT EXISTS (
+         SELECT 1
+           FROM public.promotional_reservations pr
+          WHERE (pr.id::TEXT = pn.reservation_id::TEXT OR pr.reservation_id::TEXT = pn.reservation_id::TEXT)
+            AND LOWER(COALESCE(pr.payment_status, 'pending')) IN ('paid', 'approved', 'pago')
+       )
+  `);
+
   const result = await db.query(`
     WITH expired AS (
       UPDATE public.promotional_reservations pr
@@ -295,6 +343,7 @@ export async function releaseExpiredPromotionalReservations(client = null, drawI
        SET status = 'available',
            user_id = NULL,
            reservation_id = NULL,
+           reserved_by = NULL,
            payment_id = NULL,
            payment_status = 'pending',
            buyer_name = NULL,
@@ -344,18 +393,18 @@ function drawSelect() {
   return `
     SELECT
       d.*,
-      COUNT(COALESCE(n.n, n.number_value, n.number))::int AS total_numbers,
-      COUNT(COALESCE(n.n, n.number_value, n.number)) FILTER (WHERE n.status = 'available')::int AS available_numbers,
-      COUNT(COALESCE(n.n, n.number_value, n.number)) FILTER (WHERE n.status = 'reserved')::int AS reserved_numbers,
-      COUNT(COALESCE(n.n, n.number_value, n.number)) FILTER (WHERE n.status = 'sold')::int AS sold_numbers,
-      COUNT(COALESCE(n.n, n.number_value, n.number)) FILTER (WHERE n.status = 'blocked')::int AS blocked_numbers
+      COUNT(COALESCE(n.n, n.number_value, NULLIF(regexp_replace(n.number::text, '\\D', '', 'g'), '')::integer))::int AS total_numbers,
+      COUNT(COALESCE(n.n, n.number_value, NULLIF(regexp_replace(n.number::text, '\\D', '', 'g'), '')::integer)) FILTER (WHERE n.status = 'available')::int AS available_numbers,
+      COUNT(COALESCE(n.n, n.number_value, NULLIF(regexp_replace(n.number::text, '\\D', '', 'g'), '')::integer)) FILTER (WHERE n.status = 'reserved')::int AS reserved_numbers,
+      COUNT(COALESCE(n.n, n.number_value, NULLIF(regexp_replace(n.number::text, '\\D', '', 'g'), '')::integer)) FILTER (WHERE n.status = 'sold')::int AS sold_numbers,
+      COUNT(COALESCE(n.n, n.number_value, NULLIF(regexp_replace(n.number::text, '\\D', '', 'g'), '')::integer)) FILTER (WHERE n.status = 'blocked')::int AS blocked_numbers
     FROM public.promotional_draws d
     LEFT JOIN public.promotional_numbers n ON n.draw_id = d.id
   `;
 }
 
 function normalizeNumberRow(row) {
-  const value = row.n ?? row.number_value ?? row.number;
+  const value = row.n ?? row.number_value ?? Number(row.number);
   return {
     ...row,
     n: Number(value),
@@ -368,7 +417,7 @@ function normalizeNumberRow(row) {
 
 function mapAdminNumberRow(row) {
   if (!row) return null;
-  const value = row.n ?? row.number_value ?? row.number;
+  const value = row.n ?? row.number_value ?? Number(row.number);
   return {
     id: Number(row.id),
     draw_id: Number(row.draw_id),
@@ -379,6 +428,7 @@ function mapAdminNumberRow(row) {
     status: row.status,
     user_id: row.user_id != null ? Number(row.user_id) : null,
     reservation_id: row.reservation_id != null ? String(row.reservation_id) : null,
+    reserved_by: row.reserved_by ?? null,
     buyer_name: row.buyer_name ?? null,
     buyer_email: row.buyer_email ?? null,
     buyer_phone: row.buyer_phone ?? null,
@@ -437,7 +487,7 @@ export async function getPromotionalNumbers(draw_id, client = null) {
     SELECT *
     FROM public.promotional_numbers
     WHERE draw_id = $1
-    ORDER BY COALESCE(n, number_value, number) ASC
+    ORDER BY COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) ASC
   `, [draw_id]);
   return rows.map(normalizeNumberRow);
 }
@@ -449,13 +499,14 @@ export async function getPromotionalNumbersAdmin(draw_id, client = null) {
     SELECT
       id,
       draw_id,
-      COALESCE(n, number_value, number) AS n,
-      COALESCE(n, number_value, number) AS number,
-      COALESCE(number_value, n, number) AS number_value,
+      COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) AS n,
+      COALESCE(number, LPAD(COALESCE(n, number_value)::text, 2, '0')) AS number,
+      COALESCE(number_value, n, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) AS number_value,
       label,
       status,
       user_id,
       reservation_id,
+      reserved_by,
       buyer_name,
       buyer_email,
       buyer_phone,
@@ -469,7 +520,7 @@ export async function getPromotionalNumbersAdmin(draw_id, client = null) {
       updated_at
     FROM public.promotional_numbers
     WHERE draw_id = $1
-    ORDER BY COALESCE(n, number_value, number) ASC
+    ORDER BY COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) ASC
   `, [draw_id]);
   return rows.map(mapAdminNumberRow);
 }
@@ -557,7 +608,7 @@ export async function createPromotionalNumbers(draw_id, number_start, number_end
   const rows = [];
 
   for (let n = number_start; n <= number_end; n += 1) {
-    rows.push([draw_id, n, n, n, formatPromotionalNumber(n), "available"]);
+    rows.push([draw_id, n, n, formatPromotionalNumber(n), formatPromotionalNumber(n), "available"]);
   }
 
   if (!rows.length) return [];
@@ -581,7 +632,7 @@ export async function createPromotionalNumbers(draw_id, number_start, number_end
       SELECT 1
       FROM public.promotional_numbers pn
       WHERE pn.draw_id = i.draw_id
-        AND COALESCE(pn.n, pn.number_value, pn.number) = i.n
+        AND COALESCE(pn.n, pn.number_value, NULLIF(regexp_replace(pn.number::text, '\\D', '', 'g'), '')::integer) = i.n
     )
     RETURNING *
   `, params);
@@ -613,7 +664,7 @@ export async function updatePromotionalNumberStatus(draw_id, n, status) {
         reserved_until = NULL,
         sold_at = NULL,
         updated_at = NOW()
-      WHERE draw_id = $1 AND COALESCE(n, number_value, number) = $2
+      WHERE draw_id = $1 AND COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) = $2
       RETURNING *
     `;
   } else if (s === "sold") {
@@ -623,7 +674,7 @@ export async function updatePromotionalNumberStatus(draw_id, n, status) {
         status = 'sold',
         sold_at = NOW(),
         updated_at = NOW()
-      WHERE draw_id = $1 AND COALESCE(n, number_value, number) = $2
+      WHERE draw_id = $1 AND COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) = $2
       RETURNING *
     `;
   } else if (s === "reserved") {
@@ -633,7 +684,7 @@ export async function updatePromotionalNumberStatus(draw_id, n, status) {
         status = 'reserved',
         reserved_at = COALESCE(reserved_at, NOW()),
         updated_at = NOW()
-      WHERE draw_id = $1 AND COALESCE(n, number_value, number) = $2
+      WHERE draw_id = $1 AND COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) = $2
       RETURNING *
     `;
   } else if (s === "blocked") {
@@ -642,7 +693,7 @@ export async function updatePromotionalNumberStatus(draw_id, n, status) {
       SET
         status = 'blocked',
         updated_at = NOW()
-      WHERE draw_id = $1 AND COALESCE(n, number_value, number) = $2
+      WHERE draw_id = $1 AND COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) = $2
       RETURNING *
     `;
   } else {
@@ -985,6 +1036,7 @@ export async function createPromotionalReservation({
         .map((n) => Number.parseInt(n, 10))
         .filter((n) => Number.isInteger(n) && n >= 0)
     )];
+    const formattedNumbers = cleanNumbers.map((n) => formatPromotionalNumber(n));
 
     if (!cleanNumbers.length) {
       const err = new Error("Selecione ao menos um número.");
@@ -1021,15 +1073,15 @@ export async function createPromotionalReservation({
     const locked = await client.query(`
       SELECT
         id,
-        COALESCE(n, number_value, number) AS number,
+        COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) AS number,
         status,
         payment_status,
         reservation_id,
         COALESCE(expires_at, reserved_until) AS expires_at
       FROM public.promotional_numbers
       WHERE draw_id = $1
-        AND COALESCE(n, number_value, number) = ANY($2::int[])
-      ORDER BY COALESCE(n, number_value, number) ASC
+        AND COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) = ANY($2::int[])
+      ORDER BY COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) ASC
       FOR UPDATE
     `, [normalizedDrawId, cleanNumbers]);
 
@@ -1065,17 +1117,8 @@ export async function createPromotionalReservation({
       throw err;
     }
 
-    const selectedNumberIds = [];
-    const selectedByNumber = new Set();
-    for (const row of locked.rows) {
-      const number = Number(row.number);
-      if (!selectedByNumber.has(number)) {
-        selectedByNumber.add(number);
-        selectedNumberIds.push(Number(row.id));
-      }
-    }
-
     const reservationId = randomUUID();
+    const expiresAt = new Date(Date.now() + PROMOTIONAL_RESERVATION_TTL_MINUTES * 60 * 1000);
     const reservation = await client.query(`
       INSERT INTO public.promotional_reservations (
         id,
@@ -1128,7 +1171,7 @@ export async function createPromotionalReservation({
       priceCents,
       amountCents,
       source,
-      new Date(Date.now() + PROMOTIONAL_RESERVATION_TTL_MINUTES * 60 * 1000).toISOString(),
+      expiresAt,
     ]);
 
     let updateResult;
@@ -1137,34 +1180,42 @@ export async function createPromotionalReservation({
         UPDATE public.promotional_numbers
         SET
           status = 'reserved',
-          n = COALESCE(n, number_value, number),
-          number = COALESCE(number, n, number_value),
-          number_value = COALESCE(number_value, n, number),
-          reservation_id = $3,
-          user_id = $4,
-          buyer_name = $5,
-          buyer_email = $6,
-          buyer_phone = $7,
+          n = COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer),
+          number = COALESCE(number, LPAD(COALESCE(n, number_value)::text, 2, '0')),
+          number_value = COALESCE(number_value, n, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer),
+          reservation_id = $1,
+          reserved_by = $2,
+          user_id = $3,
+          buyer_name = $4,
+          buyer_email = $5,
+          buyer_phone = $6,
           payment_status = 'pending',
           payment_id = NULL,
           reserved_at = NOW(),
-          expires_at = $9,
-          reserved_until = $9,
+          expires_at = $7,
+          reserved_until = $7,
           updated_at = NOW()
-        WHERE draw_id = $1
-          AND COALESCE(n, number_value, number) = ANY($2::int[])
-          AND status = 'available'
-          AND id = ANY($8::bigint[])
+        WHERE draw_id = $8
+          AND LPAD(COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer)::text, 2, '0') = ANY($9::text[])
+          AND (
+            LOWER(COALESCE(status, 'available')) = 'available'
+            OR (
+              LOWER(COALESCE(status, 'available')) = 'reserved'
+              AND expires_at IS NOT NULL
+              AND expires_at <= NOW()
+            )
+          )
+          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'approved', 'pago')
       `, [
-        normalizedDrawId,
-        cleanNumbers,
         reservation.rows[0].reservation_id || reservation.rows[0].id,
+        String(normalizedUserId),
         normalizedUserId,
         resolvedBuyerName || resolvedBuyerEmail || "",
         resolvedBuyerEmail || "",
         resolvedBuyerPhone || null,
-        selectedNumberIds,
         reservation.rows[0].expires_at,
+        normalizedDrawId,
+        formattedNumbers,
       ]);
     } catch (updateErr) {
       console.error("[PROMOTIONAL_RESERVE_NUMBER_UPDATE_ERROR]", {
@@ -1181,16 +1232,16 @@ export async function createPromotionalReservation({
       throw err;
     }
 
-    const expected = cleanNumbers.length;
-    if (Number(updateResult.rowCount) !== expected) {
+    const expected = formattedNumbers.length;
+    if (Number(updateResult.rowCount) < expected) {
       console.error("[PROMOTIONAL_RESERVE_NUMBER_UPDATE_ERROR]", {
         code: "ROWCOUNT_MISMATCH",
-        message: `Esperado ${expected} linhas, atualizadas ${updateResult.rowCount}`,
+        message: `Esperado ao menos ${expected} linhas, atualizadas ${updateResult.rowCount}`,
         detail: { drawId, numbers: cleanNumbers },
         hint: null,
         stack: null,
       });
-      const err = new Error("Um ou mais números já estão reservados.");
+      const err = new Error("Alguns números promocionais não puderam ser reservados. Atualize a página e tente novamente.");
       err.status = 409;
       err.code = "PROMOTIONAL_NUMBER_ALREADY_RESERVED";
       throw err;
@@ -1378,17 +1429,18 @@ export async function assignPromotionalNumbersToUser({
       UPDATE public.promotional_numbers
       SET status = $3,
           reservation_id = $4,
+          reserved_by = $8,
           buyer_name = $5,
           buyer_email = $6,
           buyer_phone = $7,
-          user_id = $8,
+          user_id = $9,
           payment_status = 'pending',
           reserved_at = NOW(),
           expires_at = NULL,
           reserved_until = NULL,
           updated_at = NOW()
       WHERE draw_id = $1
-        AND COALESCE(n, number_value, number) = ANY($2::int[])
+        AND COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) = ANY($2::int[])
         AND COALESCE(payment_status, 'pending') NOT IN ('paid', 'approved', 'pago')
         AND status NOT IN ('sold', 'paid', 'blocked')
     `, [
@@ -1399,6 +1451,7 @@ export async function assignPromotionalNumbersToUser({
       buyerName || buyerEmail,
       buyerEmail,
       buyerPhone,
+      String(normalizedUserId),
       normalizedUserId,
     ]);
 

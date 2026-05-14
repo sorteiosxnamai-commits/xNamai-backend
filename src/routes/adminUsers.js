@@ -2,6 +2,7 @@
 // ESM | CRUD de usuários + atribuição de números (isolado deste router)
 
 import express from "express";
+import { randomUUID } from "node:crypto";
 import { query, getPool } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
@@ -48,14 +49,43 @@ function parseNumbers(input) {
 
 async function ensureAdminAssignColumns(client) {
   await client.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS n INTEGER`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reservation_id TEXT`);
   await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS quantity INTEGER`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS total_amount_cents INTEGER`);
   await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
   await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id TEXT`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
   await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
   await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+  await client.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'numbers'
+          AND column_name = 'number'
+      ) THEN
+        EXECUTE '
+          UPDATE public.numbers
+          SET n = number::INTEGER
+          WHERE n IS NULL
+            AND number IS NOT NULL
+        ';
+      END IF;
+    END $$
+  `);
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_numbers_draw_n
+    ON public.numbers(draw_id, n)
+    WHERE draw_id IS NOT NULL AND n IS NOT NULL
+  `);
 }
 
 /* =============== LISTAR (com busca/paginação) =============== */
@@ -362,46 +392,99 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
     }
 
     // --------- INSERTS ---------
-    // Reserva pendente: o número fica amarelo/reservado até o cliente pagar.
-    const resv = await client.query(
-      `INSERT INTO public.reservations
-         (id, user_id, draw_id, numbers, amount_cents, status, payment_status, payment_id, created_at, expires_at, updated_at)
+    // Reserva pendente manual do admin: fica reservado até ação posterior, sem expirar em 30 minutos.
+    const reservationId = randomUUID();
+    await client.query(
+      `INSERT INTO public.reservations (
+         id,
+         user_id,
+         draw_id,
+         numbers,
+         quantity,
+         total_amount_cents,
+         amount_cents,
+         status,
+         payment_status,
+         payment_id,
+         expires_at,
+         created_at,
+         updated_at
+       )
        VALUES (
-         gen_random_uuid(),
          $1,
          $2,
-         $3::int4[],
-         $4,
+         $3,
+         $4::int4[],
+         CARDINALITY($4::int4[]),
+         0,
+         $5,
          'reserved',
          'pending',
          NULL,
+         NULL,
          NOW(),
-         NOW() + ($5::text || ' minutes')::interval,
          NOW()
        )
-       RETURNING id`,
-      [user_id, draw_id, numbers, amount_cents, ADMIN_ASSIGN_RESERVATION_TTL_MINUTES]
+       ON CONFLICT (id) DO NOTHING`,
+      [reservationId, user_id, draw_id, numbers, amount_cents]
     );
 
     await client.query(
       `UPDATE public.numbers
           SET status = 'reserved',
               user_id = $3,
-              reserved_until = NOW() + ($5::text || ' minutes')::interval,
+              payment_status = 'pending',
+              reserved_at = NOW(),
+              reserved_until = NULL,
               payment_id = NULL,
               reservation_id = $4,
               updated_at = NOW()
         WHERE draw_id = $1
           AND n = ANY ($2::int4[])
           AND lower(trim(coalesce(status, ''))) <> 'sold'`,
-      [draw_id, numbers, user_id, resv.rows[0]?.id || null, ADMIN_ASSIGN_RESERVATION_TTL_MINUTES]
+      [draw_id, numbers, user_id, reservationId]
+    );
+
+    await client.query(
+      `INSERT INTO public.numbers (
+         draw_id,
+         n,
+         status,
+         user_id,
+         reservation_id,
+         payment_status,
+         reserved_at,
+         reserved_until,
+         updated_at
+       )
+       SELECT
+         $1,
+         selected_number,
+         'reserved',
+         $3,
+         $4,
+         'pending',
+         NOW(),
+         NULL,
+         NOW()
+       FROM UNNEST($2::int4[]) AS selected_number
+       WHERE NOT EXISTS (
+         SELECT 1
+           FROM public.numbers existing
+          WHERE existing.draw_id = $1
+            AND existing.n = selected_number
+       )`,
+      [draw_id, numbers, user_id, reservationId]
     );
 
     await client.query("COMMIT");
     res.status(201).json({
       ok: true,
+      message: "Números atribuídos e reservados com sucesso.",
       payment: null,
-      reservation_id: resv.rows[0]?.id || null,
+      reservation_id: reservationId,
+      reservationId,
+      drawId: draw_id,
       numbers,
       status: "reserved",
       payment_status: "pending",
