@@ -313,7 +313,7 @@ router.post("/:drawId/reservations/:reservationId/pix", requirePromotionalAuth, 
         notification_url: `${getBaseUrl(req)}/api/payments/webhook/mercadopago`,
       }
     );
-    return res.json(pix);
+    return res.json({ ok: true, pix, payment: pix, ...pix });
   } catch (err) {
     console.error("[PROMOTIONAL_PIX_ERROR]", {
       message: err?.message,
@@ -384,7 +384,7 @@ router.post("/reservations/:reservationId/pix", requirePromotionalAuth, async (r
       }
     );
 
-    return res.json(pix);
+    return res.json({ ok: true, pix, payment: pix, ...pix });
   } catch (err) {
     console.error("[PROMOTIONAL_PIX_ALIAS_ERROR]", {
       message: err?.message,

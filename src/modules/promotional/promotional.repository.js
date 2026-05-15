@@ -1341,7 +1341,7 @@ export async function createPromotionalReservation({
       throw err;
     }
 
-    const expected = formattedNumbers.length;
+    const expected = cleanNumbers.length;
     if (Number(updateResult.rowCount) < expected) {
       console.error("[PROMOTIONAL_RESERVE_NUMBER_UPDATE_ERROR]", {
         code: "ROWCOUNT_MISMATCH",

@@ -5,9 +5,9 @@ import { query, getPool } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
   ensureMainRaffleCompat,
-  getTicketPriceCents as getDrawTicketPriceCents,
   reservationIdIsUuid,
 } from '../services/mainRaffleCompat.js';
+import { getTicketPriceCents } from '../services/config.js';
 import { mpCreatePixPayment } from '../services/mercadopago.js';
 
 const router = Router();
@@ -108,7 +108,16 @@ router.post('/', requireAuth, async (req, res) => {
 
     await ensureMainRaffleCompat(client);
 
-    const priceCents = await getDrawTicketPriceCents(client, drawId);
+    const priceRow = await client.query(
+      `
+      SELECT COALESCE(ticket_price_cents, price_cents, 5500)::int AS price_cents
+        FROM public.draws
+       WHERE id = $1
+       LIMIT 1
+      `,
+      [drawId]
+    );
+    const priceCents = Number(priceRow.rows?.[0]?.price_cents || 5500);
     const amountCents = nums.length * priceCents;
     const groupId = randomUUID();
     const usesUuidId = await reservationIdIsUuid(client);
