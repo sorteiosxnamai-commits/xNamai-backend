@@ -340,7 +340,7 @@ router.post("/reservations/:reservationId/pix", requirePromotionalAuth, async (r
 
     const pix = await createPromotionalPix(
       reservation.draw_id,
-      reservationId,
+      reservation.reservation_id || reservation.id,
       req.user,
       {
         notification_url: `${getBaseUrl(req)}/api/payments/webhook/mercadopago`,

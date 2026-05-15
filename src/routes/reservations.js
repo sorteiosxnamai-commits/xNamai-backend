@@ -1,7 +1,7 @@
 // backend/src/routes/reservations.js
 import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
-import { query } from '../db.js';
+import { query, getPool } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getTicketPriceCents } from '../services/config.js';
 import { mpCreatePixPayment } from '../services/mercadopago.js';
@@ -9,21 +9,49 @@ import { mpCreatePixPayment } from '../services/mercadopago.js';
 const router = Router();
 const RESERVATION_TTL_MINUTES = 30;
 
-async function ensureReservationPaymentColumns() {
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
-  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
-  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
-  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+async function ensureReservationPaymentColumns(client = null) {
+  const q = client ? client.query.bind(client) : query;
+
+  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER DEFAULT 0`);
+  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
+  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
+  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL`);
+  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT`);
+  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
+  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
+  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
+  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS n INTEGER`);
+  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'available'`);
+  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reservation_id TEXT`);
+  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id BIGINT`);
+  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
+  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
+  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
+  await q(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'numbers'
+           AND column_name = 'number'
+      ) THEN
+        EXECUTE '
+          UPDATE public.numbers
+             SET n = number::INTEGER
+           WHERE n IS NULL
+             AND number IS NOT NULL
+        ';
+      END IF;
+    END $$;
+  `);
 }
 
 function getBaseUrl(req) {
@@ -45,183 +73,168 @@ function getBaseUrl(req) {
  * Mantido para “limpeza geral”; a expiração crítica também acontece
  * dentro da transação ao reservar (garante consistência).
  */
-async function cleanupExpiredGlobal() {
-  // expira qualquer reserva “bloqueadora” vencida
-  await query(
-    `UPDATE reservations
-        SET status = 'expired'
+async function cleanupExpiredGlobal(client = null) {
+  const q = client ? client.query.bind(client) : query;
+
+  await q(
+    `UPDATE public.reservations
+        SET status = 'expired',
+            payment_status = 'expired',
+            updated_at = NOW()
       WHERE expires_at IS NOT NULL
-        AND expires_at < NOW()
-        AND lower(coalesce(status,'')) IN ('active','pending','reserved','')`
+        AND expires_at <= NOW()
+        AND LOWER(COALESCE(status, '')) IN ('active','pending','reserved','reservado','pendente')
+        AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`
   );
 
-  // libera números que ficaram presos com reservation_id sem reserva ativa
-  await query(
-    `UPDATE numbers n
+  await q(
+    `UPDATE public.numbers
         SET status = 'available',
-            reservation_id = NULL
-      WHERE n.status = 'reserved'
-        AND NOT EXISTS (
-              SELECT 1
-                FROM reservations r
-               WHERE r.id = n.reservation_id
-                 AND lower(coalesce(r.status,'')) IN ('active','pending','reserved','')
-            )`
+            reservation_id = NULL,
+            user_id = NULL,
+            payment_status = 'pending',
+            reserved_until = NULL,
+            reserved_at = NULL,
+            payment_id = NULL,
+            updated_at = NOW()
+      WHERE LOWER(COALESCE(status, '')) IN ('reserved','pending','reservado','pendente')
+        AND reserved_until IS NOT NULL
+        AND reserved_until <= NOW()
+        AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`
   );
 }
 
 router.post('/', requireAuth, async (req, res) => {
-  const DBG = process.env.DEBUG_RESERVATIONS === 'true';
+  const pool = await getPool();
+  const client = await pool.connect();
+  let txStarted = false;
 
   try {
-    await ensureReservationPaymentColumns();
-
-    if (DBG) {
-      console.log('[reservations] origin =', req.headers.origin || '(none)');
-      console.log('[reservations] auth header =', !!req.headers.authorization);
-      console.log(
-        '[reservations] user =',
-        req.user ? { id: req.user.id, email: req.user.email } : '(none)'
-      );
-    }
-
-    // limpeza “background” (não bloqueia o request)
-    try { cleanupExpiredGlobal(); } catch {}
+    await ensureReservationPaymentColumns(client);
 
     const { numbers } = req.body || {};
     if (!Array.isArray(numbers) || numbers.length === 0) {
-      return res.status(400).json({ error: 'no_numbers' });
+      return res.status(400).json({ ok: false, error: 'no_numbers' });
     }
 
-    // normaliza números
     const nums = Array.from(
       new Set(
-        numbers.map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n <= 99)
+        numbers
+          .map(Number)
+          .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99)
       )
     );
-    if (!nums.length) return res.status(400).json({ error: 'numbers_invalid' });
 
-    const ttlMin = RESERVATION_TTL_MINUTES;
+    if (!nums.length) {
+      return res.status(400).json({ ok: false, error: 'numbers_invalid' });
+    }
 
-    // draw aberto
-    const dr = await query(
+    await cleanupExpiredGlobal(client);
+
+    const dr = await client.query(
       `SELECT id
-         FROM draws
+         FROM public.draws
         WHERE status = 'open'
      ORDER BY id DESC
         LIMIT 1`
     );
-    if (!dr.rows.length) return res.status(400).json({ error: 'no_open_draw' });
-    const drawId = dr.rows[0].id;
+
+    if (!dr.rows.length) {
+      return res.status(400).json({ ok: false, error: 'no_open_draw' });
+    }
+
+    const drawId = Number(dr.rows[0].id);
     const priceCents = await getTicketPriceCents();
     const amountCents = nums.length * priceCents;
+    const reservationId = uuid();
+    const expiresAt = new Date(Date.now() + RESERVATION_TTL_MINUTES * 60 * 1000);
 
-    // === INÍCIO TX ===========================================================
-    await query('BEGIN');
+    await client.query('BEGIN');
+    txStarted = true;
 
-    // 1) Lock nos números alvo
-    const check = await query(
-      `SELECT n, status, reservation_id
-         FROM numbers
-        WHERE draw_id = $1
-          AND n = ANY($2)
-        FOR UPDATE`,
+    await client.query(
+      `INSERT INTO public.numbers (draw_id, n, status, updated_at)
+       SELECT $1, selected_number, 'available', NOW()
+         FROM UNNEST($2::int[]) AS selected_number
+        WHERE NOT EXISTS (
+          SELECT 1
+            FROM public.numbers existing
+           WHERE existing.draw_id = $1
+             AND existing.n = selected_number
+        )`,
       [drawId, nums]
     );
 
-    // valida existência
-    const foundSet = new Set(check.rows.map((r) => r.n));
-    const notFound = nums.filter((n) => !foundSet.has(n));
-    if (notFound.length) {
-      await query('ROLLBACK');
-      return res.status(400).json({ error: 'numbers_not_found', numbers: notFound });
-    }
-
-    // 2) Para cada número “reserved”, se a reserva estiver vencida, libera AGORA
-    const byResId = new Map(); // agrupa números por reservation_id para liberar em lote
-    for (const row of check.rows) {
-      if (row.status === 'reserved' && row.reservation_id) {
-        const rid = row.reservation_id;
-
-        // lock na reserva para leitura consistente
-        const rsv = await query(
-          `SELECT id, status, expires_at
-             FROM reservations
-            WHERE id = $1
-            FOR UPDATE`,
-          [rid]
-        );
-
-        const r = rsv.rows[0];
-        if (r) {
-          const statusLower = String(r.status || '').toLowerCase();
-          const isBlocking = ['active','pending','reserved',''].includes(statusLower);
-          const isExpired = r.expires_at && new Date(r.expires_at).getTime() <= Date.now();
-
-          if (isBlocking && isExpired) {
-            // expira a reserva e marca para liberar seus números
-            await query(`UPDATE reservations SET status = 'expired' WHERE id = $1`, [rid]);
-            if (!byResId.has(rid)) byResId.set(rid, []);
-            byResId.get(rid).push(row.n);
-          }
-        }
-      }
-    }
-
-    // libera números presos por reservas expiradas (em lote por reservation_id)
-    for (const [rid, numsOfRid] of byResId) {
-      await query(
-        `UPDATE numbers
-            SET status = 'available',
-                reservation_id = NULL
-          WHERE draw_id = $1
-            AND n = ANY($2)
-            AND reservation_id = $3`,
-        [drawId, numsOfRid, rid]
-      );
-    }
-
-    // 3) Números tomados por pagamento aprovado
-    const pays = await query(
-      `SELECT numbers
-         FROM payments
+    await client.query(
+      `UPDATE public.reservations
+          SET status = 'expired',
+              payment_status = 'expired',
+              updated_at = NOW()
         WHERE draw_id = $1
-          AND lower(status) IN ('approved','paid','pago')`,
+          AND expires_at IS NOT NULL
+          AND expires_at <= NOW()
+          AND LOWER(COALESCE(status, '')) IN ('active','pending','reserved','reservado','pendente')
+          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`,
       [drawId]
     );
-    const paidTaken = new Set();
-    for (const p of pays.rows || []) {
-      for (const n of p.numbers || []) paidTaken.add(Number(n));
-    }
 
-    // 4) Revalida os números (após possíveis liberações) e detecta conflitos
-    const after = await query(
-      `SELECT n, status, reservation_id
-         FROM numbers
+    await client.query(
+      `UPDATE public.numbers
+          SET status = 'available',
+              reservation_id = NULL,
+              user_id = NULL,
+              payment_status = 'pending',
+              reserved_until = NULL,
+              reserved_at = NULL,
+              payment_id = NULL,
+              updated_at = NOW()
         WHERE draw_id = $1
-          AND n = ANY($2)
+          AND n = ANY($2::int[])
+          AND LOWER(COALESCE(status, '')) IN ('reserved','pending','reservado','pendente')
+          AND reserved_until IS NOT NULL
+          AND reserved_until <= NOW()
+          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`,
+      [drawId, nums]
+    );
+
+    const locked = await client.query(
+      `SELECT n, status, reservation_id, reserved_until, payment_status
+         FROM public.numbers
+        WHERE draw_id = $1
+          AND n = ANY($2::int[])
         FOR UPDATE`,
       [drawId, nums]
     );
 
-    const conflicts = [];
-    for (const row of after.rows) {
-      const st = String(row.status).toLowerCase();
-      const isBusy = st !== 'available' || paidTaken.has(Number(row.n));
-      if (isBusy) conflicts.push(row.n);
-    }
+    const conflicts = locked.rows
+      .filter((row) => {
+        const status = String(row.status || 'available').toLowerCase();
+        const paymentStatus = String(row.payment_status || 'pending').toLowerCase();
+
+        if (['sold', 'paid', 'approved', 'pago', 'vendido', 'aprovado', 'blocked', 'bloqueado'].includes(status)) {
+          return true;
+        }
+
+        if (['paid', 'approved', 'pago'].includes(paymentStatus)) {
+          return true;
+        }
+
+        if (['reserved', 'pending', 'reservado', 'pendente'].includes(status)) {
+          return !row.reserved_until || new Date(row.reserved_until).getTime() > Date.now();
+        }
+
+        return false;
+      })
+      .map((row) => Number(row.n));
 
     if (conflicts.length) {
-      await query('ROLLBACK');
-      return res.status(409).json({ error: 'unavailable', conflicts });
+      await client.query('ROLLBACK');
+      txStarted = false;
+      return res.status(409).json({ ok: false, error: 'unavailable', conflicts });
     }
 
-    // 5) Cria reserva e marca números como reserved
-    const reservationId = uuid();
-    const expiresAt = new Date(Date.now() + ttlMin * 60 * 1000);
-
-    await query(
-      `INSERT INTO reservations (
+    await client.query(
+      `INSERT INTO public.reservations (
         id,
         user_id,
         draw_id,
@@ -231,9 +244,24 @@ router.post('/', requireAuth, async (req, res) => {
         buyer_name,
         buyer_email,
         amount_cents,
-        expires_at
+        expires_at,
+        created_at,
+        updated_at
       )
-       VALUES ($1, $2, $3, $4::int[], 'reserved', 'pending', $5, $6, $7, $8)`,
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4::int[],
+        'reserved',
+        'pending',
+        $5,
+        $6,
+        $7,
+        $8,
+        NOW(),
+        NOW()
+      )`,
       [
         reservationId,
         req.user.id,
@@ -246,49 +274,66 @@ router.post('/', requireAuth, async (req, res) => {
       ]
     );
 
-    await query(
-      `UPDATE numbers
+    await client.query(
+      `UPDATE public.numbers
           SET status = 'reserved',
               reservation_id = $3,
               user_id = $4,
+              payment_status = 'pending',
               reserved_until = $5,
+              reserved_at = NOW(),
               payment_id = NULL,
               updated_at = NOW()
         WHERE draw_id = $1
-          AND n = ANY($2)`,
+          AND n = ANY($2::int[])`,
       [drawId, nums, reservationId, req.user.id, expiresAt]
     );
 
-    await query('COMMIT');
-    // === FIM TX ==============================================================
+    await client.query('COMMIT');
+    txStarted = false;
 
-    if (DBG) {
-      console.log('[reservations] created', {
-        reservationId,
-        userId: req.user.id,
-        drawId,
-        numbers: nums,
-        expiresAt: expiresAt.toISOString(),
-      });
+    return res.status(201).json({
+      ok: true,
+      success: true,
+      reservationId,
+      reservation_id: reservationId,
+      id: reservationId,
+      drawId,
+      draw_id: drawId,
+      expiresAt,
+      expires_at: expiresAt,
+      numbers: nums,
+      amount_cents: amountCents,
+      payment_status: 'pending',
+      status: 'reserved',
+      can_pay: true,
+      canPay: true,
+    });
+  } catch (err) {
+    if (txStarted) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {}
     }
 
-    return res
-      .status(201)
-      .json({
-        reservationId,
-        id: reservationId,
-        drawId,
-        expiresAt,
-        numbers: nums,
-        amount_cents: amountCents,
-        payment_status: 'pending',
-        status: 'reserved',
-        can_pay: true,
-      });
-  } catch (e) {
-    try { await query('ROLLBACK'); } catch {}
-    console.error('[reservations] error:', e.code || e.message, e);
-    return res.status(500).json({ error: 'reserve_failed' });
+    console.error('[RESERVATION_CREATE_ERROR]', {
+      code: err?.code,
+      message: err?.message,
+      detail: err?.detail,
+      hint: err?.hint,
+      stack: err?.stack,
+      body: req.body,
+      user: req.user?.id,
+    });
+
+    return res.status(500).json({
+      ok: false,
+      error: 'reserve_failed',
+      message: err?.message || 'Falha ao reservar números.',
+      code: err?.code || 'RESERVATION_CREATE_ERROR',
+    });
+  } finally {
+    client.release();
   }
 });
 

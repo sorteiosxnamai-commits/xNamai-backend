@@ -355,7 +355,7 @@ export async function releaseExpiredPromotionalReservations(client = null, drawI
            updated_at = NOW()
       FROM expired e
      WHERE pn.draw_id = e.draw_id
-       AND pn.reservation_id::text = COALESCE(e.reservation_id::text, e.id::text)
+       AND pn.reservation_id::text IN (e.reservation_id::text, e.id::text)
        AND pn.status = 'reserved'
        AND COALESCE(pn.payment_status, 'pending') NOT IN ('paid', 'approved', 'pago')
   `, params);
@@ -1121,7 +1121,6 @@ export async function createPromotionalReservation({
     const expiresAt = new Date(Date.now() + PROMOTIONAL_RESERVATION_TTL_MINUTES * 60 * 1000);
     const reservation = await client.query(`
       INSERT INTO public.promotional_reservations (
-        id,
         reservation_id,
         draw_id,
         user_id,
@@ -1143,24 +1142,22 @@ export async function createPromotionalReservation({
         $1,
         $2,
         $3,
-        $4,
-        $5::int[],
+        $4::int[],
+        $5,
         $6,
         $7,
         $8,
         $9,
+        $9,
         $10,
-        $10,
-        $11,
         'reserved',
         'pending',
-        $12,
+        $11,
         NOW(),
         NOW()
       )
       RETURNING *
     `, [
-      reservationId,
       reservationId,
       normalizedDrawId,
       normalizedUserId,

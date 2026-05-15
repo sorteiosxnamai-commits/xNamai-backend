@@ -48,44 +48,48 @@ function parseNumbers(input) {
 }
 
 async function ensureAdminAssignColumns(client) {
-  await client.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
+  await client.query(`ALTER TABLE public.draws ADD COLUMN IF NOT EXISTS ticket_price_cents INTEGER DEFAULT 5500`);
+  await client.query(`ALTER TABLE public.draws ADD COLUMN IF NOT EXISTS max_numbers_per_user INTEGER DEFAULT 5`);
+
   await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS n INTEGER`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'available'`);
   await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reservation_id TEXT`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS quantity INTEGER`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS total_amount_cents INTEGER`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id TEXT`);
+  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id BIGINT`);
   await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
   await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
   await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
   await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
   await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
   await client.query(`
     DO $$
     BEGIN
       IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'numbers'
-          AND column_name = 'number'
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'numbers'
+           AND column_name = 'number'
       ) THEN
         EXECUTE '
           UPDATE public.numbers
-          SET n = number::INTEGER
-          WHERE n IS NULL
-            AND number IS NOT NULL
+             SET n = number::INTEGER
+           WHERE n IS NULL
+             AND number IS NOT NULL
         ';
       END IF;
-    END $$
+    END $$;
   `);
-  await client.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_numbers_draw_n
-    ON public.numbers(draw_id, n)
-    WHERE draw_id IS NOT NULL AND n IS NOT NULL
-  `);
+
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER DEFAULT 0`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS quantity INTEGER DEFAULT 0`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS total_amount_cents INTEGER DEFAULT 0`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT NULL`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT NULL`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT NULL`);
+  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
 }
 
 /* =============== LISTAR (com busca/paginação) =============== */
@@ -274,126 +278,182 @@ router.delete("/:id", async (req, res, next) => {
  * - Checa conflitos em payments aprovados e reservas ativas
  * - Se ok, cria reserva pending/reserved e marca números como reserved.
  */
-router.post("/:id/assign-numbers", async (req, res, next) => {
+router.post("/:id/assign-numbers", async (req, res) => {
   const pool = await getPool();
   const client = await pool.connect();
+
   try {
     const user_id = Number(req.params.id);
     const draw_id = Number(req.body?.draw_id);
     const numbers = parseNumbers(req.body?.numbers);
-    let amount_cents = Number.isFinite(+req.body?.amount_cents)
-      ? Math.max(0, +req.body.amount_cents)
-      : 0;
 
-    if (!Number.isInteger(user_id) || !Number.isInteger(draw_id) || numbers.length === 0) {
-      return res.status(400).json({ error: "bad_request" });
+    if (!Number.isInteger(user_id) || user_id <= 0) {
+      return res.status(400).json({ ok: false, error: "invalid_user_id" });
     }
 
-    await client.query("BEGIN");
+    if (!Number.isInteger(draw_id) || draw_id <= 0) {
+      return res.status(400).json({ ok: false, error: "invalid_draw_id" });
+    }
+
+    if (!numbers.length) {
+      return res.status(400).json({ ok: false, error: "invalid_numbers" });
+    }
+
     await ensureAdminAssignColumns(client);
 
-    // garante que o usuário existe
-    const u = await client.query("SELECT id FROM public.users WHERE id = $1", [user_id]);
-    if (!u.rowCount) {
+    await client.query("BEGIN");
+
+    const userResult = await client.query(
+      `SELECT id, name, email, phone
+         FROM public.users
+        WHERE id = $1
+        FOR UPDATE`,
+      [user_id]
+    );
+
+    if (!userResult.rowCount) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "user_not_found" });
+      return res.status(404).json({ ok: false, error: "user_not_found" });
     }
 
-    // garante sorteio existente
-    const d = await client.query(
-      "SELECT id, COALESCE(ticket_price_cents, 5500)::int AS ticket_price_cents FROM public.draws WHERE id = $1",
+    const drawResult = await client.query(
+      `SELECT id, COALESCE(ticket_price_cents, 5500)::int AS ticket_price_cents
+         FROM public.draws
+        WHERE id = $1
+        FOR UPDATE`,
       [draw_id]
     );
-    if (!d.rowCount) {
+
+    if (!drawResult.rowCount) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "draw_not_found" });
+      return res.status(404).json({ ok: false, error: "draw_not_found" });
     }
 
-    if (amount_cents <= 0) {
-      amount_cents = numbers.length * Number(d.rows[0].ticket_price_cents || 5500);
-    }
+    const ticketPriceCents = Number(drawResult.rows[0]?.ticket_price_cents || 5500);
+    const amount_cents = Number.isFinite(Number(req.body?.amount_cents)) && Number(req.body.amount_cents) > 0
+      ? Math.trunc(Number(req.body.amount_cents))
+      : numbers.length * ticketPriceCents;
 
     await client.query(
-      `INSERT INTO public.numbers (draw_id, n, status)
-       SELECT $1, x.n, 'available'
-         FROM unnest($2::int4[]) AS x(n)
+      `UPDATE public.reservations
+          SET status = 'expired',
+              payment_status = 'expired',
+              updated_at = NOW()
+        WHERE draw_id = $1
+          AND expires_at IS NOT NULL
+          AND expires_at <= NOW()
+          AND LOWER(COALESCE(status, '')) IN ('active','pending','reserved','reservado','pendente')
+          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`,
+      [draw_id]
+    );
+
+    await client.query(
+      `UPDATE public.numbers
+          SET status = 'available',
+              reservation_id = NULL,
+              user_id = NULL,
+              payment_status = 'pending',
+              reserved_until = NULL,
+              reserved_at = NULL,
+              payment_id = NULL,
+              updated_at = NOW()
+        WHERE draw_id = $1
+          AND LOWER(COALESCE(status, '')) IN ('reserved','pending','reservado','pendente')
+          AND reserved_until IS NOT NULL
+          AND reserved_until <= NOW()
+          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`,
+      [draw_id]
+    );
+
+    await client.query(
+      `INSERT INTO public.numbers (draw_id, n, status, updated_at)
+       SELECT $1, selected_number, 'available', NOW()
+         FROM UNNEST($2::int[]) AS selected_number
         WHERE NOT EXISTS (
           SELECT 1
-            FROM public.numbers n
-           WHERE n.draw_id = $1
-             AND n.n = x.n
+            FROM public.numbers existing
+           WHERE existing.draw_id = $1
+             AND existing.n = selected_number
         )`,
       [draw_id, numbers]
     );
 
-    const numberConf = await client.query(
-      `SELECT n::int, status
+    const numberConflicts = await client.query(
+      `SELECT DISTINCT n::int AS n, status
          FROM public.numbers
         WHERE draw_id = $1
-          AND n = ANY ($2::int4[])
-          AND lower(trim(coalesce(status, ''))) IN (
-            'sold','paid','approved','pago','vendido','aprovado',
-            'reserved','pending','reservado','pendente'
+          AND n = ANY($2::int[])
+          AND (
+            LOWER(COALESCE(status, 'available')) IN ('sold','paid','approved','pago','vendido','aprovado','blocked','bloqueado')
+            OR (
+              LOWER(COALESCE(status, 'available')) IN ('reserved','pending','reservado','pendente')
+              AND (
+                reserved_until IS NULL
+                OR reserved_until > NOW()
+              )
+            )
           )
         ORDER BY n`,
       [draw_id, numbers]
     );
-    if (numberConf.rowCount) {
+
+    if (numberConflicts.rowCount) {
       await client.query("ROLLBACK");
       return res.status(409).json({
+        ok: false,
         error: "numbers_taken",
-        where: "numbers",
-        conflicts: numberConf.rows.map((r) => Number(r.n)),
+        conflicts: numberConflicts.rows.map((r) => Number(r.n)),
       });
     }
 
-    // conflitos em payments aprovados
-    const payConf = await client.query(
-      `SELECT DISTINCT n
-         FROM (
-           SELECT unnest(p.numbers) AS n
-           FROM public.payments p
-           WHERE p.draw_id = $1
-             AND lower(trim(coalesce(p.status, ''))) IN ('approved','paid','pago')
-             AND p.numbers && $2::int4[]
-         ) s
-         WHERE n = ANY ($2::int4[])`,
+    const paymentConflicts = await client.query(
+      `SELECT DISTINCT used.n::int AS n
+         FROM public.payments p
+         CROSS JOIN LATERAL UNNEST(p.numbers) AS used(n)
+        WHERE p.draw_id = $1
+          AND used.n = ANY($2::int[])
+          AND LOWER(COALESCE(p.status, '')) IN ('approved','paid','pago')
+        ORDER BY used.n`,
       [draw_id, numbers]
     );
-    if (payConf.rowCount) {
+
+    if (paymentConflicts.rowCount) {
       await client.query("ROLLBACK");
       return res.status(409).json({
-        error: "numbers_taken",
-        where: "payments",
-        conflicts: payConf.rows.map((r) => Number(r.n)).sort((a, b) => a - b),
+        ok: false,
+        error: "numbers_paid",
+        conflicts: paymentConflicts.rows.map((r) => Number(r.n)),
       });
     }
 
-    // conflitos em reservas ativas (somente pelo array)
-    const resvConf = await client.query(
-      `SELECT DISTINCT n
-         FROM (
-           SELECT unnest(r.numbers) AS n
-           FROM public.reservations r
-           WHERE r.draw_id = $1
-             AND lower(trim(coalesce(r.status, ''))) IN ('active','reserved','pending','paid','approved','pago')
-             AND r.numbers && $2::int4[]
-         ) x
-         WHERE n = ANY ($2::int4[])`,
+    const reservationConflicts = await client.query(
+      `SELECT DISTINCT used.n::int AS n
+         FROM public.reservations r
+         CROSS JOIN LATERAL UNNEST(r.numbers) AS used(n)
+        WHERE r.draw_id = $1
+          AND used.n = ANY($2::int[])
+          AND LOWER(COALESCE(r.status, '')) IN ('active','pending','reserved','reservado','pendente')
+          AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN ('paid','approved','pago','expired','cancelled','canceled')
+          AND (
+            r.expires_at IS NULL
+            OR r.expires_at > NOW()
+          )
+        ORDER BY used.n`,
       [draw_id, numbers]
     );
-    if (resvConf.rowCount) {
+
+    if (reservationConflicts.rowCount) {
       await client.query("ROLLBACK");
       return res.status(409).json({
+        ok: false,
         error: "numbers_reserved",
-        where: "reservations",
-        conflicts: resvConf.rows.map((r) => Number(r.n)).sort((a, b) => a - b),
+        conflicts: reservationConflicts.rows.map((r) => Number(r.n)),
       });
     }
 
-    // --------- INSERTS ---------
-    // Reserva pendente manual do admin: fica reservado até ação posterior, sem expirar em 30 minutos.
     const reservationId = randomUUID();
+    const user = userResult.rows[0];
+
     await client.query(
       `INSERT INTO public.reservations (
          id,
@@ -406,6 +466,9 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
          status,
          payment_status,
          payment_id,
+         buyer_name,
+         buyer_email,
+         buyer_phone,
          expires_at,
          created_at,
          updated_at
@@ -414,84 +477,86 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
          $1,
          $2,
          $3,
-         $4::int4[],
-         CARDINALITY($4::int4[]),
-         0,
+         $4::int[],
+         CARDINALITY($4::int[]),
+         $5,
          $5,
          'reserved',
          'pending',
          NULL,
+         $6,
+         $7,
+         $8,
          NULL,
          NOW(),
          NOW()
-       )
-       ON CONFLICT (id) DO NOTHING`,
-      [reservationId, user_id, draw_id, numbers, amount_cents]
+       )`,
+      [
+        reservationId,
+        user_id,
+        draw_id,
+        numbers,
+        amount_cents,
+        user.name || user.email || "",
+        user.email || "",
+        user.phone || "",
+      ]
     );
 
     await client.query(
       `UPDATE public.numbers
           SET status = 'reserved',
               user_id = $3,
+              reservation_id = $4,
               payment_status = 'pending',
               reserved_at = NOW(),
               reserved_until = NULL,
               payment_id = NULL,
-              reservation_id = $4,
               updated_at = NOW()
         WHERE draw_id = $1
-          AND n = ANY ($2::int4[])
-          AND lower(trim(coalesce(status, ''))) <> 'sold'`,
-      [draw_id, numbers, user_id, reservationId]
-    );
-
-    await client.query(
-      `INSERT INTO public.numbers (
-         draw_id,
-         n,
-         status,
-         user_id,
-         reservation_id,
-         payment_status,
-         reserved_at,
-         reserved_until,
-         updated_at
-       )
-       SELECT
-         $1,
-         selected_number,
-         'reserved',
-         $3,
-         $4,
-         'pending',
-         NOW(),
-         NULL,
-         NOW()
-       FROM UNNEST($2::int4[]) AS selected_number
-       WHERE NOT EXISTS (
-         SELECT 1
-           FROM public.numbers existing
-          WHERE existing.draw_id = $1
-            AND existing.n = selected_number
-       )`,
+          AND n = ANY($2::int[])`,
       [draw_id, numbers, user_id, reservationId]
     );
 
     await client.query("COMMIT");
-    res.status(201).json({
+
+    return res.status(201).json({
       ok: true,
+      success: true,
       message: "Números atribuídos e reservados com sucesso.",
-      payment: null,
       reservation_id: reservationId,
       reservationId,
+      draw_id,
       drawId: draw_id,
+      user_id,
       numbers,
       status: "reserved",
       payment_status: "pending",
     });
-  } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    next(e);
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+
+    console.error("[ADMIN_ASSIGN_NUMBERS_ERROR]", {
+      code: err?.code,
+      message: err?.message,
+      detail: err?.detail,
+      hint: err?.hint,
+      stack: err?.stack,
+      params: {
+        user_id: req.params.id,
+        draw_id: req.body?.draw_id,
+        numbers: req.body?.numbers,
+      },
+    });
+
+    return res.status(500).json({
+      ok: false,
+      error: "assign_numbers_failed",
+      message: err?.message || "Falha ao atribuir números.",
+      code: err?.code || "ADMIN_ASSIGN_NUMBERS_ERROR",
+    });
   } finally {
     client.release();
   }

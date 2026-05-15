@@ -20,6 +20,65 @@ router.get("/:id/board", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "bad_draw_id" });
     }
 
+    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS n INTEGER`);
+    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'available'`);
+    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reservation_id TEXT`);
+    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id BIGINT`);
+    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
+    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
+    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
+    await query(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1
+            FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'numbers'
+             AND column_name = 'number'
+        ) THEN
+          EXECUTE '
+            UPDATE public.numbers
+               SET n = number::INTEGER
+             WHERE n IS NULL
+               AND number IS NOT NULL
+          ';
+        END IF;
+      END $$;
+    `);
+
+    await query(
+      `UPDATE public.reservations
+          SET status = 'expired',
+              payment_status = 'expired',
+              updated_at = NOW()
+        WHERE draw_id = $1
+          AND expires_at IS NOT NULL
+          AND expires_at <= NOW()
+          AND LOWER(COALESCE(status, '')) IN ('active','pending','reserved','reservado','pendente')
+          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`,
+      [drawId]
+    );
+
+    await query(
+      `UPDATE public.numbers
+          SET status = 'available',
+              reservation_id = NULL,
+              user_id = NULL,
+              payment_status = 'pending',
+              reserved_until = NULL,
+              reserved_at = NULL,
+              updated_at = NOW()
+        WHERE draw_id = $1
+          AND LOWER(COALESCE(status, '')) IN ('reserved','pending','reservado','pendente')
+          AND reserved_until IS NOT NULL
+          AND reserved_until <= NOW()
+          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`,
+      [drawId]
+    );
+
     // dados do sorteio + produto + nome do vencedor
     const d = await query(
       `SELECT d.id,
@@ -51,12 +110,32 @@ router.get("/:id/board", requireAuth, async (req, res) => {
 
     // reservas ativas/pending/paid (marcamos como "reserved")
     const resvR = await query(
-      `SELECT unnest(r.numbers)::int AS n
-         FROM public.reservations r
-        WHERE r.draw_id = $1
-          AND LOWER(COALESCE(r.status, '')) IN ('active','pending','reserved','reservado','pendente','hold')
-          AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN ('paid','approved','pago','expired','cancelled','canceled')
-          AND (r.expires_at IS NULL OR r.expires_at > NOW())`,
+      `SELECT DISTINCT n::int AS n
+         FROM (
+           SELECT unnest(r.numbers)::int AS n
+             FROM public.reservations r
+            WHERE r.draw_id = $1
+              AND LOWER(COALESCE(r.status, '')) IN ('active','pending','reserved','reservado','pendente')
+              AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN ('paid','approved','pago','expired','cancelled','canceled')
+              AND (
+                r.expires_at IS NULL
+                OR r.expires_at > NOW()
+              )
+
+           UNION
+
+           SELECT num.n::int AS n
+             FROM public.numbers num
+            WHERE num.draw_id = $1
+              AND num.n IS NOT NULL
+              AND LOWER(COALESCE(num.status, '')) IN ('reserved','pending','reservado','pendente')
+              AND LOWER(COALESCE(num.payment_status, 'pending')) NOT IN ('paid','approved','pago','expired','cancelled','canceled')
+              AND (
+                num.reserved_until IS NULL
+                OR num.reserved_until > NOW()
+              )
+         ) x
+        WHERE n BETWEEN 0 AND 99`,
       [drawId]
     );
 
