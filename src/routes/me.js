@@ -10,16 +10,6 @@ import {
 
 const router = Router();
 
-async function ensureReservationPaymentColumns() {
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-}
-
 function formatDay(value) {
   if (!value) return "";
   return new Intl.DateTimeFormat("pt-BR", {
@@ -77,7 +67,6 @@ router.get('/', requireAuth, async (req, res) => {
 router.get('/reservations', requireAuth, async (req, res) => {
   try {
     console.log("[ACCOUNT_RESERVATIONS]", { userId: req.user?.id });
-    await ensureReservationPaymentColumns();
     await ensurePromotionalSchema();
     await releaseExpiredPromotionalReservations();
     const userId = req.user.id;

@@ -30,19 +30,6 @@ function isDebugMpEnabled() {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
-async function ensureReservationPaymentColumns() {
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
-  await query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-}
-
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
@@ -127,8 +114,6 @@ async function finalizeDrawIfComplete(drawId) {
  * e marca a reserva (se houver) como 'paid'.
  */
 async function settleApprovedPayment(id, drawId, numbers) {
-  await ensureReservationPaymentColumns().catch(() => {});
-
   // marca números como vendidos
   await query(
     `UPDATE numbers
@@ -253,7 +238,6 @@ router.post('/pix', requireAuth, async (req, res) => {
   console.log('[payments/pix] user=', req.user?.id, 'body=', req.body);
   try {
     if (!req.user?.id) return res.status(401).json({ error: 'unauthorized' });
-    await ensureReservationPaymentColumns();
 
     const { reservationId } = req.body || {};
     if (!reservationId) {

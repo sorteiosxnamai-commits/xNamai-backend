@@ -47,51 +47,6 @@ function parseNumbers(input) {
     .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99));
 }
 
-async function ensureAdminAssignColumns(client) {
-  await client.query(`ALTER TABLE public.draws ADD COLUMN IF NOT EXISTS ticket_price_cents INTEGER DEFAULT 5500`);
-  await client.query(`ALTER TABLE public.draws ADD COLUMN IF NOT EXISTS max_numbers_per_user INTEGER DEFAULT 5`);
-
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS n INTEGER`);
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'available'`);
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reservation_id TEXT`);
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id BIGINT`);
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
-  await client.query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-
-  await client.query(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1
-          FROM information_schema.columns
-         WHERE table_schema = 'public'
-           AND table_name = 'numbers'
-           AND column_name = 'number'
-      ) THEN
-        EXECUTE '
-          UPDATE public.numbers
-             SET n = number::INTEGER
-           WHERE n IS NULL
-             AND number IS NOT NULL
-        ';
-      END IF;
-    END $$;
-  `);
-
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER DEFAULT 0`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS quantity INTEGER DEFAULT 0`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS total_amount_cents INTEGER DEFAULT 0`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT NULL`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT NULL`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT NULL`);
-  await client.query(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-}
-
 /* =============== LISTAR (com busca/paginação) =============== */
 /**
  * GET /api/admin/users
@@ -298,8 +253,6 @@ router.post("/:id/assign-numbers", async (req, res) => {
     if (!numbers.length) {
       return res.status(400).json({ ok: false, error: "invalid_numbers" });
     }
-
-    await ensureAdminAssignColumns(client);
 
     await client.query("BEGIN");
 

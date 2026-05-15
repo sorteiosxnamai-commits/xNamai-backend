@@ -9,51 +9,6 @@ import { mpCreatePixPayment } from '../services/mercadopago.js';
 const router = Router();
 const RESERVATION_TTL_MINUTES = 30;
 
-async function ensureReservationPaymentColumns(client = null) {
-  const q = client ? client.query.bind(client) : query;
-
-  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
-  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER DEFAULT 0`);
-  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
-  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
-  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
-  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL`);
-  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT`);
-  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
-  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
-  await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-
-  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS n INTEGER`);
-  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'available'`);
-  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reservation_id TEXT`);
-  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id BIGINT`);
-  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
-  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
-  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
-  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_id TEXT NULL`);
-  await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-
-  await q(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1
-          FROM information_schema.columns
-         WHERE table_schema = 'public'
-           AND table_name = 'numbers'
-           AND column_name = 'number'
-      ) THEN
-        EXECUTE '
-          UPDATE public.numbers
-             SET n = number::INTEGER
-           WHERE n IS NULL
-             AND number IS NOT NULL
-        ';
-      END IF;
-    END $$;
-  `);
-}
-
 function getBaseUrl(req) {
   const publicUrl = process.env.PUBLIC_URL ? String(process.env.PUBLIC_URL).replace(/\/$/, '') : '';
   if (publicUrl) return publicUrl;
@@ -110,8 +65,6 @@ router.post('/', requireAuth, async (req, res) => {
   let txStarted = false;
 
   try {
-    await ensureReservationPaymentColumns(client);
-
     const { numbers } = req.body || {};
     if (!Array.isArray(numbers) || numbers.length === 0) {
       return res.status(400).json({ ok: false, error: 'no_numbers' });
@@ -339,8 +292,6 @@ router.post('/', requireAuth, async (req, res) => {
 
 router.post('/:reservationId/pix', requireAuth, async (req, res) => {
   try {
-    await ensureReservationPaymentColumns();
-
     const reservationId = req.params.reservationId;
     const r = await query(
       `SELECT r.id,

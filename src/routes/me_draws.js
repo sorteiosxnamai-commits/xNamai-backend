@@ -20,35 +20,6 @@ router.get("/:id/board", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "bad_draw_id" });
     }
 
-    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS n INTEGER`);
-    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'available'`);
-    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reservation_id TEXT`);
-    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id BIGINT`);
-    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
-    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ NULL`);
-    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NULL`);
-    await query(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-
-    await query(`
-      DO $$
-      BEGIN
-        IF EXISTS (
-          SELECT 1
-            FROM information_schema.columns
-           WHERE table_schema = 'public'
-             AND table_name = 'numbers'
-             AND column_name = 'number'
-        ) THEN
-          EXECUTE '
-            UPDATE public.numbers
-               SET n = number::INTEGER
-             WHERE n IS NULL
-               AND number IS NOT NULL
-          ';
-        END IF;
-      END $$;
-    `);
-
     await query(
       `UPDATE public.reservations
           SET status = 'expired',
