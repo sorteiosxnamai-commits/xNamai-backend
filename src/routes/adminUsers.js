@@ -298,7 +298,11 @@ router.post("/:id/assign-numbers", async (req, res) => {
         ? Math.trunc(Number(req.body.amount_cents))
         : numbers.length * ticketPriceCents;
 
-    const expiresAt = new Date(Date.now() + ADMIN_ASSIGN_RESERVATION_TTL_MINUTES * 60 * 1000);
+    // Regra de negócio: reserva criada por cliente expira em 30 min, porém
+    // número atribuído manualmente pelo admin NÃO expira automaticamente.
+    // Mantemos a constante ADMIN_ASSIGN_RESERVATION_TTL_MINUTES apenas para
+    // compatibilidade histórica; o valor efetivo aqui é null (sem TTL).
+    const expiresAt = null;
 
     await client.query(
       `
@@ -603,7 +607,8 @@ router.post("/:id/assign-numbers", async (req, res) => {
       numbers,
       status: "reserved",
       payment_status: "pending",
-      expires_at: expiresAt.toISOString(),
+      expires_at: null,
+      expiresAt: null,
     });
   } catch (err) {
     try {
