@@ -165,34 +165,55 @@ function formatDay(value) {
   }).format(new Date(value));
 }
 
-export async function reserveNumbers(draw_id, payloadOrUserId, userOrPayload = null) {
-  const calledWithUserId = typeof payloadOrUserId === "number" || typeof payloadOrUserId === "string";
-  const payload = calledWithUserId ? (userOrPayload || {}) : (payloadOrUserId || {});
-  const user = calledWithUserId
-    ? {
-        id: payloadOrUserId,
-        email: payload?.buyer_email || payload?.email || "",
-        name: payload?.buyer_name || payload?.name || payload?.email || "",
-      }
-    : userOrPayload;
-  const userId = Number(user?.id);
-  const userEmail = String(user?.email || payload?.buyer_email || payload?.email || "").trim();
-  const userName = String(user?.name || user?.nome || payload?.buyer_name || payload?.name || userEmail).trim();
+export async function reserveNumbers(input = {}, user = null) {
+  const drawId = Number.parseInt(input.drawId ?? input.draw_id, 10);
+  const numbers = (input.numbers || [])
+    .map((value) => Number.parseInt(String(value).trim(), 10))
+    .filter((value) => Number.isInteger(value) && value >= 0 && value <= 99);
+
+  const userId = input.userId != null
+    ? Number.parseInt(input.userId, 10)
+    : user?.id != null
+      ? Number.parseInt(user.id, 10)
+      : null;
+
+  const customer = input.customer || null;
+  const payload = {
+    numbers,
+    ...(customer && typeof customer === "object" ? customer : {}),
+    buyer_email: input.buyer_email || customer?.email || user?.email || "",
+    buyer_name: input.buyer_name || customer?.name || user?.name || user?.nome || "",
+    buyer_phone: input.buyer_phone || customer?.phone || user?.phone || null,
+  };
+
+  const userEmail = String(payload.buyer_email || user?.email || "").trim();
+  const userName = String(
+    payload.buyer_name || user?.name || user?.nome || userEmail
+  ).trim();
+
+  if (!Number.isInteger(drawId) || drawId <= 0) {
+    throw httpError(400, "invalid_promotional_draw", "ID do sorteio promocional inválido.");
+  }
+
+  if (!numbers.length) {
+    throw httpError(400, "no_numbers", "Nenhum número selecionado.");
+  }
 
   if (!Number.isInteger(userId) || !userEmail) {
     throw httpError(401, "login_required", "Usuário não autenticado.");
   }
 
-  const draw = await getPublicDraw(draw_id);
+  const draw = await getPublicDraw(drawId);
   const data = validateReservationPayload(
     {
       ...payload,
+      numbers,
       name: userName,
       email: userEmail,
-      phone: payload?.buyer_phone || null,
+      phone: payload.buyer_phone || null,
       buyer_name: userName,
       buyer_email: userEmail,
-      buyer_phone: payload?.buyer_phone || null,
+      buyer_phone: payload.buyer_phone || null,
     },
     {
       id: userId,
@@ -236,8 +257,8 @@ export async function reserveNumbers(draw_id, payloadOrUserId, userOrPayload = n
   }
 
   const result = await createPromotionalReservation({
-    drawId: draw.id,
-    userId: data.user_id,
+    drawId,
+    userId,
     numbers: data.numbers,
     buyerName: data.name,
     buyerEmail: data.email,

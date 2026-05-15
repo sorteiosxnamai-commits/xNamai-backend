@@ -46,6 +46,21 @@ function requirePromotionalAuth(req, res, next) {
   });
 }
 
+function normalizePromotionalNumbers(body = {}) {
+  const raw =
+    body.selectedNumbers ??
+    body.numbers ??
+    body.number ??
+    body.numero ??
+    [];
+
+  const list = Array.isArray(raw) ? raw : [raw];
+
+  return list
+    .map((value) => Number.parseInt(String(value).trim(), 10))
+    .filter((value) => Number.isInteger(value) && value >= 0 && value <= 99);
+}
+
 function logPromotionalError(tag, err) {
   console.error("[promotional] error:", {
     tag,
@@ -194,16 +209,43 @@ function sendReservationCreated(res, reservation, pix = null) {
 }
 
 async function createReservationHandler(req, res) {
-  const drawId = req.params.drawId || req.params.id;
-  const numbers = Array.isArray(req.body?.numbers)
-    ? req.body.numbers
-    : Array.isArray(req.body?.selectedNumbers)
-      ? req.body.selectedNumbers
-      : [];
-  const userId = req.user?.id;
+  const drawId = Number.parseInt(req.params.id || req.params.drawId, 10);
+
+  if (!Number.isInteger(drawId) || drawId <= 0) {
+    return res.status(400).json({
+      ok: false,
+      error: "invalid_promotional_draw",
+      message: "ID do sorteio promocional inválido",
+    });
+  }
+
+  const userId = req.user?.id
+    ? Number.parseInt(req.user.id, 10)
+    : req.body?.userId
+      ? Number.parseInt(req.body.userId, 10)
+      : null;
+
+  const numbers = normalizePromotionalNumbers(req.body);
+
+  if (!numbers.length) {
+    return res.status(400).json({
+      ok: false,
+      error: "no_numbers",
+      message: "Nenhum número selecionado",
+    });
+  }
 
   try {
-    const reservation = await reserveNumbers(drawId, { ...(req.body || {}), numbers }, req.user);
+    const reservation = await reserveNumbers(
+      {
+        drawId,
+        userId,
+        numbers,
+        customer: req.body?.customer || null,
+      },
+      req.user
+    );
+
     let pix = null;
     try {
       pix = await createPromotionalPix(
@@ -225,6 +267,7 @@ async function createReservationHandler(req, res) {
         userId,
       });
     }
+
     console.log("[PROMOTIONAL_RESERVATION_CREATE]", {
       reservationId: reservation.id || reservation.reservation_id,
       drawId,
@@ -232,20 +275,14 @@ async function createReservationHandler(req, res) {
       numbers: reservation.numbers,
       amount_cents: reservation.amount_cents || reservation.total_cents || 0,
     });
+
     return sendReservationCreated(res, reservation, pix);
   } catch (err) {
-    console.error("[PROMOTIONAL_RESERVATION_ERROR]", {
+    console.error("[PROMOTIONAL_RESERVE_ERROR]", {
       message: err?.message,
       code: err?.code,
-      stack: err?.stack,
-      drawId,
-      userId,
-      numbers,
-    });
-    console.error("[promotional.reserve] error", {
-      message: err?.message,
-      code: err?.code,
-      stack: err?.stack,
+      detail: err?.detail,
+      hint: err?.hint,
       drawId,
       userId,
       numbers,
