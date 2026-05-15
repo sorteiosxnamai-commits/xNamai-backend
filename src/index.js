@@ -56,6 +56,7 @@ import {
 
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
+import { ensureMainRaffleCompat } from "./services/mainRaffleCompat.js";
 import { ensureAppConfig } from "./services/config.js";
 import { validateTrayConfigAtStartup } from "./services/trayConfig.js";
 
@@ -344,7 +345,9 @@ async function bootstrap() {
     // Validação de env Vindi
     validateVindiConfig();
 
+    await ensureMainRaffleCompat();
     await ensureSchema(); // cria o schema base/tabelas
+    await ensureMainRaffleCompat();
     await ensureAppConfig(); // garante app_config e ticket_price_cents
 
     const pool = await getPool();

@@ -5,6 +5,11 @@ import express from "express";
 import { randomUUID } from "node:crypto";
 import { query, getPool } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import {
+  ensureMainRaffleCompat,
+  getTicketPriceCents,
+  reservationIdIsUuid,
+} from "../services/mainRaffleCompat.js";
 
 const router = express.Router();
 const ADMIN_ASSIGN_RESERVATION_TTL_MINUTES = 30;
@@ -255,12 +260,15 @@ router.post("/:id/assign-numbers", async (req, res) => {
     }
 
     await client.query("BEGIN");
+    await ensureMainRaffleCompat(client);
 
     const userResult = await client.query(
-      `SELECT id, name, email, phone
-         FROM public.users
-        WHERE id = $1
-        FOR UPDATE`,
+      `
+      SELECT id, name, email, phone
+        FROM public.users
+       WHERE id = $1
+       FOR UPDATE
+      `,
       [user_id]
     );
 
@@ -270,10 +278,12 @@ router.post("/:id/assign-numbers", async (req, res) => {
     }
 
     const drawResult = await client.query(
-      `SELECT id, COALESCE(ticket_price_cents, 5500)::int AS ticket_price_cents
-         FROM public.draws
-        WHERE id = $1
-        FOR UPDATE`,
+      `
+      SELECT id
+        FROM public.draws
+       WHERE id = $1
+       FOR UPDATE
+      `,
       [draw_id]
     );
 
@@ -282,71 +292,79 @@ router.post("/:id/assign-numbers", async (req, res) => {
       return res.status(404).json({ ok: false, error: "draw_not_found" });
     }
 
-    const ticketPriceCents = Number(drawResult.rows[0]?.ticket_price_cents || 5500);
-    const amount_cents = Number.isFinite(Number(req.body?.amount_cents)) && Number(req.body.amount_cents) > 0
-      ? Math.trunc(Number(req.body.amount_cents))
-      : numbers.length * ticketPriceCents;
+    const ticketPriceCents = await getTicketPriceCents(client, draw_id);
+    const amount_cents =
+      Number.isFinite(Number(req.body?.amount_cents)) && Number(req.body.amount_cents) > 0
+        ? Math.trunc(Number(req.body.amount_cents))
+        : numbers.length * ticketPriceCents;
+
+    const expiresAt = new Date(Date.now() + ADMIN_ASSIGN_RESERVATION_TTL_MINUTES * 60 * 1000);
 
     await client.query(
-      `UPDATE public.reservations
-          SET status = 'expired',
-              payment_status = 'expired',
-              updated_at = NOW()
-        WHERE draw_id = $1
-          AND expires_at IS NOT NULL
-          AND expires_at <= NOW()
-          AND LOWER(COALESCE(status, '')) IN ('active','pending','reserved','reservado','pendente')
-          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`,
+      `
+      UPDATE public.reservations
+         SET status = 'expired',
+             payment_status = 'expired',
+             updated_at = NOW()
+       WHERE draw_id = $1
+         AND expires_at IS NOT NULL
+         AND expires_at <= NOW()
+         AND LOWER(COALESCE(status, '')) IN ('active','pending','reserved','reservado','pendente')
+         AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')
+      `,
       [draw_id]
     );
 
     await client.query(
-      `UPDATE public.numbers
-          SET status = 'available',
-              reservation_id = NULL,
-              user_id = NULL,
-              payment_status = 'pending',
-              reserved_until = NULL,
-              reserved_at = NULL,
-              payment_id = NULL,
-              updated_at = NOW()
-        WHERE draw_id = $1
-          AND LOWER(COALESCE(status, '')) IN ('reserved','pending','reservado','pendente')
-          AND reserved_until IS NOT NULL
-          AND reserved_until <= NOW()
-          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`,
+      `
+      UPDATE public.numbers
+         SET status = 'available',
+             reservation_id = NULL,
+             user_id = NULL,
+             payment_status = 'pending',
+             reserved_until = NULL,
+             reserved_at = NULL,
+             payment_id = NULL,
+             updated_at = NOW()
+       WHERE draw_id = $1
+         AND LOWER(COALESCE(status, '')) IN ('reserved','pending','reservado','pendente')
+         AND reserved_until IS NOT NULL
+         AND reserved_until <= NOW()
+         AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')
+      `,
       [draw_id]
     );
 
     await client.query(
-      `INSERT INTO public.numbers (draw_id, n, status, updated_at)
-       SELECT $1, selected_number, 'available', NOW()
-         FROM UNNEST($2::int[]) AS selected_number
-        WHERE NOT EXISTS (
-          SELECT 1
-            FROM public.numbers existing
-           WHERE existing.draw_id = $1
-             AND existing.n = selected_number
-        )`,
+      `
+      INSERT INTO public.numbers (draw_id, n, number, status, created_at, updated_at)
+      SELECT $1, selected_number::smallint, selected_number::int, 'available', NOW(), NOW()
+        FROM UNNEST($2::int[]) AS selected_number
+       WHERE NOT EXISTS (
+         SELECT 1
+           FROM public.numbers existing
+          WHERE existing.draw_id = $1
+            AND COALESCE(existing.n::int, existing.number) = selected_number
+       )
+      `,
       [draw_id, numbers]
     );
 
     const numberConflicts = await client.query(
-      `SELECT DISTINCT n::int AS n, status
-         FROM public.numbers
-        WHERE draw_id = $1
-          AND n = ANY($2::int[])
-          AND (
-            LOWER(COALESCE(status, 'available')) IN ('sold','paid','approved','pago','vendido','aprovado','blocked','bloqueado')
-            OR (
-              LOWER(COALESCE(status, 'available')) IN ('reserved','pending','reservado','pendente')
-              AND (
-                reserved_until IS NULL
-                OR reserved_until > NOW()
-              )
-            )
-          )
-        ORDER BY n`,
+      `
+      SELECT DISTINCT COALESCE(n::int, number) AS number, status
+        FROM public.numbers
+       WHERE draw_id = $1
+         AND COALESCE(n::int, number) = ANY($2::int[])
+         AND (
+           LOWER(COALESCE(status, 'available')) IN ('sold','paid','approved','pago','vendido','aprovado','blocked','bloqueado')
+           OR (
+             LOWER(COALESCE(status, 'available')) IN ('reserved','pending','reservado','pendente')
+             AND (reserved_until IS NULL OR reserved_until > NOW())
+           )
+         )
+       ORDER BY number
+      `,
       [draw_id, numbers]
     );
 
@@ -355,18 +373,20 @@ router.post("/:id/assign-numbers", async (req, res) => {
       return res.status(409).json({
         ok: false,
         error: "numbers_taken",
-        conflicts: numberConflicts.rows.map((r) => Number(r.n)),
+        conflicts: numberConflicts.rows.map((r) => Number(r.number)),
       });
     }
 
     const paymentConflicts = await client.query(
-      `SELECT DISTINCT used.n::int AS n
-         FROM public.payments p
-         CROSS JOIN LATERAL UNNEST(p.numbers) AS used(n)
-        WHERE p.draw_id = $1
-          AND used.n = ANY($2::int[])
-          AND LOWER(COALESCE(p.status, '')) IN ('approved','paid','pago')
-        ORDER BY used.n`,
+      `
+      SELECT DISTINCT used.n::int AS number
+        FROM public.payments p
+        CROSS JOIN LATERAL UNNEST(COALESCE(p.numbers, '{}'::int[])) AS used(n)
+       WHERE p.draw_id = $1
+         AND used.n = ANY($2::int[])
+         AND LOWER(COALESCE(p.status, '')) IN ('approved','paid','pago')
+       ORDER BY used.n
+      `,
       [draw_id, numbers]
     );
 
@@ -375,23 +395,22 @@ router.post("/:id/assign-numbers", async (req, res) => {
       return res.status(409).json({
         ok: false,
         error: "numbers_paid",
-        conflicts: paymentConflicts.rows.map((r) => Number(r.n)),
+        conflicts: paymentConflicts.rows.map((r) => Number(r.number)),
       });
     }
 
     const reservationConflicts = await client.query(
-      `SELECT DISTINCT used.n::int AS n
-         FROM public.reservations r
-         CROSS JOIN LATERAL UNNEST(r.numbers) AS used(n)
-        WHERE r.draw_id = $1
-          AND used.n = ANY($2::int[])
-          AND LOWER(COALESCE(r.status, '')) IN ('active','pending','reserved','reservado','pendente')
-          AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN ('paid','approved','pago','expired','cancelled','canceled')
-          AND (
-            r.expires_at IS NULL
-            OR r.expires_at > NOW()
-          )
-        ORDER BY used.n`,
+      `
+      SELECT DISTINCT COALESCE(r.number, used.n)::int AS number
+        FROM public.reservations r
+        LEFT JOIN LATERAL UNNEST(COALESCE(r.numbers, '{}'::int[])) AS used(n) ON TRUE
+       WHERE r.draw_id = $1
+         AND COALESCE(r.number, used.n) = ANY($2::int[])
+         AND LOWER(COALESCE(r.status, '')) IN ('active','pending','reserved','reservado','pendente')
+         AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN ('paid','approved','pago','expired','cancelled','canceled')
+         AND (r.expires_at IS NULL OR r.expires_at > NOW())
+       ORDER BY number
+      `,
       [draw_id, numbers]
     );
 
@@ -400,76 +419,175 @@ router.post("/:id/assign-numbers", async (req, res) => {
       return res.status(409).json({
         ok: false,
         error: "numbers_reserved",
-        conflicts: reservationConflicts.rows.map((r) => Number(r.n)),
+        conflicts: reservationConflicts.rows.map((r) => Number(r.number)),
       });
     }
 
-    const reservationId = randomUUID();
     const user = userResult.rows[0];
+    const groupId = randomUUID();
+    const usesUuidId = await reservationIdIsUuid(client);
 
-    await client.query(
-      `INSERT INTO public.reservations (
-         id,
-         user_id,
-         draw_id,
-         numbers,
-         quantity,
-         total_amount_cents,
-         amount_cents,
-         status,
-         payment_status,
-         payment_id,
-         buyer_name,
-         buyer_email,
-         buyer_phone,
-         expires_at,
-         created_at,
-         updated_at
-       )
-       VALUES (
-         $1,
-         $2,
-         $3,
-         $4::int[],
-         CARDINALITY($4::int[]),
-         $5,
-         $5,
-         'reserved',
-         'pending',
-         NULL,
-         $6,
-         $7,
-         $8,
-         NULL,
-         NOW(),
-         NOW()
-       )`,
-      [
-        reservationId,
-        user_id,
-        draw_id,
-        numbers,
-        amount_cents,
-        user.name || user.email || "",
-        user.email || "",
-        user.phone || "",
-      ]
-    );
+    let reservationIdForResponse = groupId;
 
-    await client.query(
-      `UPDATE public.numbers
-          SET status = 'reserved',
-              user_id = $3,
-              reservation_id = $4,
-              payment_status = 'pending',
-              reserved_at = NOW(),
-              reserved_until = NULL,
-              payment_id = NULL,
-              updated_at = NOW()
-        WHERE draw_id = $1
-          AND n = ANY($2::int[])`,
-      [draw_id, numbers, user_id, reservationId]
-    );
+    if (usesUuidId) {
+      await client.query(
+        `
+        INSERT INTO public.reservations (
+          id,
+          reservation_group_id,
+          user_id,
+          draw_id,
+          numbers,
+          quantity,
+          total_amount_cents,
+          total_cents,
+          amount_cents,
+          status,
+          payment_status,
+          payment_id,
+          buyer_name,
+          buyer_email,
+          buyer_phone,
+          expires_at,
+          source,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,
+          $1,
+          $2,
+          $3,
+          $4::int[],
+          CARDINALITY($4::int[]),
+          $5,
+          $5,
+          $5,
+          'reserved',
+          'pending',
+          NULL,
+          $6,
+          $7,
+          $8,
+          $9,
+          'admin',
+          NOW(),
+          NOW()
+        )
+        `,
+        [
+          groupId,
+          user_id,
+          draw_id,
+          numbers,
+          amount_cents,
+          user.name || user.email || "",
+          user.email || "",
+          user.phone || "",
+          expiresAt,
+        ]
+      );
+
+      await client.query(
+        `
+        UPDATE public.numbers
+           SET status = 'reserved',
+               user_id = $3,
+               reservation_id = $4,
+               payment_status = 'pending',
+               reserved_at = NOW(),
+               reserved_until = $5,
+               payment_id = NULL,
+               updated_at = NOW()
+         WHERE draw_id = $1
+           AND COALESCE(n::int, number) = ANY($2::int[])
+        `,
+        [draw_id, numbers, user_id, groupId, expiresAt]
+      );
+    } else {
+      const inserted = await client.query(
+        `
+        WITH inserted AS (
+          INSERT INTO public.reservations (
+            reservation_group_id,
+            user_id,
+            draw_id,
+            number,
+            numbers,
+            quantity,
+            price_cents,
+            total_amount_cents,
+            total_cents,
+            amount_cents,
+            status,
+            payment_status,
+            payment_id,
+            buyer_name,
+            buyer_email,
+            buyer_phone,
+            expires_at,
+            source,
+            created_at,
+            updated_at
+          )
+          SELECT
+            $1,
+            $2,
+            $3,
+            selected_number,
+            $4::int[],
+            CARDINALITY($4::int[]),
+            $5,
+            $6,
+            $6,
+            $6,
+            'reserved',
+            'pending',
+            NULL,
+            $7,
+            $8,
+            $9,
+            $10,
+            'admin',
+            NOW(),
+            NOW()
+          FROM UNNEST($4::int[]) AS selected_number
+          RETURNING id, number
+        )
+        UPDATE public.numbers n
+           SET status = 'reserved',
+               user_id = $2,
+               reservation_id = inserted.id,
+               payment_status = 'pending',
+               reserved_at = NOW(),
+               reserved_until = $10,
+               payment_id = NULL,
+               updated_at = NOW()
+          FROM inserted
+         WHERE n.draw_id = $3
+           AND COALESCE(n.n::int, n.number) = inserted.number
+        RETURNING inserted.id, inserted.number
+        `,
+        [
+          groupId,
+          user_id,
+          draw_id,
+          numbers,
+          ticketPriceCents,
+          amount_cents,
+          user.name || user.email || "",
+          user.email || "",
+          user.phone || "",
+          expiresAt,
+        ]
+      );
+
+      reservationIdForResponse = groupId;
+
+      if (inserted.rowCount !== numbers.length) {
+        throw new Error(`assignment_rowcount_mismatch:${inserted.rowCount}/${numbers.length}`);
+      }
+    }
 
     await client.query("COMMIT");
 
@@ -477,14 +595,15 @@ router.post("/:id/assign-numbers", async (req, res) => {
       ok: true,
       success: true,
       message: "Números atribuídos e reservados com sucesso.",
-      reservation_id: reservationId,
-      reservationId,
+      reservation_id: reservationIdForResponse,
+      reservationId: reservationIdForResponse,
       draw_id,
       drawId: draw_id,
       user_id,
       numbers,
       status: "reserved",
       payment_status: "pending",
+      expires_at: expiresAt.toISOString(),
     });
   } catch (err) {
     try {
@@ -509,6 +628,8 @@ router.post("/:id/assign-numbers", async (req, res) => {
       error: "assign_numbers_failed",
       message: err?.message || "Falha ao atribuir números.",
       code: err?.code || "ADMIN_ASSIGN_NUMBERS_ERROR",
+      detail: err?.detail || null,
+      hint: err?.hint || null,
     });
   } finally {
     client.release();

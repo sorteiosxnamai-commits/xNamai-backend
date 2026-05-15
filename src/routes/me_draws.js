@@ -83,8 +83,9 @@ router.get("/:id/board", requireAuth, async (req, res) => {
     const resvR = await query(
       `SELECT DISTINCT n::int AS n
          FROM (
-           SELECT unnest(r.numbers)::int AS n
+           SELECT COALESCE(r.number, used.n)::int AS n
              FROM public.reservations r
+             LEFT JOIN LATERAL UNNEST(COALESCE(r.numbers, '{}'::int[])) AS used(n) ON TRUE
             WHERE r.draw_id = $1
               AND LOWER(COALESCE(r.status, '')) IN ('active','pending','reserved','reservado','pendente')
               AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN ('paid','approved','pago','expired','cancelled','canceled')
@@ -95,10 +96,10 @@ router.get("/:id/board", requireAuth, async (req, res) => {
 
            UNION
 
-           SELECT num.n::int AS n
+           SELECT COALESCE(num.n::int, num.number) AS n
              FROM public.numbers num
             WHERE num.draw_id = $1
-              AND num.n IS NOT NULL
+              AND COALESCE(num.n::int, num.number) IS NOT NULL
               AND LOWER(COALESCE(num.status, '')) IN ('reserved','pending','reservado','pendente')
               AND LOWER(COALESCE(num.payment_status, 'pending')) NOT IN ('paid','approved','pago','expired','cancelled','canceled')
               AND (

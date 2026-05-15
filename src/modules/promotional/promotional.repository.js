@@ -12,6 +12,20 @@ function getDbRunner(client) {
   return client && typeof client.query === "function" ? client : { query };
 }
 
+async function promotionalReservationIdUsesUuid(client = null) {
+  const db = getDbRunner(client);
+  const result = await db.query(`
+    SELECT udt_name
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'promotional_reservations'
+       AND column_name = 'id'
+     LIMIT 1
+  `);
+
+  return String(result.rows?.[0]?.udt_name || "").toLowerCase() === "uuid";
+}
+
 export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `CREATE EXTENSION IF NOT EXISTS pgcrypto`);
 
@@ -1119,57 +1133,123 @@ export async function createPromotionalReservation({
 
     const reservationId = randomUUID();
     const expiresAt = new Date(Date.now() + PROMOTIONAL_RESERVATION_TTL_MINUTES * 60 * 1000);
-    const reservation = await client.query(`
-      INSERT INTO public.promotional_reservations (
-        reservation_id,
-        draw_id,
-        user_id,
-        numbers,
-        buyer_name,
-        buyer_email,
-        buyer_phone,
-        price_cents,
-        total_cents,
-        amount_cents,
-        source,
-        status,
-        payment_status,
-        expires_at,
-        created_at,
-        updated_at
-      )
-      VALUES (
-        $1,
-        $2,
-        $3,
-        $4::int[],
-        $5,
-        $6,
-        $7,
-        $8,
-        $9,
-        $9,
-        $10,
-        'reserved',
-        'pending',
-        $11,
-        NOW(),
-        NOW()
-      )
-      RETURNING *
-    `, [
-      reservationId,
-      normalizedDrawId,
-      normalizedUserId,
-      cleanNumbers,
-      resolvedBuyerName || resolvedBuyerEmail || "",
-      resolvedBuyerEmail || "",
-      resolvedBuyerPhone || "",
-      priceCents,
-      amountCents,
-      source,
-      expiresAt,
-    ]);
+    const idUsesUuid = await promotionalReservationIdUsesUuid(client);
+
+    let reservation;
+
+    if (idUsesUuid) {
+      reservation = await client.query(
+        `
+        INSERT INTO public.promotional_reservations (
+          id,
+          reservation_id,
+          draw_id,
+          user_id,
+          numbers,
+          buyer_name,
+          buyer_email,
+          buyer_phone,
+          price_cents,
+          total_cents,
+          amount_cents,
+          source,
+          status,
+          payment_status,
+          expires_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,
+          $1,
+          $2,
+          $3,
+          $4::int[],
+          $5,
+          $6,
+          $7,
+          $8,
+          $9,
+          $9,
+          $10,
+          'reserved',
+          'pending',
+          $11,
+          NOW(),
+          NOW()
+        )
+        RETURNING *
+        `,
+        [
+          reservationId,
+          normalizedDrawId,
+          normalizedUserId,
+          cleanNumbers,
+          resolvedBuyerName || resolvedBuyerEmail || "",
+          resolvedBuyerEmail || "",
+          resolvedBuyerPhone || "",
+          priceCents,
+          amountCents,
+          source,
+          expiresAt,
+        ]
+      );
+    } else {
+      reservation = await client.query(
+        `
+        INSERT INTO public.promotional_reservations (
+          reservation_id,
+          draw_id,
+          user_id,
+          numbers,
+          buyer_name,
+          buyer_email,
+          buyer_phone,
+          price_cents,
+          total_cents,
+          amount_cents,
+          source,
+          status,
+          payment_status,
+          expires_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4::int[],
+          $5,
+          $6,
+          $7,
+          $8,
+          $9,
+          $9,
+          $10,
+          'reserved',
+          'pending',
+          $11,
+          NOW(),
+          NOW()
+        )
+        RETURNING *
+        `,
+        [
+          reservationId,
+          normalizedDrawId,
+          normalizedUserId,
+          cleanNumbers,
+          resolvedBuyerName || resolvedBuyerEmail || "",
+          resolvedBuyerEmail || "",
+          resolvedBuyerPhone || "",
+          priceCents,
+          amountCents,
+          source,
+          expiresAt,
+        ]
+      );
+    }
 
     let updateResult;
     try {
@@ -1369,58 +1449,120 @@ export async function assignPromotionalNumbersToUser({
     const amountCents = Math.max(0, Number(draw.price_cents || 0)) * normalizedNumbers.length;
     const reservationId = randomUUID();
 
-    const reservationResult = await client.query(`
-      INSERT INTO public.promotional_reservations (
-        id,
-        reservation_id,
-        draw_id,
-        user_id,
-        numbers,
-        buyer_name,
-        buyer_email,
-        buyer_phone,
-        price_cents,
-        total_cents,
-        amount_cents,
-        source,
-        status,
-        payment_status,
-        expires_at,
-        created_at,
-        updated_at
-      )
-      VALUES (
-        $1,
-        $1,
-        $2,
-        $3,
-        $4::int[],
-        $5,
-        $6,
-        $7,
-        $8,
-        $9,
-        $9,
-        'admin',
-        $10,
-        'pending',
-        NULL,
-        NOW(),
-        NOW()
-      )
-      RETURNING *
-    `, [
-      reservationId,
-      normalizedDrawId,
-      normalizedUserId,
-      normalizedNumbers,
-      buyerName || buyerEmail,
-      buyerEmail,
-      buyerPhone,
-      Number(draw.price_cents || 0),
-      amountCents,
-      finalStatus,
-    ]);
+    const idUsesUuid = await promotionalReservationIdUsesUuid(client);
+    let reservationResult;
+
+    if (idUsesUuid) {
+      reservationResult = await client.query(
+        `
+        INSERT INTO public.promotional_reservations (
+          id,
+          reservation_id,
+          draw_id,
+          user_id,
+          numbers,
+          buyer_name,
+          buyer_email,
+          buyer_phone,
+          price_cents,
+          total_cents,
+          amount_cents,
+          source,
+          status,
+          payment_status,
+          expires_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,
+          $1,
+          $2,
+          $3,
+          $4::int[],
+          $5,
+          $6,
+          $7,
+          $8,
+          $9,
+          $9,
+          'admin',
+          $10,
+          'pending',
+          NULL,
+          NOW(),
+          NOW()
+        )
+        RETURNING *
+        `,
+        [
+          reservationId,
+          normalizedDrawId,
+          normalizedUserId,
+          normalizedNumbers,
+          buyerName || buyerEmail,
+          buyerEmail,
+          buyerPhone,
+          Number(draw.price_cents || 0),
+          amountCents,
+          finalStatus,
+        ]
+      );
+    } else {
+      reservationResult = await client.query(
+        `
+        INSERT INTO public.promotional_reservations (
+          reservation_id,
+          draw_id,
+          user_id,
+          numbers,
+          buyer_name,
+          buyer_email,
+          buyer_phone,
+          price_cents,
+          total_cents,
+          amount_cents,
+          source,
+          status,
+          payment_status,
+          expires_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4::int[],
+          $5,
+          $6,
+          $7,
+          $8,
+          $9,
+          $9,
+          'admin',
+          $10,
+          'pending',
+          NULL,
+          NOW(),
+          NOW()
+        )
+        RETURNING *
+        `,
+        [
+          reservationId,
+          normalizedDrawId,
+          normalizedUserId,
+          normalizedNumbers,
+          buyerName || buyerEmail,
+          buyerEmail,
+          buyerPhone,
+          Number(draw.price_cents || 0),
+          amountCents,
+          finalStatus,
+        ]
+      );
+    }
 
     await client.query(`
       UPDATE public.promotional_numbers

@@ -1,0 +1,147 @@
+import { query } from "../db.js";
+
+function runner(client) {
+  return client && typeof client.query === "function"
+    ? (sql, params = []) => client.query(sql, params)
+    : (sql, params = []) => query(sql, params);
+}
+
+export async function tableExists(tableName, client = null) {
+  const q = runner(client);
+  const result = await q(
+    `
+    SELECT 1
+      FROM information_schema.tables
+     WHERE table_schema = 'public'
+       AND table_name = $1
+     LIMIT 1
+    `,
+    [tableName]
+  );
+
+  return result.rowCount > 0;
+}
+
+export async function columnType(tableName, columnName, client = null) {
+  const q = runner(client);
+  const result = await q(
+    `
+    SELECT udt_name
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = $1
+       AND column_name = $2
+     LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+
+  return result.rows?.[0]?.udt_name || null;
+}
+
+export async function reservationIdIsUuid(client = null) {
+  const type = await columnType("reservations", "id", client);
+  return String(type).toLowerCase() === "uuid";
+}
+
+export async function ensureMainRaffleCompat(client = null) {
+  const q = runner(client);
+
+  await q(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
+
+  const drawsExists = await tableExists("draws", client);
+  if (drawsExists) {
+    await q(`ALTER TABLE public.draws ADD COLUMN IF NOT EXISTS price_cents INTEGER NOT NULL DEFAULT 5500`);
+    await q(`ALTER TABLE public.draws ADD COLUMN IF NOT EXISTS ticket_price_cents INTEGER`);
+    await q(`
+      UPDATE public.draws
+         SET ticket_price_cents = COALESCE(ticket_price_cents, price_cents, 5500),
+             price_cents = COALESCE(price_cents, ticket_price_cents, 5500)
+    `);
+  }
+
+  const numbersExists = await tableExists("numbers", client);
+  if (numbersExists) {
+    await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS n SMALLINT`);
+    await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS number INTEGER`);
+    await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS user_id BIGINT`);
+    await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+    await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS payment_id TEXT`);
+    await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ`);
+    await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ`);
+    await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+    await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+
+    await q(`
+      UPDATE public.numbers
+         SET n = number::smallint
+       WHERE n IS NULL
+         AND number IS NOT NULL
+    `);
+
+    await q(`
+      UPDATE public.numbers
+         SET number = n::int
+       WHERE number IS NULL
+         AND n IS NOT NULL
+    `);
+  }
+
+  const reservationsExists = await tableExists("reservations", client);
+  if (reservationsExists) {
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS reservation_group_id UUID DEFAULT gen_random_uuid()`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS numbers INTEGER[] DEFAULT '{}'`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS number INTEGER`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS quantity INTEGER DEFAULT 1`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS price_cents INTEGER DEFAULT 0`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS total_cents INTEGER DEFAULT 0`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS total_amount_cents INTEGER DEFAULT 0`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS amount_cents INTEGER DEFAULT 0`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_id TEXT`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payment_provider TEXT DEFAULT 'mercadopago'`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_qr_code TEXT`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS pix_ticket_url TEXT`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_name TEXT`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'public'`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+
+    await q(`ALTER TABLE public.reservations ALTER COLUMN number DROP NOT NULL`);
+
+    await q(`
+      UPDATE public.reservations
+         SET reservation_group_id = COALESCE(reservation_group_id, gen_random_uuid()),
+             numbers = CASE
+               WHEN numbers IS NULL OR cardinality(numbers) = 0 THEN ARRAY[number]::integer[]
+               ELSE numbers
+             END,
+             quantity = COALESCE(quantity, cardinality(numbers), 1),
+             total_cents = COALESCE(NULLIF(total_cents, 0), amount_cents, total_amount_cents, price_cents, 0),
+             total_amount_cents = COALESCE(NULLIF(total_amount_cents, 0), total_cents, amount_cents, price_cents, 0),
+             amount_cents = COALESCE(NULLIF(amount_cents, 0), total_cents, total_amount_cents, price_cents, 0),
+             payment_status = COALESCE(payment_status, 'pending')
+    `);
+  }
+}
+
+export async function getTicketPriceCents(client, drawId) {
+  await ensureMainRaffleCompat(client);
+
+  const result = await client.query(
+    `
+    SELECT COALESCE(ticket_price_cents, price_cents, 5500)::int AS price_cents
+      FROM public.draws
+     WHERE id = $1
+     LIMIT 1
+    `,
+    [drawId]
+  );
+
+  return Number(result.rows?.[0]?.price_cents || 5500);
+}
