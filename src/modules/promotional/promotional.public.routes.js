@@ -295,7 +295,7 @@ async function createReservationHandler(req, res) {
 }
 
 router.post("/:drawId/checkout", requirePromotionalAuth, async (req, res) => {
-  res.set("X-XNAMAI-PROMOTIONAL-ROUTE", "checkout-debug-v4");
+  res.set("X-XNAMAI-PROMOTIONAL-ROUTE", "checkout-debug-status-fix");
 
   console.log("[PROMOTIONAL_CHECKOUT_ROUTE_HIT]", {
     drawId: req.params.drawId,
@@ -310,7 +310,7 @@ router.post("/:drawId/checkout", requirePromotionalAuth, async (req, res) => {
       ok: false,
       error: "invalid_promotional_draw",
       message: "ID do sorteio promocional inválido.",
-      debug_route: "checkout-debug-v4",
+      debug_route: "checkout-debug-status-fix",
     });
   }
 
@@ -327,7 +327,7 @@ router.post("/:drawId/checkout", requirePromotionalAuth, async (req, res) => {
       ok: false,
       error: "no_numbers",
       message: "Nenhum número promocional selecionado.",
-      debug_route: "checkout-debug-v4",
+      debug_route: "checkout-debug-status-fix",
     });
   }
 
@@ -373,7 +373,7 @@ router.post("/:drawId/checkout", requirePromotionalAuth, async (req, res) => {
         error: "promotional_reservation_without_id",
         message: "Reserva promocional criada, mas sem ID retornado.",
         reservation,
-        debug_route: "checkout-debug-v4",
+        debug_route: "checkout-debug-status-fix",
       });
     }
 
@@ -420,7 +420,7 @@ router.post("/:drawId/checkout", requirePromotionalAuth, async (req, res) => {
     const response = {
       ok: true,
       success: true,
-      debug_route: "checkout-debug-v4",
+      debug_route: "checkout-debug-status-fix",
       type: "promotional",
       source: "promotional",
 
@@ -480,6 +480,7 @@ router.post("/:drawId/checkout", requirePromotionalAuth, async (req, res) => {
       code: err?.code,
       detail: err?.detail,
       hint: err?.hint,
+      constraint: err?.constraint,
       stack: err?.stack,
       body: req.body,
       params: req.params,
@@ -492,7 +493,8 @@ router.post("/:drawId/checkout", requirePromotionalAuth, async (req, res) => {
       message: err?.message || "Erro no checkout promocional.",
       detail: err?.detail || null,
       hint: err?.hint || null,
-      debug_route: "checkout-debug-v4",
+      constraint: err?.constraint || null,
+      debug_route: "checkout-debug-status-fix",
     });
   }
 });

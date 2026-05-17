@@ -346,7 +346,7 @@ export async function releaseExpiredPromotionalReservations(client = null, drawI
          SET status = 'expired',
              payment_status = 'expired',
              updated_at = NOW()
-       WHERE pr.status = 'reserved'
+       WHERE pr.status IN ('pending', 'reserved')
          AND COALESCE(pr.payment_status, 'pending') IN ('pending', 'waiting', 'open')
          AND pr.expires_at IS NOT NULL
          AND pr.expires_at < NOW()
@@ -867,7 +867,7 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
     SET payment_id = $3,
         preference_id = COALESCE($7, preference_id),
         payment_status = 'pending',
-        status = 'reserved',
+        status = 'pending',
         payment_provider = 'mercadopago',
         pix_qr_code = $4,
         pix_qr_code_base64 = $5,
@@ -962,7 +962,7 @@ export async function attachPaymentToPromotionalReservation({
         preference_id = COALESCE($3, preference_id),
         payment_provider = COALESCE(payment_provider, 'mercadopago'),
         payment_status = 'pending',
-        status = 'reserved',
+        status = 'pending',
         pix_qr_code = COALESCE($4, pix_qr_code),
         pix_qr_code_base64 = COALESCE($5, pix_qr_code_base64),
         pix_copy_paste = COALESCE($4, pix_copy_paste),
@@ -1200,7 +1200,7 @@ export async function createPromotionalReservation({
           $9,
           $9,
           $10,
-          'reserved',
+          'pending',
           'pending',
           $11,
           NOW(),
@@ -1255,7 +1255,7 @@ export async function createPromotionalReservation({
           $9,
           $9,
           $10,
-          'reserved',
+          'pending',
           'pending',
           $11,
           NOW(),
@@ -1278,6 +1278,15 @@ export async function createPromotionalReservation({
         ]
       );
     }
+
+    console.log("[PROMOTIONAL_RESERVATION_CREATED]", {
+      reservationId: reservation.rows[0]?.reservation_id || reservation.rows[0]?.id,
+      drawId: normalizedDrawId,
+      userId: normalizedUserId,
+      numbers: cleanNumbers,
+      status: reservation.rows[0]?.status,
+      paymentStatus: reservation.rows[0]?.payment_status,
+    });
 
     let updateResult;
     try {
@@ -1478,6 +1487,7 @@ export async function assignPromotionalNumbersToUser({
     const buyerEmail = buyer.buyer_email || buyer.email || "";
     const buyerPhone = buyer.buyer_phone || buyer.phone || "";
     const finalStatus = String(status || "reserved").toLowerCase() === "unavailable" ? "unavailable" : "reserved";
+    const finalReservationStatus = "pending";
     const amountCents = Math.max(0, Number(draw.price_cents || 0)) * normalizedNumbers.length;
     const reservationId = randomUUID();
 
@@ -1537,7 +1547,7 @@ export async function assignPromotionalNumbersToUser({
           buyerPhone,
           Number(draw.price_cents || 0),
           amountCents,
-          finalStatus,
+          finalReservationStatus,
         ]
       );
     } else {
@@ -1591,10 +1601,19 @@ export async function assignPromotionalNumbersToUser({
           buyerPhone,
           Number(draw.price_cents || 0),
           amountCents,
-          finalStatus,
+          finalReservationStatus,
         ]
       );
     }
+
+    console.log("[PROMOTIONAL_RESERVATION_CREATED]", {
+      reservationId: reservationResult.rows[0]?.reservation_id || reservationResult.rows[0]?.id,
+      drawId: normalizedDrawId,
+      userId: normalizedUserId,
+      numbers: normalizedNumbers,
+      status: reservationResult.rows[0]?.status,
+      paymentStatus: reservationResult.rows[0]?.payment_status,
+    });
 
     await client.query(`
       UPDATE public.promotional_numbers
