@@ -84,6 +84,85 @@ function buyerFromRequest(req) {
   };
 }
 
+function normalizePromotionalPaymentStatus(status) {
+  const value = String(status || "pending")
+    .trim()
+    .toLowerCase();
+
+  if (
+    [
+      "approved",
+      "paid",
+      "pago",
+      "success",
+      "succeeded",
+      "completed",
+    ].includes(value)
+  ) {
+    return "paid";
+  }
+
+  if (
+    [
+      "pending",
+      "in_process",
+      "authorized",
+      "waiting",
+      "waiting_payment",
+      "pendente",
+      "created",
+      "processing",
+    ].includes(value)
+  ) {
+    return "pending";
+  }
+
+  if (
+    [
+      "rejected",
+      "failed",
+      "failure",
+      "recusado",
+      "denied",
+    ].includes(value)
+  ) {
+    return "failed";
+  }
+
+  if (
+    [
+      "cancelled",
+      "canceled",
+      "cancelado",
+      "cancelada",
+    ].includes(value)
+  ) {
+    return "cancelled";
+  }
+
+  if (
+    [
+      "expired",
+      "expirado",
+    ].includes(value)
+  ) {
+    return "expired";
+  }
+
+  if (
+    [
+      "refunded",
+      "charged_back",
+      "estornado",
+      "devolvido",
+    ].includes(value)
+  ) {
+    return "refunded";
+  }
+
+  return "pending";
+}
+
 async function columnType(client, table, column) {
   const { rows } = await client.query(
     `SELECT udt_name
@@ -280,11 +359,81 @@ async function ensurePromotionalDirectSchema(client) {
     CHECK (LOWER(TRIM(status)) IN ('reserved','pending','paid','approved','expired','cancelled','canceled','blocked','unavailable','sold'))
   `);
 
-  await client.query(`ALTER TABLE public.promotional_reservations DROP CONSTRAINT IF EXISTS promotional_reservations_payment_status_check`);
+  await client.query(`
+    ALTER TABLE public.promotional_reservations
+    DROP CONSTRAINT IF EXISTS promotional_reservations_payment_status_check
+  `);
+
+  await client.query(`
+    UPDATE public.promotional_reservations
+       SET payment_status = CASE
+         WHEN payment_status IS NULL OR TRIM(payment_status::text) = '' THEN 'pending'
+
+         WHEN LOWER(TRIM(payment_status::text)) IN (
+           'approved',
+           'paid',
+           'pago',
+           'success',
+           'succeeded',
+           'completed'
+         ) THEN 'paid'
+
+         WHEN LOWER(TRIM(payment_status::text)) IN (
+           'pending',
+           'in_process',
+           'authorized',
+           'waiting',
+           'waiting_payment',
+           'pendente',
+           'created',
+           'processing'
+         ) THEN 'pending'
+
+         WHEN LOWER(TRIM(payment_status::text)) IN (
+           'rejected',
+           'failed',
+           'failure',
+           'recusado',
+           'denied'
+         ) THEN 'failed'
+
+         WHEN LOWER(TRIM(payment_status::text)) IN (
+           'cancelled',
+           'canceled',
+           'cancelado',
+           'cancelada'
+         ) THEN 'cancelled'
+
+         WHEN LOWER(TRIM(payment_status::text)) IN (
+           'expired',
+           'expirado'
+         ) THEN 'expired'
+
+         WHEN LOWER(TRIM(payment_status::text)) IN (
+           'refunded',
+           'charged_back',
+           'estornado',
+           'devolvido'
+         ) THEN 'refunded'
+
+         ELSE 'pending'
+       END
+  `);
+
   await client.query(`
     ALTER TABLE public.promotional_reservations
     ADD CONSTRAINT promotional_reservations_payment_status_check
-    CHECK (LOWER(TRIM(payment_status)) IN ('pending','paid','approved','expired','cancelled','canceled','failed','refunded'))
+    CHECK (
+      LOWER(TRIM(payment_status)) IN (
+        'pending',
+        'paid',
+        'failed',
+        'cancelled',
+        'canceled',
+        'expired',
+        'refunded'
+      )
+    )
   `);
 
   await client.query(`ALTER TABLE public.promotional_numbers DROP CONSTRAINT IF EXISTS promotional_numbers_status_check`);
@@ -699,11 +848,23 @@ async function attachPix(req, reservationId, drawId = null) {
       },
     });
 
+    const normalizedPaymentStatus = normalizePromotionalPaymentStatus(
+      payment.status || payment.payment_status || "pending"
+    );
+
+    console.log("[PROMOTIONAL_PIX_STATUS_RESOLVED]", {
+      rawStatus: payment.status,
+      rawPaymentStatus: payment.payment_status,
+      normalizedPaymentStatus,
+      reservationId: reservation.reservation_id || reservation.id,
+      drawId: reservation.draw_id,
+    });
+
     await client.query(
       `UPDATE public.promotional_reservations
           SET payment_provider = 'mercadopago',
               payment_id = $2,
-              payment_status = COALESCE($3, 'pending'),
+              payment_status = $3,
               pix_qr_code = $4,
               pix_qr_code_base64 = $5,
               pix_copy_paste = $4,
@@ -713,7 +874,7 @@ async function attachPix(req, reservationId, drawId = null) {
       [
         String(reservation.reservation_id || reservation.id),
         payment.payment_id,
-        payment.status || "pending",
+        normalizedPaymentStatus,
         payment.qr_code || "",
         payment.qr_code_base64 || "",
         payment.ticket_url || "",
@@ -723,14 +884,14 @@ async function attachPix(req, reservationId, drawId = null) {
     await client.query(
       `UPDATE public.promotional_numbers
           SET payment_id = $2,
-              payment_status = COALESCE($3, 'pending'),
+              payment_status = $3,
               updated_at = NOW()
         WHERE draw_id = $4
           AND reservation_id::text IN ($1, $5)`,
       [
         String(reservation.reservation_id || reservation.id),
         payment.payment_id,
-        payment.status || "pending",
+        normalizedPaymentStatus,
         reservation.draw_id,
         String(reservation.id),
       ]
@@ -761,8 +922,8 @@ async function attachPix(req, reservationId, drawId = null) {
           reservation.user_id,
           payment.payment_id,
           payment.external_reference,
-          payment.status || "pending",
-          payment.status_detail || null,
+          normalizedPaymentStatus,
+          payment.status_detail || payment.status || null,
           payment.amount_cents || amountCents,
           payment.qr_code || "",
           payment.qr_code_base64 || "",
@@ -777,10 +938,16 @@ async function attachPix(req, reservationId, drawId = null) {
     return {
       ...payment,
       paymentId: payment.payment_id,
+      payment_id: payment.payment_id,
+      status: normalizedPaymentStatus,
+      payment_status: normalizedPaymentStatus,
       copy_paste_code: payment.qr_code,
       copy_paste: payment.qr_code,
+      qr_code: payment.qr_code,
       pix_qr_code: payment.qr_code,
+      qr_code_base64: payment.qr_code_base64,
       pix_qr_code_base64: payment.qr_code_base64,
+      ticket_url: payment.ticket_url,
       pix_ticket_url: payment.ticket_url,
       amount_cents: payment.amount_cents || amountCents,
       source: "promotional",
