@@ -15,6 +15,7 @@ import paymentsVindiRoutes from "./routes/payments_vindi.js";
 import meRoutes from "./routes/me.js";
 import drawsRoutes from "./routes/draws.js";
 import drawsExtRoutes from "./routes/draws_ext.js";
+import promotionalDirectRouter from "./modules/promotional/promotional.direct.routes.js";
 import promotionalPublicRouter from "./modules/promotional/promotional.public.routes.js";
 import promotionalAdminRouter from "./modules/promotional/promotional.admin.routes.js";
 
@@ -136,6 +137,12 @@ app.use("/api/draws-ext", drawsExtRoutes);
 
 // ── Módulo Promocional isolado ───────────────────────────────
 app.use("/api/promotional/admin", promotionalAdminRouter);
+
+// Nova camada direta do promocional.
+// Ela fica antes da rota antiga para interceptar checkout, numbers e pix sem mexer no Sorteio Principal.
+app.use("/api/promotional", promotionalDirectRouter);
+
+// Mantém o legado como fallback para telas/admin/rotas antigas que ainda dependam dele.
 app.use("/api/promotional", promotionalPublicRouter);
 
 // ── Rotas ADMIN específicas (antes do genérico) ────────────
