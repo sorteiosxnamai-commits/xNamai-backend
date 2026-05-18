@@ -26,6 +26,162 @@ async function promotionalReservationIdUsesUuid(client = null) {
   return String(result.rows?.[0]?.udt_name || "").toLowerCase() === "uuid";
 }
 
+async function ensurePromotionalRuntimeConstraints(client = null) {
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'reserved'
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'
+  `);
+
+  await dbQuery(client, `
+    UPDATE public.promotional_reservations
+       SET status = CASE
+         WHEN status IS NULL OR TRIM(status::text) = '' THEN 'reserved'
+
+         WHEN LOWER(TRIM(status::text)) IN ('reserved', 'reservado', 'reserve') THEN 'reserved'
+         WHEN LOWER(TRIM(status::text)) IN ('pending', 'pendente', 'created', 'waiting', 'waiting_payment') THEN 'pending'
+         WHEN LOWER(TRIM(status::text)) IN ('paid', 'approved', 'pago', 'vendido', 'sold') THEN 'paid'
+         WHEN LOWER(TRIM(status::text)) IN ('expired', 'expirado') THEN 'expired'
+         WHEN LOWER(TRIM(status::text)) IN ('cancelled', 'canceled', 'cancelado', 'cancelada') THEN 'cancelled'
+         WHEN LOWER(TRIM(status::text)) IN ('blocked', 'bloqueado', 'unavailable', 'indisponivel', 'indisponível') THEN 'blocked'
+
+         ELSE 'pending'
+       END
+  `);
+
+  await dbQuery(client, `
+    UPDATE public.promotional_reservations
+       SET payment_status = CASE
+         WHEN payment_status IS NULL OR TRIM(payment_status::text) = '' THEN 'pending'
+
+         WHEN LOWER(TRIM(payment_status::text)) IN ('pending', 'pendente', 'waiting', 'waiting_payment') THEN 'pending'
+         WHEN LOWER(TRIM(payment_status::text)) IN ('paid', 'approved', 'pago') THEN 'paid'
+         WHEN LOWER(TRIM(payment_status::text)) IN ('expired', 'expirado') THEN 'expired'
+         WHEN LOWER(TRIM(payment_status::text)) IN ('cancelled', 'canceled', 'cancelado', 'cancelada') THEN 'cancelled'
+         WHEN LOWER(TRIM(payment_status::text)) IN ('failed', 'rejected', 'recusado') THEN 'failed'
+         WHEN LOWER(TRIM(payment_status::text)) IN ('refunded', 'estornado') THEN 'refunded'
+
+         ELSE 'pending'
+       END
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    DROP CONSTRAINT IF EXISTS promotional_reservations_status_check
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    ADD CONSTRAINT promotional_reservations_status_check
+    CHECK (
+      LOWER(TRIM(status)) IN (
+        'reserved',
+        'pending',
+        'paid',
+        'approved',
+        'expired',
+        'cancelled',
+        'canceled',
+        'blocked',
+        'unavailable',
+        'sold'
+      )
+    )
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    DROP CONSTRAINT IF EXISTS promotional_reservations_payment_status_check
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    ADD CONSTRAINT promotional_reservations_payment_status_check
+    CHECK (
+      LOWER(TRIM(payment_status)) IN (
+        'pending',
+        'paid',
+        'approved',
+        'expired',
+        'cancelled',
+        'canceled',
+        'failed',
+        'refunded'
+      )
+    )
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    ALTER COLUMN status SET DEFAULT 'reserved'
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    ALTER COLUMN payment_status SET DEFAULT 'pending'
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    ALTER COLUMN status SET NOT NULL
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    ALTER COLUMN payment_status SET NOT NULL
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_numbers
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'available'
+  `);
+
+  await dbQuery(client, `
+    UPDATE public.promotional_numbers
+       SET status = CASE
+         WHEN status IS NULL OR TRIM(status::text) = '' THEN 'available'
+
+         WHEN LOWER(TRIM(status::text)) IN ('available', 'disponivel', 'disponível') THEN 'available'
+         WHEN LOWER(TRIM(status::text)) IN ('reserved', 'reservado', 'pending', 'pendente') THEN 'reserved'
+         WHEN LOWER(TRIM(status::text)) IN ('sold', 'paid', 'approved', 'vendido', 'pago') THEN 'sold'
+         WHEN LOWER(TRIM(status::text)) IN ('blocked', 'bloqueado', 'unavailable', 'indisponivel', 'indisponível') THEN 'blocked'
+
+         ELSE 'available'
+       END
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_numbers
+    DROP CONSTRAINT IF EXISTS promotional_numbers_status_check
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_numbers
+    ADD CONSTRAINT promotional_numbers_status_check
+    CHECK (
+      LOWER(TRIM(status)) IN (
+        'available',
+        'reserved',
+        'sold',
+        'paid',
+        'approved',
+        'blocked',
+        'unavailable'
+      )
+    )
+  `);
+
+  console.log("[PROMOTIONAL_SCHEMA_FIX] runtime constraints ensured", {
+    promotional_reservations_status: true,
+    promotional_reservations_payment_status: true,
+    promotional_numbers_status: true,
+  });
+}
+
 export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `CREATE EXTENSION IF NOT EXISTS pgcrypto`);
 
@@ -192,41 +348,6 @@ export async function ensurePromotionalSchema(client = null) {
     END $$;
   `);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
-
-  await dbQuery(client, `
-    DO $$
-    DECLARE
-      current_def text;
-      expected_def text := 'CHECK ((status = ANY (ARRAY[''pending''::text, ''reserved''::text, ''paid''::text, ''expired''::text, ''cancelled''::text, ''sorted''::text])))';
-    BEGIN
-      SELECT pg_get_constraintdef(c.oid)
-        INTO current_def
-        FROM pg_constraint c
-        JOIN pg_class t ON t.oid = c.conrelid
-        JOIN pg_namespace n ON n.oid = t.relnamespace
-       WHERE c.conname = 'promotional_reservations_status_check'
-         AND t.relname = 'promotional_reservations'
-         AND n.nspname = 'public';
-
-      IF current_def IS NULL OR current_def <> expected_def THEN
-        BEGIN
-          ALTER TABLE public.promotional_reservations
-            DROP CONSTRAINT IF EXISTS promotional_reservations_status_check;
-        EXCEPTION WHEN OTHERS THEN
-          NULL;
-        END;
-
-        BEGIN
-          ALTER TABLE public.promotional_reservations
-            ADD CONSTRAINT promotional_reservations_status_check
-            CHECK (status IN ('pending', 'reserved', 'paid', 'expired', 'cancelled', 'sorted'));
-        EXCEPTION WHEN OTHERS THEN
-          NULL;
-        END;
-      END IF;
-    END $$;
-  `);
-
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS n INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS number TEXT NULL`);
@@ -338,6 +459,8 @@ export async function ensurePromotionalSchema(client = null) {
     CREATE INDEX IF NOT EXISTS promotional_payments_reservation_idx
     ON public.promotional_payments(reservation_id)
   `);
+
+  await ensurePromotionalRuntimeConstraints(client);
 }
 
 export async function releaseExpiredPromotionalReservations(client = null, drawId = null) {
@@ -1196,6 +1319,9 @@ export async function createPromotionalReservation({
 
     const reservationId = randomUUID();
     const expiresAt = new Date(Date.now() + PROMOTIONAL_RESERVATION_TTL_MINUTES * 60 * 1000);
+
+    await ensurePromotionalRuntimeConstraints(client);
+
     const idUsesUuid = await promotionalReservationIdUsesUuid(client);
 
     let reservation;

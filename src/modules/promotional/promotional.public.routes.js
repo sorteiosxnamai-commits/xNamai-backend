@@ -329,14 +329,195 @@ router.post("/:drawId/reservations", requirePromotionalAuth, createReservationHa
 
 router.post("/:id/reserve", requirePromotionalAuth, createReservationHandler);
 
-router.post("/:drawId/checkout", requirePromotionalAuth, (req, res) => {
-  res.set("X-XNAMAI-PROMOTIONAL-ROUTE", "checkout-alias-v1");
+router.post("/:drawId/checkout", requirePromotionalAuth, async (req, res) => {
+  res.set("X-XNAMAI-PROMOTIONAL-ROUTE", "checkout-debug-v5");
+
   console.log("[PROMOTIONAL_CHECKOUT_ROUTE_HIT]", {
     drawId: req.params.drawId,
     body: req.body,
     userId: req.user?.id,
   });
-  return createReservationHandler(req, res);
+
+  const drawId = Number.parseInt(req.params.drawId, 10);
+
+  if (!Number.isInteger(drawId) || drawId <= 0) {
+    return res.status(400).json({
+      ok: false,
+      error: "invalid_promotional_draw",
+      message: "ID do sorteio promocional inválido.",
+      debug_route: "checkout-debug-v5",
+    });
+  }
+
+  const userId = req.user?.id
+    ? Number.parseInt(req.user.id, 10)
+    : req.body?.userId
+      ? Number.parseInt(req.body.userId, 10)
+      : null;
+
+  const numbers = normalizePromotionalNumbers(req.body);
+
+  if (!numbers.length) {
+    return res.status(400).json({
+      ok: false,
+      error: "no_numbers",
+      message: "Nenhum número promocional selecionado.",
+      debug_route: "checkout-debug-v5",
+    });
+  }
+
+  try {
+    const reservation = await reserveNumbers(
+      {
+        drawId,
+        userId,
+        numbers,
+        customer: req.body?.customer || null,
+      },
+      req.user
+    );
+
+    const reservationId =
+      reservation?.reservation_id ||
+      reservation?.reservationId ||
+      reservation?.id;
+
+    if (!reservationId) {
+      return res.status(500).json({
+        ok: false,
+        error: "promotional_reservation_without_id",
+        message: "Reserva promocional criada, mas sem ID retornado.",
+        reservation,
+        debug_route: "checkout-debug-v5",
+      });
+    }
+
+    let pix = null;
+    let pixError = null;
+
+    try {
+      pix = await createPromotionalPix(
+        drawId,
+        reservationId,
+        req.user,
+        {
+          notification_url: `${getBaseUrl(req)}/api/payments/webhook/mercadopago`,
+        }
+      );
+    } catch (err) {
+      pixError = {
+        code: err?.code || "promotional_pix_failed",
+        message: err?.message || "Não foi possível gerar PIX promocional agora.",
+        detail: err?.detail || null,
+        hint: err?.hint || null,
+      };
+      console.error("[PROMOTIONAL_CHECKOUT_PIX_ERROR]", {
+        drawId,
+        reservationId,
+        userId,
+        message: err?.message,
+        code: err?.code,
+        detail: err?.detail,
+        hint: err?.hint,
+        stack: err?.stack,
+      });
+    }
+
+    const amountCents = Number(
+      reservation?.amount_cents ||
+      reservation?.amountCents ||
+      reservation?.total_cents ||
+      reservation?.totalCents ||
+      0
+    );
+
+    const response = {
+      ok: true,
+      success: true,
+      debug_route: "checkout-debug-v5",
+      type: "promotional",
+      source: "promotional",
+
+      reservation_id: reservationId,
+      reservationId,
+      draw_id: drawId,
+      drawId,
+
+      numbers: Array.isArray(reservation?.numbers)
+        ? reservation.numbers.map(Number)
+        : numbers,
+
+      amount_cents: amountCents,
+      amountCents,
+      expires_at: reservation?.expires_at || reservation?.expiresAt || null,
+      expiresAt: reservation?.expires_at || reservation?.expiresAt || null,
+
+      status: reservation?.status || "reserved",
+      payment_status: reservation?.payment_status || reservation?.paymentStatus || "pending",
+      paymentStatus: reservation?.payment_status || reservation?.paymentStatus || "pending",
+
+      can_pay: true,
+      canPay: true,
+
+      reservation: {
+        ...reservation,
+        id: reservationId,
+        reservation_id: reservationId,
+        reservationId,
+        draw_id: drawId,
+        drawId,
+        type: "promotional",
+        source: "promotional",
+      },
+
+      pix,
+      payment: pix?.payment || pix || null,
+      pix_error: pixError,
+
+      message: pix
+        ? "Reserva promocional criada e PIX gerado com sucesso."
+        : "Reserva promocional criada. Gere o PIX pela área do cliente.",
+    };
+
+    console.log("[PROMOTIONAL_CHECKOUT_SUCCESS]", {
+      drawId,
+      userId,
+      reservationId,
+      numbers: response.numbers,
+      hasPix: Boolean(pix),
+    });
+
+    return res.status(201).json(response);
+  } catch (err) {
+    console.error("[PROMOTIONAL_CHECKOUT_ERROR]", {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      hint: err?.hint,
+      constraint: err?.constraint,
+      table: err?.table,
+      column: err?.column,
+      schema: err?.schema,
+      stack: err?.stack,
+      body: req.body,
+      params: req.params,
+      userId: req.user?.id,
+    });
+
+    return res.status(err?.status || err?.statusCode || 500).json({
+      ok: false,
+      error: err?.code || "PROMOTIONAL_CHECKOUT_ERROR",
+      code: err?.code || "PROMOTIONAL_CHECKOUT_ERROR",
+      message: err?.message || "Erro no checkout promocional.",
+      detail: err?.detail || null,
+      hint: err?.hint || null,
+      constraint: err?.constraint || null,
+      table: err?.table || null,
+      column: err?.column || null,
+      schema: err?.schema || null,
+      debug_route: "checkout-debug-v5",
+    });
+  }
 });
 
 router.post("/:drawId/reservations/:reservationId/pix", requirePromotionalAuth, async (req, res) => {
