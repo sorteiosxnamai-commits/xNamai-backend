@@ -192,6 +192,41 @@ export async function ensurePromotionalSchema(client = null) {
     END $$;
   `);
   await dbQuery(client, `ALTER TABLE public.promotional_reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
+
+  await dbQuery(client, `
+    DO $$
+    DECLARE
+      current_def text;
+      expected_def text := 'CHECK ((status = ANY (ARRAY[''pending''::text, ''reserved''::text, ''paid''::text, ''expired''::text, ''cancelled''::text, ''sorted''::text])))';
+    BEGIN
+      SELECT pg_get_constraintdef(c.oid)
+        INTO current_def
+        FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+       WHERE c.conname = 'promotional_reservations_status_check'
+         AND t.relname = 'promotional_reservations'
+         AND n.nspname = 'public';
+
+      IF current_def IS NULL OR current_def <> expected_def THEN
+        BEGIN
+          ALTER TABLE public.promotional_reservations
+            DROP CONSTRAINT IF EXISTS promotional_reservations_status_check;
+        EXCEPTION WHEN OTHERS THEN
+          NULL;
+        END;
+
+        BEGIN
+          ALTER TABLE public.promotional_reservations
+            ADD CONSTRAINT promotional_reservations_status_check
+            CHECK (status IN ('pending', 'reserved', 'paid', 'expired', 'cancelled', 'sorted'));
+        EXCEPTION WHEN OTHERS THEN
+          NULL;
+        END;
+      END IF;
+    END $$;
+  `);
+
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS user_id INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS n INTEGER NULL`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ADD COLUMN IF NOT EXISTS number TEXT NULL`);
@@ -346,7 +381,7 @@ export async function releaseExpiredPromotionalReservations(client = null, drawI
          SET status = 'expired',
              payment_status = 'expired',
              updated_at = NOW()
-       WHERE pr.status IN ('pending', 'reserved')
+       WHERE pr.status IN ('reserved', 'pending')
          AND COALESCE(pr.payment_status, 'pending') IN ('pending', 'waiting', 'open')
          AND pr.expires_at IS NOT NULL
          AND pr.expires_at < NOW()
@@ -867,7 +902,7 @@ export async function attachPromotionalPixPayment(draw_id, reservation_id, pix) 
     SET payment_id = $3,
         preference_id = COALESCE($7, preference_id),
         payment_status = 'pending',
-        status = 'pending',
+        status = 'reserved',
         payment_provider = 'mercadopago',
         pix_qr_code = $4,
         pix_qr_code_base64 = $5,
@@ -962,7 +997,7 @@ export async function attachPaymentToPromotionalReservation({
         preference_id = COALESCE($3, preference_id),
         payment_provider = COALESCE(payment_provider, 'mercadopago'),
         payment_status = 'pending',
-        status = 'pending',
+        status = 'reserved',
         pix_qr_code = COALESCE($4, pix_qr_code),
         pix_qr_code_base64 = COALESCE($5, pix_qr_code_base64),
         pix_copy_paste = COALESCE($4, pix_copy_paste),
@@ -1200,7 +1235,7 @@ export async function createPromotionalReservation({
           $9,
           $9,
           $10,
-          'pending',
+          'reserved',
           'pending',
           $11,
           NOW(),
@@ -1255,7 +1290,7 @@ export async function createPromotionalReservation({
           $9,
           $9,
           $10,
-          'pending',
+          'reserved',
           'pending',
           $11,
           NOW(),
@@ -1487,7 +1522,6 @@ export async function assignPromotionalNumbersToUser({
     const buyerEmail = buyer.buyer_email || buyer.email || "";
     const buyerPhone = buyer.buyer_phone || buyer.phone || "";
     const finalStatus = String(status || "reserved").toLowerCase() === "unavailable" ? "unavailable" : "reserved";
-    const finalReservationStatus = "pending";
     const amountCents = Math.max(0, Number(draw.price_cents || 0)) * normalizedNumbers.length;
     const reservationId = randomUUID();
 
@@ -1547,7 +1581,7 @@ export async function assignPromotionalNumbersToUser({
           buyerPhone,
           Number(draw.price_cents || 0),
           amountCents,
-          finalReservationStatus,
+          finalStatus,
         ]
       );
     } else {
@@ -1601,12 +1635,12 @@ export async function assignPromotionalNumbersToUser({
           buyerPhone,
           Number(draw.price_cents || 0),
           amountCents,
-          finalReservationStatus,
+          finalStatus,
         ]
       );
     }
 
-    console.log("[PROMOTIONAL_RESERVATION_CREATED]", {
+    console.log("[PROMOTIONAL_ASSIGNMENT_CREATED]", {
       reservationId: reservationResult.rows[0]?.reservation_id || reservationResult.rows[0]?.id,
       drawId: normalizedDrawId,
       userId: normalizedUserId,
