@@ -6,7 +6,16 @@ import { mpCreatePixPayment } from "../../services/mercadopago.js";
 
 const router = express.Router();
 
-const DEFAULT_PRICE_CENTS = Number(process.env.PRICE_CENTS || process.env.PIX_PRICE || 5500);
+function parsePositiveInt(value, fallback = 0) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const DEFAULT_PROMOTIONAL_PRICE_CENTS =
+  parsePositiveInt(process.env.PROMOTIONAL_PRICE_CENTS, 0) ||
+  parsePositiveInt(process.env.PROMOTIONAL_PIX_PRICE, 0) ||
+  5500;
+
 const RESERVATION_TTL_MINUTES = Number(process.env.PROMOTIONAL_RESERVATION_TTL_MINUTES || 30);
 const SOURCE = "promotional_direct_v1";
 
@@ -16,8 +25,19 @@ function toInt(value, fallback = null) {
 }
 
 function centsFromDraw(draw) {
-  const fromDraw = toInt(draw?.price_cents, 0);
-  return fromDraw > 0 ? fromDraw : DEFAULT_PRICE_CENTS;
+  const fromPromotionalPrice = parsePositiveInt(draw?.promotional_price_cents, 0);
+  if (fromPromotionalPrice > 0) return fromPromotionalPrice;
+
+  const fromPriceCents = parsePositiveInt(draw?.price_cents, 0);
+  if (fromPriceCents > 0) return fromPriceCents;
+
+  const fromTicketPrice = parsePositiveInt(draw?.ticket_price_cents, 0);
+  if (fromTicketPrice > 0) return fromTicketPrice;
+
+  const fromPixPrice = parsePositiveInt(draw?.pix_price_cents, 0);
+  if (fromPixPrice > 0) return fromPixPrice;
+
+  return DEFAULT_PROMOTIONAL_PRICE_CENTS;
 }
 
 function formatNumber(value) {
@@ -185,6 +205,18 @@ async function ensurePromotionalDirectSchema(client) {
   `);
 
   await client.query(`ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS price_cents INTEGER NOT NULL DEFAULT 0`);
+  await client.query(`
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS promotional_price_cents INTEGER
+  `);
+  await client.query(`
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS ticket_price_cents INTEGER
+  `);
+  await client.query(`
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS pix_price_cents INTEGER
+  `);
   await client.query(`ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS number_start INTEGER NOT NULL DEFAULT 0`);
   await client.query(`ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS number_end INTEGER NOT NULL DEFAULT 99`);
   await client.query(`ALTER TABLE public.promotional_draws ADD COLUMN IF NOT EXISTS max_numbers_per_user INTEGER NOT NULL DEFAULT 1`);
@@ -270,7 +302,13 @@ async function ensurePromotionalDirectSchema(client) {
 async function getDraw(client, drawId) {
   const { rows } = await client.query(
     `SELECT d.*,
-            COALESCE(NULLIF(d.price_cents, 0), $2)::int AS resolved_price_cents,
+            COALESCE(
+              NULLIF(d.promotional_price_cents, 0),
+              NULLIF(d.price_cents, 0),
+              NULLIF(d.ticket_price_cents, 0),
+              NULLIF(d.pix_price_cents, 0),
+              $2
+            )::int AS resolved_price_cents,
             COUNT(pn.id)::int AS total_numbers,
             COUNT(pn.id) FILTER (WHERE pn.status = 'available')::int AS available_numbers,
             COUNT(pn.id) FILTER (WHERE pn.status = 'reserved')::int AS reserved_numbers,
@@ -282,7 +320,7 @@ async function getDraw(client, drawId) {
         AND COALESCE(d.archived_at, NULL) IS NULL
       GROUP BY d.id
       LIMIT 1`,
-    [drawId, DEFAULT_PRICE_CENTS]
+    [drawId, DEFAULT_PROMOTIONAL_PRICE_CENTS]
   );
 
   return rows[0] || null;
@@ -352,7 +390,13 @@ function mapDraw(row) {
   return {
     ...row,
     id: Number(row.id),
-    price_cents: Number(row.resolved_price_cents || row.price_cents || DEFAULT_PRICE_CENTS),
+    price_cents: Number(row.resolved_price_cents || row.price_cents || DEFAULT_PROMOTIONAL_PRICE_CENTS),
+    promotional_price_cents: Number(
+      row.resolved_price_cents ||
+        row.promotional_price_cents ||
+        row.price_cents ||
+        DEFAULT_PROMOTIONAL_PRICE_CENTS
+    ),
     number_start: toInt(row.number_start, 0),
     number_end: toInt(row.number_end, 99),
     max_numbers_per_user: toInt(row.max_numbers_per_user, 1),
@@ -453,6 +497,20 @@ async function createReservation(client, req, draw, numbers) {
   const reservationUuid = crypto.randomUUID();
   const idType = await columnType(client, "promotional_reservations", "id");
 
+  console.log("[PROMOTIONAL_PRICE_RESOLVED]", {
+    drawId: draw.id,
+    numbers,
+    priceCents,
+    amountCents,
+    source: {
+      promotional_price_cents: draw.promotional_price_cents,
+      price_cents: draw.price_cents,
+      ticket_price_cents: draw.ticket_price_cents,
+      pix_price_cents: draw.pix_price_cents,
+      default_promotional_price_cents: DEFAULT_PROMOTIONAL_PRICE_CENTS,
+    },
+  });
+
   let reservation;
 
   if (idType === "uuid") {
@@ -465,7 +523,19 @@ async function createReservation(client, req, draw, numbers) {
          $8, $9, $9, $10, 'reserved', 'pending', $11, NOW(), NOW()
        )
        RETURNING *`,
-      [reservationUuid, draw.id, userId, numbers, buyer.name, buyer.email, buyer.phone, priceCents, amountCents, SOURCE, expiresAt]
+      [
+        reservationUuid, // $1
+        draw.id,         // $2
+        userId,          // $3
+        numbers,         // $4
+        buyer.name,      // $5
+        buyer.email,     // $6
+        buyer.phone,     // $7
+        priceCents,      // $8
+        amountCents,     // $9
+        SOURCE,          // $10
+        expiresAt,       // $11
+      ]
     );
 
     reservation = result.rows[0];
@@ -479,7 +549,19 @@ async function createReservation(client, req, draw, numbers) {
          $8, $9, $9, $10, 'reserved', 'pending', $11, NOW(), NOW()
        )
        RETURNING *`,
-      [reservationUuid, draw.id, userId, numbers, buyer.name, buyer.email, buyer.phone, priceCents, amountCents, SOURCE, expiresAt]
+      [
+        reservationUuid, // $1
+        draw.id,         // $2
+        userId,          // $3
+        numbers,         // $4
+        buyer.name,      // $5
+        buyer.email,     // $6
+        buyer.phone,     // $7
+        priceCents,      // $8
+        amountCents,     // $9
+        SOURCE,          // $10
+        expiresAt,       // $11
+      ]
     );
 
     reservation = result.rows[0];
@@ -501,13 +583,22 @@ async function createReservation(client, req, draw, numbers) {
             buyer_phone = $7,
             reserved_by = $6,
             reserved_at = NOW(),
-            expires_at = $8,
-            reserved_until = $8,
+            expires_at = $8::timestamptz,
+            reserved_until = $8::timestamptz,
             updated_at = NOW()
       WHERE draw_id = $1
         AND COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::int) = ANY($2::int[])
         AND status = 'available'`,
-    [draw.id, numbers, userId, numberReservationValue, buyer.name, buyer.email, buyer.phone, expiresAt]
+    [
+      draw.id,                // $1
+      numbers,                // $2
+      userId,                 // $3
+      numberReservationValue, // $4
+      buyer.name,             // $5
+      buyer.email,            // $6
+      buyer.phone,            // $7
+      expiresAt,              // $8
+    ]
   );
 
   if (updateResult.rowCount !== numbers.length) {
@@ -535,13 +626,26 @@ async function attachPix(req, reservationId, drawId = null) {
     await ensurePromotionalDirectSchema(client);
 
     const { rows } = await client.query(
-      `SELECT r.*, d.title AS draw_title, d.price_cents AS draw_price_cents
+      `SELECT r.*,
+              d.title AS draw_title,
+              d.price_cents AS draw_price_cents,
+              COALESCE(
+                NULLIF(d.promotional_price_cents, 0),
+                NULLIF(d.price_cents, 0),
+                NULLIF(d.ticket_price_cents, 0),
+                NULLIF(d.pix_price_cents, 0),
+                $3
+              )::int AS resolved_draw_price_cents
          FROM public.promotional_reservations r
          JOIN public.promotional_draws d ON d.id = r.draw_id
         WHERE (r.reservation_id::text = $1 OR r.id::text = $1)
           AND ($2::bigint IS NULL OR r.draw_id = $2::bigint)
         LIMIT 1`,
-      [String(reservationId), drawId ? Number(drawId) : null]
+      [
+        String(reservationId),
+        drawId ? Number(drawId) : null,
+        DEFAULT_PROMOTIONAL_PRICE_CENTS,
+      ]
     );
 
     const reservation = rows[0];
@@ -566,9 +670,13 @@ async function attachPix(req, reservationId, drawId = null) {
     }
 
     const amountCents =
-      toInt(reservation.amount_cents || reservation.total_cents, 0) ||
+      parsePositiveInt(reservation.amount_cents || reservation.total_cents, 0) ||
       (Array.isArray(reservation.numbers) ? reservation.numbers.length : 1) *
-        (toInt(reservation.draw_price_cents, 0) || DEFAULT_PRICE_CENTS);
+        (
+          parsePositiveInt(reservation.resolved_draw_price_cents, 0) ||
+          parsePositiveInt(reservation.draw_price_cents, 0) ||
+          DEFAULT_PROMOTIONAL_PRICE_CENTS
+        );
 
     const expiresAt = reservation.expires_at
       ? new Date(reservation.expires_at).toISOString()
@@ -587,6 +695,7 @@ async function attachPix(req, reservationId, drawId = null) {
         source: "promotional",
         reservation_id: String(reservation.reservation_id || reservation.id),
         draw_id: String(reservation.draw_id),
+        amount_cents: String(amountCents),
       },
     });
 
