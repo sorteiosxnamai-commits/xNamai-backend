@@ -101,25 +101,12 @@ export async function createDraw(payload) {
     await client.query("BEGIN");
 
     const draw = await createPromotionalDraw(data, client);
-
-    const numbers = await createPromotionalNumbers(
-      draw.id,
-      data.number_start,
-      data.number_end,
-      client
-    );
+    await createPromotionalNumbers(draw.id, data.number_start, data.number_end, client);
 
     await client.query("COMMIT");
 
-    const savedDraw = await getPromotionalDrawById(draw.id);
-
-    return {
-      ...savedDraw,
-      created_numbers: numbers.length,
-    };
+    return getPromotionalDrawById(draw.id);
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-
     console.error("[PROMOTIONAL_CREATE_DRAW_ERROR]", {
       code: err?.code,
       message: err?.message,
@@ -128,9 +115,11 @@ export async function createDraw(payload) {
       constraint: err?.constraint,
       table: err?.table,
       column: err?.column,
+      routine: err?.routine,
       stack: err?.stack,
     });
 
+    await client.query("ROLLBACK").catch(() => {});
     throw err;
   } finally {
     client.release();

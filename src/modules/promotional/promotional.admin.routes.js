@@ -18,17 +18,18 @@ const router = Router();
 router.use(requireAuth, requireAdmin);
 
 function handleError(res, err, options = {}) {
-  const status = err?.status || err?.statusCode || 500;
-  const logTag = options.logTag || "[PROMOTIONAL_ERROR]";
+  const status = Number(err?.status || err?.statusCode || 500);
+  const logTag = options.logTag || "[PROMOTIONAL_ADMIN_ERROR]";
 
   const debug = {
-    code: err?.code,
-    message: err?.message,
-    detail: err?.detail,
-    hint: err?.hint,
-    constraint: err?.constraint,
-    table: err?.table,
-    column: err?.column,
+    code: err?.code || null,
+    message: err?.message || null,
+    detail: err?.detail || null,
+    hint: err?.hint || null,
+    constraint: err?.constraint || null,
+    table: err?.table || null,
+    column: err?.column || null,
+    routine: err?.routine || null,
   };
 
   console.error(logTag, {
@@ -36,19 +37,10 @@ function handleError(res, err, options = {}) {
     stack: err?.stack,
   });
 
-  if (status >= 500) {
-    return res.status(500).json({
-      ok: false,
-      error: options.friendlyError || "Erro no módulo promocional",
-      code: err?.code || "PROMOTIONAL_ERROR",
-      debug,
-    });
-  }
-
-  return res.status(status).json({
+  return res.status(status >= 400 && status < 600 ? status : 500).json({
     ok: false,
-    error: err?.code || "promotional_admin_error",
-    message: err?.message || "Erro no módulo promocional.",
+    error: options.friendlyError || err?.message || "Erro no módulo promocional admin.",
+    code: err?.code || "promotional_admin_error",
     debug,
     ...(err?.conflicts && { conflicts: err.conflicts }),
     ...(err?.details && { details: err.details }),
@@ -62,7 +54,7 @@ router.get("/draws", async (_req, res) => {
   } catch (err) {
     return handleError(res, err, {
       logTag: "[PROMOTIONAL_ADMIN_DRAWS_LIST_ERROR]",
-      friendlyError: "Erro ao carregar campanhas promocionais",
+      friendlyError: "Erro ao carregar campanhas promocionais.",
     });
   }
 });
@@ -78,7 +70,7 @@ router.post("/draws", async (req, res) => {
   } catch (err) {
     return handleError(res, err, {
       logTag: "[PROMOTIONAL_ADMIN_DRAWS_CREATE_ERROR]",
-      friendlyError: "Erro ao criar campanha promocional",
+      friendlyError: "Erro ao criar campanha promocional.",
     });
   }
 });
