@@ -96,6 +96,248 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
 });
 
 /**
+ * GET /api/admin/clients/purchase-history
+ * Histórico geral de compras pagas/aprovadas para o painel admin.
+ * Une Sorteio Principal + Sorteios Promocionais sem alterar o fluxo existente.
+ */
+router.get("/purchase-history", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const search = String(req.query.q || "").trim();
+    const typeFilter = String(req.query.type || "all").trim().toLowerCase();
+
+    const limit = Math.min(
+      500,
+      Math.max(1, Number.parseInt(req.query.limit || "250", 10) || 250)
+    );
+
+    const offset = Math.max(
+      0,
+      Number.parseInt(req.query.offset || "0", 10) || 0
+    );
+
+    const hasSearch = search.length > 0;
+    const like = `%${search}%`;
+
+    const formatMoney = (cents) => {
+      const value = (Number(cents) || 0) / 100;
+
+      return value.toLocaleString("pt-BR", {
+        style: "currency",
+        currency: "BRL",
+      });
+    };
+
+    const normalizeNumbers = (numbers) => {
+      if (!Array.isArray(numbers)) return [];
+
+      return numbers
+        .map((number) => Number(number))
+        .filter((number) => Number.isFinite(number))
+        .sort((a, b) => a - b);
+    };
+
+    let mainRows = [];
+
+    if (typeFilter === "all" || typeFilter === "main" || typeFilter === "principal") {
+      const params = hasSearch ? [like] : [];
+
+      const mainResult = await query(
+        `
+        SELECT
+          p.id::text AS id,
+          'main'::text AS type,
+          'Principal'::text AS type_label,
+          p.user_id::int AS user_id,
+          COALESCE(NULLIF(u.name, ''), u.email, 'Cliente #' || p.user_id::text) AS customer_name,
+          u.email AS customer_email,
+          p.draw_id::int AS draw_id,
+          COALESCE(
+            NULLIF(d.title, ''),
+            NULLIF(d.prize, ''),
+            'Sorteio Principal #' || p.draw_id::text
+          ) AS draw_title,
+          COALESCE(p.numbers, '{}'::int[]) AS numbers,
+          COALESCE(p.amount_cents, 0)::int AS amount_cents,
+          LOWER(COALESCE(p.status, 'paid')) AS status,
+          p.paid_at,
+          COALESCE(p.paid_at, p.created_at) AS purchased_at
+        FROM public.payments p
+        LEFT JOIN public.users u
+          ON u.id = p.user_id
+        LEFT JOIN public.draws d
+          ON d.id = p.draw_id
+        WHERE LOWER(TRIM(COALESCE(p.status, ''))) IN ('approved', 'paid', 'pago', 'sold', 'vendido', 'aprovado')
+        ${
+          hasSearch
+            ? `
+              AND (
+                COALESCE(u.name, '') ILIKE $1
+                OR COALESCE(u.email, '') ILIKE $1
+                OR CAST(u.id AS text) ILIKE $1
+                OR CAST(p.user_id AS text) ILIKE $1
+                OR CAST(p.draw_id AS text) ILIKE $1
+                OR COALESCE(d.title, '') ILIKE $1
+                OR COALESCE(d.prize, '') ILIKE $1
+              )
+            `
+            : ""
+        }
+        `,
+        params
+      );
+
+      mainRows = mainResult.rows || [];
+    }
+
+    let promotionalRows = [];
+
+    if (typeFilter === "all" || typeFilter === "promotional" || typeFilter === "promocional") {
+      try {
+        const params = hasSearch ? [like] : [];
+
+        const promotionalResult = await query(
+          `
+          SELECT
+            COALESCE(r.payment_id, r.reservation_id::text, r.id::text) AS id,
+            'promotional'::text AS type,
+            'Promocional'::text AS type_label,
+            r.user_id::int AS user_id,
+            COALESCE(
+              NULLIF(u.name, ''),
+              NULLIF(r.buyer_name, ''),
+              u.email,
+              NULLIF(r.buyer_email, ''),
+              'Cliente sem cadastro'
+            ) AS customer_name,
+            COALESCE(u.email, r.buyer_email) AS customer_email,
+            r.draw_id::int AS draw_id,
+            COALESCE(
+              NULLIF(d.title, ''),
+              NULLIF(d.prize, ''),
+              'Sorteio Promocional #' || r.draw_id::text
+            ) AS draw_title,
+            COALESCE(r.numbers, '{}'::int[]) AS numbers,
+            COALESCE(
+              NULLIF(r.amount_cents, 0),
+              NULLIF(r.total_cents, 0),
+              cardinality(COALESCE(r.numbers, '{}'::int[])) * COALESCE(NULLIF(r.price_cents, 0), NULLIF(d.price_cents, 0), NULLIF(d.ticket_price_cents, 0), 0),
+              0
+            )::int AS amount_cents,
+            LOWER(COALESCE(r.payment_status, r.status, 'paid')) AS status,
+            r.paid_at,
+            COALESCE(r.paid_at, r.updated_at, r.created_at) AS purchased_at
+          FROM public.promotional_reservations r
+          LEFT JOIN public.users u
+            ON u.id = r.user_id
+          LEFT JOIN public.promotional_draws d
+            ON d.id = r.draw_id
+          WHERE (
+            LOWER(TRIM(COALESCE(r.payment_status, ''))) IN ('approved', 'paid', 'pago', 'sold', 'vendido', 'aprovado')
+            OR LOWER(TRIM(COALESCE(r.status, ''))) IN ('approved', 'paid', 'pago', 'sold', 'vendido', 'aprovado')
+          )
+          ${
+            hasSearch
+              ? `
+                AND (
+                  COALESCE(u.name, '') ILIKE $1
+                  OR COALESCE(u.email, '') ILIKE $1
+                  OR COALESCE(r.buyer_name, '') ILIKE $1
+                  OR COALESCE(r.buyer_email, '') ILIKE $1
+                  OR CAST(r.user_id AS text) ILIKE $1
+                  OR CAST(r.draw_id AS text) ILIKE $1
+                  OR COALESCE(d.title, '') ILIKE $1
+                  OR COALESCE(d.prize, '') ILIKE $1
+                )
+              `
+              : ""
+          }
+          `,
+          params
+        );
+
+        promotionalRows = promotionalResult.rows || [];
+      } catch (promoError) {
+        console.warn("[admin/clients/purchase-history] promotional ignored:", {
+          message: promoError?.message,
+          code: promoError?.code,
+          detail: promoError?.detail,
+        });
+
+        promotionalRows = [];
+      }
+    }
+
+    const items = [...mainRows, ...promotionalRows]
+      .map((row) => {
+        const numbers = normalizeNumbers(row.numbers);
+
+        return {
+          id: row.id,
+          type: row.type,
+          type_label: row.type_label,
+          user_id: row.user_id ? Number(row.user_id) : null,
+          customer_name: row.customer_name || "Cliente",
+          customer_email: row.customer_email || "",
+          draw_id: row.draw_id ? Number(row.draw_id) : null,
+          draw_title: row.draw_title || "Sorteio",
+          numbers,
+          numbers_label: numbers.map((number) => String(number).padStart(2, "0")).join(", "),
+          amount_cents: Number(row.amount_cents || 0),
+          amount_label: formatMoney(row.amount_cents),
+          status: row.status || "paid",
+          paid_at: row.paid_at || null,
+          purchased_at: row.purchased_at || row.paid_at || null,
+        };
+      })
+      .sort((a, b) => {
+        const timeA = new Date(a.purchased_at || 0).getTime();
+        const timeB = new Date(b.purchased_at || 0).getTime();
+        return timeB - timeA;
+      });
+
+    const totalAmountCents = items.reduce(
+      (sum, item) => sum + Number(item.amount_cents || 0),
+      0
+    );
+
+    const uniqueCustomers = new Set(
+      items.map((item) => item.user_id || item.customer_email).filter(Boolean)
+    );
+
+    const paginatedItems = items.slice(offset, offset + limit);
+
+    return res.json({
+      ok: true,
+      items: paginatedItems,
+      purchases: paginatedItems,
+      total: items.length,
+      limit,
+      offset,
+      has_more: offset + paginatedItems.length < items.length,
+      summary: {
+        total_purchases: items.length,
+        total_clients: uniqueCustomers.size,
+        total_amount_cents: totalAmountCents,
+        total_amount_label: formatMoney(totalAmountCents),
+        last_purchase: items[0] || null,
+      },
+    });
+  } catch (error) {
+    console.error("[admin/clients/purchase-history] error:", {
+      message: error?.message,
+      code: error?.code,
+      detail: error?.detail,
+      stack: error?.stack,
+    });
+
+    return res.status(500).json({
+      ok: false,
+      error: "admin_purchase_history_failed",
+    });
+  }
+});
+
+/**
  * GET /api/admin/clients/:userId/coupon
  * Lê o saldo manual do usuário (preferindo `coupon_value_cents`).
  * Sempre responde 200 com { user_id, code, cents }.
