@@ -565,13 +565,23 @@ function drawSelect() {
   return `
     SELECT
       d.*,
-      COUNT(COALESCE(n.n, n.number_value, NULLIF(regexp_replace(n.number::text, '\\D', '', 'g'), '')::integer))::int AS total_numbers,
-      COUNT(COALESCE(n.n, n.number_value, NULLIF(regexp_replace(n.number::text, '\\D', '', 'g'), '')::integer)) FILTER (WHERE n.status = 'available')::int AS available_numbers,
-      COUNT(COALESCE(n.n, n.number_value, NULLIF(regexp_replace(n.number::text, '\\D', '', 'g'), '')::integer)) FILTER (WHERE n.status = 'reserved')::int AS reserved_numbers,
-      COUNT(COALESCE(n.n, n.number_value, NULLIF(regexp_replace(n.number::text, '\\D', '', 'g'), '')::integer)) FILTER (WHERE n.status = 'sold')::int AS sold_numbers,
-      COUNT(COALESCE(n.n, n.number_value, NULLIF(regexp_replace(n.number::text, '\\D', '', 'g'), '')::integer)) FILTER (WHERE n.status = 'blocked')::int AS blocked_numbers
+      COALESCE(ns.total_numbers, 0)::int AS total_numbers,
+      COALESCE(ns.available_numbers, 0)::int AS available_numbers,
+      COALESCE(ns.reserved_numbers, 0)::int AS reserved_numbers,
+      COALESCE(ns.sold_numbers, 0)::int AS sold_numbers,
+      COALESCE(ns.blocked_numbers, 0)::int AS blocked_numbers
     FROM public.promotional_draws d
-    LEFT JOIN public.promotional_numbers n ON n.draw_id = d.id
+    LEFT JOIN (
+      SELECT
+        draw_id,
+        COUNT(*)::int AS total_numbers,
+        COUNT(*) FILTER (WHERE status = 'available')::int AS available_numbers,
+        COUNT(*) FILTER (WHERE status = 'reserved')::int AS reserved_numbers,
+        COUNT(*) FILTER (WHERE status IN ('sold', 'paid'))::int AS sold_numbers,
+        COUNT(*) FILTER (WHERE status = 'blocked')::int AS blocked_numbers
+      FROM public.promotional_numbers
+      GROUP BY draw_id
+    ) ns ON ns.draw_id = d.id
   `;
 }
 
@@ -618,37 +628,44 @@ function mapAdminNumberRow(row) {
 export async function listActivePromotionalDraws() {
   await ensurePromotionalSchema();
   await releaseExpiredPromotionalReservations();
+
   const { rows } = await query(`
     ${drawSelect()}
     WHERE d.status IN ('active', 'published', 'open')
       AND (d.starts_at IS NULL OR d.starts_at <= NOW())
       AND (d.ends_at IS NULL OR d.ends_at >= NOW())
-    GROUP BY d.id
     ORDER BY d.created_at DESC, d.id DESC
   `);
+
   return rows;
 }
 
 export async function listPromotionalDraws() {
   await ensurePromotionalSchema();
   await releaseExpiredPromotionalReservations();
+
   const { rows } = await query(`
     ${drawSelect()}
-    GROUP BY d.id
     ORDER BY d.created_at DESC, d.id DESC
   `);
+
   return rows;
 }
 
 export async function getPromotionalDrawById(id, client = null) {
   await ensurePromotionalSchema(client);
   await releaseExpiredPromotionalReservations(client);
-  const { rows } = await dbQuery(client, `
-    ${drawSelect()}
-    WHERE d.id = $1
-    GROUP BY d.id
-    LIMIT 1
-  `, [id]);
+
+  const { rows } = await dbQuery(
+    client,
+    `
+      ${drawSelect()}
+      WHERE d.id = $1
+      LIMIT 1
+    `,
+    [id]
+  );
+
   return rows[0] || null;
 }
 
@@ -699,35 +716,54 @@ export async function getPromotionalNumbersAdmin(draw_id, client = null) {
 
 export async function createPromotionalDraw(payload, client = null) {
   await ensurePromotionalSchema(client);
-  const { rows } = await dbQuery(client, `
-    INSERT INTO public.promotional_draws (
-      title,
-      description,
-      prize,
-      price_cents,
-      number_start,
-      number_end,
-      max_numbers_per_user,
-      status,
-      banner_url,
-      starts_at,
-      ends_at
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-    RETURNING *
-  `, [
-    payload.title,
-    payload.description,
-    payload.prize,
-    payload.price_cents,
-    payload.number_start,
-    payload.number_end,
-    payload.max_numbers_per_user,
-    payload.status,
-    payload.banner_url,
-    payload.starts_at,
-    payload.ends_at,
-  ]);
+
+  const priceCents = Number(
+    payload.price_cents ||
+    payload.ticket_price_cents ||
+    payload.promotional_price_cents ||
+    5500
+  );
+
+  const { rows } = await dbQuery(
+    client,
+    `
+      INSERT INTO public.promotional_draws (
+        title,
+        description,
+        prize,
+        price_cents,
+        ticket_price_cents,
+        promotional_price_cents,
+        number_start,
+        number_end,
+        max_numbers_per_user,
+        status,
+        banner_url,
+        starts_at,
+        ends_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,$2,$3,$4,$4,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW()
+      )
+      RETURNING *
+    `,
+    [
+      payload.title,
+      payload.description || "",
+      payload.prize || "",
+      priceCents,
+      Number(payload.number_start ?? 0),
+      Number(payload.number_end ?? 99),
+      Number(payload.max_numbers_per_user ?? 1),
+      payload.status || "inactive",
+      payload.banner_url || null,
+      payload.starts_at || null,
+      payload.ends_at || null,
+    ]
+  );
+
   return rows[0];
 }
 
@@ -779,59 +815,64 @@ export async function createPromotionalNumbers(draw_id, number_start, number_end
   await ensurePromotionalSchema(client);
 
   const normalizedDrawId = Number.parseInt(draw_id, 10);
-  const start = Number.parseInt(number_start, 10);
-  const end = Number.parseInt(number_end, 10);
+  const start = Number.parseInt(number_start ?? 0, 10);
+  const end = Number.parseInt(number_end ?? 99, 10);
 
-  if (!Number.isInteger(normalizedDrawId) || !Number.isInteger(start) || !Number.isInteger(end)) {
-    return [];
+  if (
+    !Number.isInteger(normalizedDrawId) ||
+    !Number.isInteger(start) ||
+    !Number.isInteger(end) ||
+    start < 0 ||
+    end < start ||
+    end > 1000
+  ) {
+    const err = new Error("Intervalo de números promocionais inválido.");
+    err.status = 400;
+    err.code = "invalid_promotional_number_range";
+    throw err;
   }
 
-  const rows = [];
+  const { rows } = await dbQuery(
+    client,
+    `
+      INSERT INTO public.promotional_numbers (
+        draw_id,
+        n,
+        number_value,
+        number,
+        label,
+        status,
+        payment_status,
+        created_at,
+        updated_at
+      )
+      SELECT
+        $1::bigint AS draw_id,
+        gs.n::int AS n,
+        gs.n::int AS number_value,
+        LPAD(gs.n::text, 2, '0') AS number,
+        LPAD(gs.n::text, 2, '0') AS label,
+        'available' AS status,
+        'pending' AS payment_status,
+        NOW() AS created_at,
+        NOW() AS updated_at
+      FROM generate_series($2::int, $3::int) AS gs(n)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM public.promotional_numbers pn
+        WHERE pn.draw_id = $1::bigint
+          AND COALESCE(
+            pn.n,
+            pn.number_value,
+            NULLIF(regexp_replace(pn.number::text, '\\D', '', 'g'), '')::int
+          ) = gs.n
+      )
+      RETURNING *
+    `,
+    [normalizedDrawId, start, end]
+  );
 
-  for (let n = start; n <= end; n += 1) {
-    rows.push([
-      normalizedDrawId,
-      n,
-      n,
-      formatPromotionalNumber(n),
-      formatPromotionalNumber(n),
-      "available",
-    ]);
-  }
-
-  if (!rows.length) return [];
-
-  const values = [];
-  const params = [];
-  rows.forEach((row, index) => {
-    const offset = index * 6;
-    values.push(
-      `($${offset + 1}::int, $${offset + 2}::int, $${offset + 3}::int, $${offset + 4}::text, $${offset + 5}::text, $${offset + 6}::text)`
-    );
-    params.push(...row);
-  });
-
-  const { rows: inserted } = await dbQuery(client, `
-    WITH input(draw_id, n, number_value, number, label, status) AS (
-      VALUES ${values.join(", ")}
-    )
-    INSERT INTO public.promotional_numbers (draw_id, n, number_value, number, label, status)
-    SELECT i.draw_id, i.n, i.number_value, i.number, i.label, i.status
-    FROM input i
-    WHERE NOT EXISTS (
-      SELECT 1
-      FROM public.promotional_numbers pn
-      WHERE pn.draw_id = i.draw_id::int
-        AND COALESCE(
-          pn.n::int,
-          pn.number_value::int,
-          NULLIF(regexp_replace(pn.number::text, '\\D', '', 'g'), '')::integer
-        ) = i.n::int
-    )
-    RETURNING *
-  `, params);
-
-  return inserted.map(normalizeNumberRow);
+  return rows.map(normalizeNumberRow);
 }
 
 export async function updatePromotionalNumberStatus(draw_id, n, status) {

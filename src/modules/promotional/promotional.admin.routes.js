@@ -25,6 +25,9 @@ function handleError(res, err, options = {}) {
     message: err?.message,
     detail: err?.detail,
     hint: err?.hint,
+    constraint: err?.constraint,
+    table: err?.table,
+    column: err?.column,
     stack: err?.stack,
   });
 
