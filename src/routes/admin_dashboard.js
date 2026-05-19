@@ -523,43 +523,292 @@ router.get("/open-buyers", async (req, res) => {
     if (!active) {
       return res.json({
         ok: true,
+        draw_id: null,
+        sold: 0,
+        remaining: 100,
+        reserved: 0,
+        total_numbers: 100,
         draw: null,
         buyers: [],
+        numbers: [],
       });
     }
 
-    const { rows } = await query(
+    const ticketPriceCents = toInt(active.ticket_price_cents, 5500);
+
+    const occupiedResult = await query(
+      `
+      WITH paid_numbers AS (
+        SELECT DISTINCT ON (paid_num.n)
+          paid_num.n::int AS n,
+          p.user_id::bigint AS user_id,
+          COALESCE(NULLIF(u.name, ''), u.email, 'Cliente #' || p.user_id::text) AS name,
+          COALESCE(u.email, '') AS email,
+          COALESCE(u.phone, '') AS phone,
+          'paid'::text AS source,
+          'Pago'::text AS source_label,
+          p.id::text AS payment_id,
+          NULL::text AS reservation_id,
+          COALESCE(
+            NULLIF((p.amount_cents / NULLIF(CARDINALITY(COALESCE(p.numbers, '{}'::int[])), 0)), 0),
+            d.ticket_price_cents,
+            $5
+          )::int AS unit_cents,
+          1::int AS priority
+        FROM public.payments p
+        JOIN public.draws d
+          ON d.id = p.draw_id
+        LEFT JOIN public.users u
+          ON u.id = p.user_id
+        CROSS JOIN LATERAL UNNEST(COALESCE(p.numbers, '{}'::int[])) AS paid_num(n)
+        WHERE p.draw_id = $1
+          AND paid_num.n BETWEEN 0 AND 99
+          AND LOWER(TRIM(COALESCE(p.status, ''))) = ANY($2)
+        ORDER BY paid_num.n, p.created_at DESC NULLS LAST
+      ),
+
+      assigned_numbers AS (
+        SELECT DISTINCT ON (COALESCE(n.n::int, n.number::int))
+          COALESCE(n.n::int, n.number::int) AS n,
+          n.user_id::bigint AS user_id,
+          COALESCE(NULLIF(u.name, ''), u.email, 'Cliente #' || n.user_id::text, 'Sem usuário') AS name,
+          COALESCE(u.email, '') AS email,
+          COALESCE(u.phone, '') AS phone,
+          CASE
+            WHEN LOWER(TRIM(COALESCE(n.payment_status, ''))) = ANY($2)
+              OR LOWER(TRIM(COALESCE(n.status, ''))) = ANY($3)
+            THEN 'paid'
+            ELSE 'admin_assigned'
+          END AS source,
+          CASE
+            WHEN LOWER(TRIM(COALESCE(n.payment_status, ''))) = ANY($2)
+              OR LOWER(TRIM(COALESCE(n.status, ''))) = ANY($3)
+            THEN 'Pago'
+            ELSE 'Atribuído pelo admin'
+          END AS source_label,
+          n.payment_id::text AS payment_id,
+          n.reservation_id::text AS reservation_id,
+          COALESCE(d.ticket_price_cents, $5)::int AS unit_cents,
+          CASE
+            WHEN LOWER(TRIM(COALESCE(n.payment_status, ''))) = ANY($2)
+              OR LOWER(TRIM(COALESCE(n.status, ''))) = ANY($3)
+            THEN 1
+            ELSE 2
+          END AS priority
+        FROM public.numbers n
+        JOIN public.draws d
+          ON d.id = n.draw_id
+        LEFT JOIN public.users u
+          ON u.id = n.user_id
+        WHERE n.draw_id = $1
+          AND COALESCE(n.n::int, n.number::int) BETWEEN 0 AND 99
+          AND (
+            LOWER(TRIM(COALESCE(n.status, ''))) = ANY($3)
+            OR LOWER(TRIM(COALESCE(n.payment_status, ''))) = ANY($2)
+            OR (
+              LOWER(TRIM(COALESCE(n.status, ''))) = ANY($4)
+              AND n.user_id IS NOT NULL
+              AND n.reserved_until IS NULL
+              AND LOWER(TRIM(COALESCE(n.payment_status, 'pending'))) NOT IN (
+                'expired',
+                'cancelled',
+                'canceled',
+                'cancelado'
+              )
+            )
+          )
+        ORDER BY COALESCE(n.n::int, n.number::int), n.updated_at DESC NULLS LAST
+      ),
+
+      merged AS (
+        SELECT * FROM paid_numbers
+        UNION ALL
+        SELECT * FROM assigned_numbers
+      ),
+
+      ranked AS (
+        SELECT DISTINCT ON (n)
+          *
+        FROM merged
+        ORDER BY n, priority ASC
+      )
+
+      SELECT *
+      FROM ranked
+      ORDER BY n ASC
+      `,
+      [
+        active.id,
+        PAID_PAYMENT_STATUSES,
+        SOLD_STATUSES,
+        RESERVED_STATUSES,
+        ticketPriceCents,
+      ]
+    );
+
+    const reservedResult = await query(
       `
       SELECT
-        COALESCE(u.id, 0) AS user_id,
-        COALESCE(u.name, 'Sem usuário') AS name,
-        COALESCE(u.email, '') AS email,
-        COUNT(*)::int AS qtd,
-        COALESCE(
-          json_agg(LPAD(num.n::text, 2, '0') ORDER BY num.n)
-          FILTER (WHERE num.n IS NOT NULL),
-          '[]'::json
-        ) AS numbers,
-        (COUNT(*)::int * COALESCE(d.ticket_price_cents, 5500))::int AS value_cents
-      FROM payments p
-      JOIN draws d ON d.id = p.draw_id
-      JOIN users u ON u.id = p.user_id
-      CROSS JOIN LATERAL unnest(p.numbers) AS num(n)
-      WHERE p.draw_id = $1
-        AND lower(trim(coalesce(p.status, ''))) = ANY($2)
-      GROUP BY u.id, u.name, u.email, d.ticket_price_cents
-      ORDER BY qtd DESC, name ASC
+        COUNT(DISTINCT COALESCE(n.n::int, n.number::int))::int AS reserved_count
+      FROM public.numbers n
+      WHERE n.draw_id = $1
+        AND COALESCE(n.n::int, n.number::int) BETWEEN 0 AND 99
+        AND LOWER(TRIM(COALESCE(n.status, ''))) = ANY($2)
+        AND LOWER(TRIM(COALESCE(n.payment_status, 'pending'))) NOT IN (
+          'paid',
+          'approved',
+          'pago',
+          'expired',
+          'cancelled',
+          'canceled',
+          'cancelado'
+        )
+        AND NOT (
+          n.user_id IS NOT NULL
+          AND n.reserved_until IS NULL
+        )
+        AND (
+          n.reserved_until IS NULL
+          OR n.reserved_until > NOW()
+        )
       `,
-      [active.id, PAID_PAYMENT_STATUSES]
+      [active.id, RESERVED_STATUSES]
     );
+
+    const occupiedNumbers = occupiedResult.rows || [];
+    const reserved = Number(reservedResult.rows?.[0]?.reserved_count || 0);
+    const sold = occupiedNumbers.length;
+    const remaining = Math.max(0, 100 - sold - reserved);
+
+    const pad2 = (value) => String(Number(value)).padStart(2, "0");
+
+    const buyerMap = new Map();
+
+    for (const row of occupiedNumbers) {
+      const userId = row.user_id ? Number(row.user_id) : null;
+      const buyerKey = userId
+        ? `user:${userId}`
+        : `guest:${row.email || row.name || "sem-usuario"}`;
+
+      if (!buyerMap.has(buyerKey)) {
+        buyerMap.set(buyerKey, {
+          buyer_key: buyerKey,
+          user_id: userId,
+          name: row.name || "Sem usuário",
+          email: row.email || "",
+          phone: row.phone || "",
+          numbers: [],
+          qtd: 0,
+          count: 0,
+          quantity: 0,
+          value_cents: 0,
+          total_cents: 0,
+          amount_cents: 0,
+          paid_count: 0,
+          assigned_count: 0,
+          sources: [],
+        });
+      }
+
+      const buyer = buyerMap.get(buyerKey);
+      const number = Number(row.n);
+
+      buyer.numbers.push(number);
+      buyer.qtd += 1;
+      buyer.count += 1;
+      buyer.quantity += 1;
+      buyer.value_cents += Number(row.unit_cents || ticketPriceCents);
+      buyer.total_cents += Number(row.unit_cents || ticketPriceCents);
+      buyer.amount_cents += Number(row.unit_cents || ticketPriceCents);
+
+      if (row.source === "admin_assigned") {
+        buyer.assigned_count += 1;
+      } else {
+        buyer.paid_count += 1;
+      }
+
+      if (row.source_label && !buyer.sources.includes(row.source_label)) {
+        buyer.sources.push(row.source_label);
+      }
+    }
+
+    const buyers = Array.from(buyerMap.values())
+      .map((buyer) => ({
+        ...buyer,
+        numbers: buyer.numbers.sort((a, b) => a - b),
+        numbers_label: buyer.numbers
+          .sort((a, b) => a - b)
+          .map(pad2)
+          .join(", "),
+        source_label: buyer.sources.includes("Atribuído pelo admin")
+          ? buyer.sources.includes("Pago")
+            ? "Pago + atribuído pelo admin"
+            : "Atribuído pelo admin"
+          : "Pago",
+      }))
+      .sort((a, b) => {
+        if (b.count !== a.count) return b.count - a.count;
+        return String(a.name || "").localeCompare(String(b.name || ""), "pt-BR");
+      });
+
+    const numbers = occupiedNumbers.map((row) => {
+      const number = Number(row.n);
+      const userId = row.user_id ? Number(row.user_id) : null;
+      const buyerKey = userId
+        ? `user:${userId}`
+        : `guest:${row.email || row.name || "sem-usuario"}`;
+
+      return {
+        n: number,
+        number,
+        label: pad2(number),
+        buyer_key: buyerKey,
+        user_id: userId,
+        name: row.name || "Sem usuário",
+        email: row.email || "",
+        phone: row.phone || "",
+        source: row.source || "paid",
+        source_label: row.source_label || "Pago",
+        payment_id: row.payment_id || null,
+        reservation_id: row.reservation_id || null,
+        unit_cents: Number(row.unit_cents || ticketPriceCents),
+        value_cents: Number(row.unit_cents || ticketPriceCents),
+      };
+    });
+
+    const normalizedDraw = {
+      ...active,
+      id: Number(active.id),
+      total_numbers: 100,
+      sold_numbers: sold,
+      reserved_numbers: reserved,
+      remaining_numbers: remaining,
+      ticket_price_cents: ticketPriceCents,
+    };
 
     return res.json({
       ok: true,
-      draw: active,
-      buyers: rows,
+      draw_id: Number(active.id),
+      sold,
+      sold_numbers: sold,
+      reserved,
+      reserved_numbers: reserved,
+      remaining,
+      remaining_numbers: remaining,
+      total_numbers: 100,
+      draw: normalizedDraw,
+      buyers,
+      participants: buyers,
+      numbers,
     });
   } catch (err) {
-    console.error("[admin.dashboard.open-buyers]", err);
+    console.error("[admin.dashboard.open-buyers]", {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      stack: err?.stack,
+    });
+
     return res.status(500).json({
       ok: false,
       error: "admin_dashboard_open_buyers_failed",
