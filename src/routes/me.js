@@ -176,4 +176,158 @@ router.get('/reservations', requireAuth, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/me/purchase-history
+ * Histórico de compras pagas/aprovadas (principal + promocional).
+ */
+router.get('/purchase-history', requireAuth, async (req, res) => {
+  try {
+    const userId = Number(req.user?.id);
+
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(401).json({
+        ok: false,
+        error: 'unauthorized',
+      });
+    }
+
+    const mainResult = await query(
+      `
+      SELECT
+        p.id::text AS id,
+        'main'::text AS type,
+        'Principal'::text AS type_label,
+        p.draw_id::int AS draw_id,
+        COALESCE(
+          NULLIF(d.title, ''),
+          NULLIF(d.prize, ''),
+          'Sorteio Principal #' || p.draw_id::text
+        ) AS draw_title,
+        COALESCE(p.numbers, '{}'::int[]) AS numbers,
+        COALESCE(p.amount_cents, 0)::int AS amount_cents,
+        LOWER(COALESCE(p.status, 'paid')) AS status,
+        p.paid_at,
+        COALESCE(p.paid_at, p.created_at) AS purchased_at,
+        COALESCE(d.status, '') AS draw_status
+      FROM public.payments p
+      LEFT JOIN public.draws d
+        ON d.id = p.draw_id
+      WHERE p.user_id = $1
+        AND LOWER(COALESCE(p.status, '')) IN ('approved', 'paid', 'pago', 'sold')
+      `,
+      [userId]
+    );
+
+    let promotionalRows = [];
+
+    try {
+      const promotionalResult = await query(
+        `
+        SELECT
+          COALESCE(r.payment_id, r.reservation_id::text, r.id::text) AS id,
+          'promotional'::text AS type,
+          'Promocional'::text AS type_label,
+          r.draw_id::int AS draw_id,
+          COALESCE(
+            NULLIF(d.title, ''),
+            NULLIF(d.prize, ''),
+            'Sorteio Promocional #' || r.draw_id::text
+          ) AS draw_title,
+          COALESCE(r.numbers, '{}'::int[]) AS numbers,
+          COALESCE(
+            NULLIF(r.amount_cents, 0),
+            NULLIF(r.total_cents, 0),
+            cardinality(COALESCE(r.numbers, '{}'::int[])) * COALESCE(NULLIF(r.price_cents, 0), NULLIF(d.price_cents, 0), NULLIF(d.ticket_price_cents, 0), 0),
+            0
+          )::int AS amount_cents,
+          LOWER(COALESCE(r.payment_status, r.status, 'paid')) AS status,
+          r.paid_at,
+          COALESCE(r.paid_at, r.updated_at, r.created_at) AS purchased_at,
+          COALESCE(d.status, '') AS draw_status
+        FROM public.promotional_reservations r
+        LEFT JOIN public.promotional_draws d
+          ON d.id = r.draw_id
+        WHERE r.user_id = $1
+          AND (
+            LOWER(COALESCE(r.payment_status, '')) IN ('approved', 'paid', 'pago', 'sold')
+            OR LOWER(COALESCE(r.status, '')) IN ('approved', 'paid', 'pago', 'sold')
+          )
+        `,
+        [userId]
+      );
+
+      promotionalRows = promotionalResult.rows || [];
+    } catch (promoError) {
+      console.error('[me/purchase-history] promotional query error:', {
+        message: promoError?.message,
+        code: promoError?.code,
+        detail: promoError?.detail,
+      });
+
+      promotionalRows = [];
+    }
+
+    const formatMoney = (cents) => {
+      const value = (Number(cents) || 0) / 100;
+      return value.toLocaleString('pt-BR', {
+        style: 'currency',
+        currency: 'BRL',
+      });
+    };
+
+    const normalizeNumbers = (numbers) => {
+      if (!Array.isArray(numbers)) return [];
+
+      return numbers
+        .map((number) => Number(number))
+        .filter((number) => Number.isFinite(number))
+        .sort((a, b) => a - b);
+    };
+
+    const items = [...(mainResult.rows || []), ...promotionalRows]
+      .map((row) => {
+        const numbers = normalizeNumbers(row.numbers);
+
+        return {
+          id: row.id,
+          type: row.type,
+          type_label: row.type_label,
+          draw_id: Number(row.draw_id),
+          draw_title: row.draw_title || (row.type === 'promotional' ? 'Sorteio Promocional' : 'Sorteio Principal'),
+          numbers,
+          numbers_label: numbers.map((number) => String(number).padStart(2, '0')).join(', '),
+          amount_cents: Number(row.amount_cents || 0),
+          amount_label: formatMoney(row.amount_cents),
+          status: row.status || 'paid',
+          paid_at: row.paid_at || null,
+          purchased_at: row.purchased_at || row.paid_at || null,
+          draw_status: row.draw_status || null,
+        };
+      })
+      .sort((a, b) => {
+        const timeA = new Date(a.purchased_at || 0).getTime();
+        const timeB = new Date(b.purchased_at || 0).getTime();
+        return timeB - timeA;
+      });
+
+    return res.json({
+      ok: true,
+      last_purchase: items[0] || null,
+      items,
+    });
+  } catch (error) {
+    console.error('[me/purchase-history] error:', {
+      message: error?.message,
+      code: error?.code,
+      detail: error?.detail,
+      stack: error?.stack,
+    });
+
+    return res.status(500).json({
+      ok: false,
+      error: 'purchase_history_failed',
+    });
+  }
+});
+
 export default router;
