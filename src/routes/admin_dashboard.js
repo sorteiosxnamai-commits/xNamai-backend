@@ -69,11 +69,54 @@ async function ensureAdminSchema() {
   await query(`ALTER TABLE draws ADD COLUMN IF NOT EXISTS winner_user_id INTEGER`);
   await query(`ALTER TABLE draws ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
   await query(`ALTER TABLE draws ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ DEFAULT NOW()`);
+  await query(`ALTER TABLE draws ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ`);
+  await query(`ALTER TABLE draws ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS n SMALLINT`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS number INTEGER`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'available'`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS user_id BIGINT`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS reservation_id TEXT`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS payment_id TEXT`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMPTZ`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+  await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
+  await query(`
+    UPDATE numbers
+       SET n = number::smallint
+     WHERE n IS NULL
+       AND number IS NOT NULL
+  `);
+
+  await query(`
+    UPDATE numbers
+       SET number = n::int
+     WHERE number IS NULL
+       AND n IS NOT NULL
+  `);
 
   await query(`
     CREATE UNIQUE INDEX IF NOT EXISTS numbers_draw_id_n_unique
     ON numbers(draw_id, n)
   `);
+}
+
+async function ensureNumbersForDraw(drawId) {
+  if (!Number.isInteger(Number(drawId)) || Number(drawId) <= 0) return;
+
+  await query(
+    `
+    INSERT INTO numbers(draw_id, n, number, status, created_at, updated_at)
+    SELECT $1, gs::smallint, gs::int, 'available', NOW(), NOW()
+      FROM generate_series(0, 99) AS gs
+    ON CONFLICT (draw_id, n) DO NOTHING
+    `,
+    [Number(drawId)]
+  );
 }
 
 async function upsertConfig(client, key, value) {
@@ -139,25 +182,70 @@ async function getConfigObject() {
 async function getActiveDraw() {
   await ensureAdminSchema();
 
+  const activeResult = await query(
+    `
+    SELECT *
+      FROM draws
+     WHERE LOWER(COALESCE(status, '')) = ANY($1)
+     ORDER BY id DESC
+     LIMIT 1
+    `,
+    [OPEN_STATUSES]
+  );
+
+  const activeDraw = activeResult.rows[0] || null;
+
+  if (!activeDraw) return null;
+
+  await ensureNumbersForDraw(Number(activeDraw.id));
+
   const { rows } = await query(
     `
     SELECT
       d.*,
-      COUNT(n.id)::int AS total_numbers,
-      COUNT(n.id) FILTER (WHERE LOWER(COALESCE(n.status, '')) = ANY($1))::int AS sold_numbers,
-      COUNT(n.id) FILTER (WHERE LOWER(COALESCE(n.status, '')) = ANY($2))::int AS reserved_numbers,
-      COUNT(n.id) FILTER (WHERE LOWER(COALESCE(n.status, '')) = ANY($3))::int AS free_numbers
+
+      COUNT(DISTINCT COALESCE(n.n::int, n.number))::int AS total_numbers,
+
+      COUNT(DISTINCT COALESCE(n.n::int, n.number)) FILTER (
+        WHERE
+          LOWER(COALESCE(n.status, '')) = ANY($1)
+          OR LOWER(COALESCE(n.payment_status, '')) IN ('paid', 'approved', 'pago')
+          OR (
+            LOWER(COALESCE(n.status, '')) = ANY($2)
+            AND n.user_id IS NOT NULL
+            AND n.reserved_until IS NULL
+            AND LOWER(COALESCE(n.payment_status, 'pending')) NOT IN ('expired', 'cancelled', 'canceled')
+          )
+      )::int AS sold_numbers,
+
+      COUNT(DISTINCT COALESCE(n.n::int, n.number)) FILTER (
+        WHERE
+          LOWER(COALESCE(n.status, '')) = ANY($2)
+          AND LOWER(COALESCE(n.payment_status, 'pending')) NOT IN ('paid', 'approved', 'pago', 'expired', 'cancelled', 'canceled')
+          AND NOT (
+            n.user_id IS NOT NULL
+            AND n.reserved_until IS NULL
+          )
+          AND (
+            n.reserved_until IS NULL
+            OR n.reserved_until > NOW()
+          )
+      )::int AS reserved_numbers,
+
+      COUNT(DISTINCT COALESCE(n.n::int, n.number)) FILTER (
+        WHERE LOWER(COALESCE(n.status, '')) = ANY($3)
+      )::int AS free_numbers
+
     FROM draws d
     LEFT JOIN numbers n ON n.draw_id = d.id
-    WHERE LOWER(COALESCE(d.status, '')) = ANY($4)
+    WHERE d.id = $4
     GROUP BY d.id
-    ORDER BY d.id DESC
     LIMIT 1
     `,
-    [SOLD_STATUSES, RESERVED_STATUSES, FREE_STATUSES, OPEN_STATUSES]
+    [SOLD_STATUSES, RESERVED_STATUSES, FREE_STATUSES, activeDraw.id]
   );
 
-  return rows[0] || null;
+  return rows[0] || activeDraw;
 }
 
 async function handleSummary(_req, res) {
@@ -195,7 +283,7 @@ async function handleSummary(_req, res) {
       });
     }
 
-    const total = toInt(draw.total_numbers, 0);
+    const total = Math.max(100, toInt(draw.total_numbers, 0));
     const sold = toInt(draw.sold_numbers, 0);
     const reserved = toInt(draw.reserved_numbers, 0);
     const remaining = Math.max(0, total - sold - reserved);
