@@ -45,7 +45,9 @@ async function ensureUserColumns() {
         ADD COLUMN IF NOT EXISTS coupon_updated_at timestamptz,
         ADD COLUMN IF NOT EXISTS tray_coupon_id text,
         ADD COLUMN IF NOT EXISTS coupon_value_cents int4 DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS phone text
+        ADD COLUMN IF NOT EXISTS phone text,
+        ADD COLUMN IF NOT EXISTS city text,
+        ADD COLUMN IF NOT EXISTS state text
     `);
   } catch (e) {
     // ok ignorar; se não conseguir, o fallback do hydrate cobre
@@ -69,14 +71,14 @@ async function hydrateUserFromDB(id, email) {
     let r = null;
     if (id) {
       r = await query(
-        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents
+        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents, city, state
            FROM users WHERE id=$1 LIMIT 1`,
         [id]
       );
     }
     if ((!r || !r.rows.length) && email) {
       r = await query(
-        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents
+        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents, city, state
            FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
         [email]
       );
@@ -92,7 +94,7 @@ async function hydrateUserFromDB(id, email) {
         `UPDATE users
             SET coupon_code=$2, coupon_updated_at=NOW()
           WHERE id=$1
-        RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents`,
+        RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents, city, state`,
         [u.id, code]
       );
       u = upd.rows[0];
@@ -106,6 +108,8 @@ async function hydrateUserFromDB(id, email) {
       coupon_code: u.coupon_code || null,
       coupon_updated_at: u.coupon_updated_at || null,
       coupon_value_cents: Number(u.coupon_value_cents || 0),
+      city: u.city || '',
+      state: u.state || '',
     };
   } catch {
     // fallback minimalista
@@ -126,6 +130,8 @@ async function hydrateUserFromDB(id, email) {
       coupon_code: null,
       coupon_updated_at: null,
       coupon_value_cents: 0,
+      city: u.city || '',
+      state: u.state || '',
     };
   }
 }
@@ -240,17 +246,30 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'invalid_payload' });
     }
 
+    const city = String(req.body.city || '').trim();
+    const state = String(req.body.state || '').trim();
+
+    if (!city) {
+      return res.status(400).json({ ok: false, error: 'Cidade é obrigatória.' });
+    }
+
+    if (!state) {
+      return res.status(400).json({ ok: false, error: 'Estado é obrigatório.' });
+    }
+
     const emailNorm = String(email).trim().toLowerCase();
     const dupe = await query('SELECT 1 FROM users WHERE LOWER(email)=LOWER($1)', [emailNorm]);
     if (dupe.rows.length) return res.status(409).json({ error: 'email_in_use' });
 
+    await ensureUserColumns();
+
     const hash = await bcrypt.hash(String(password), 10);
     const ins = await query(
-      `INSERT INTO users (name, email, pass_hash, phone)
-       VALUES ($1,$2,$3,$4)
-       RETURNING id, name, email, phone,
+      `INSERT INTO users (name, email, pass_hash, phone, city, state)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id, name, email, phone, city, state, is_admin, coupon_code, coupon_value_cents,
                  CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role`,
-      [name, emailNorm, hash, String(phone || '').trim() || null]
+      [name, emailNorm, hash, String(phone || '').trim() || null, city, state]
     );
 
     const u = ins.rows[0];
@@ -264,7 +283,15 @@ router.post('/register', async (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    return res.json({ ok: true, token, user: u });
+    return res.json({
+      ok: true,
+      token,
+      user: {
+        ...u,
+        city: u.city || '',
+        state: u.state || '',
+      },
+    });
   } catch (e) {
     console.error('[auth] register error', e.code || e.message || e);
     return res.status(503).json({ error: 'db_unavailable' });
