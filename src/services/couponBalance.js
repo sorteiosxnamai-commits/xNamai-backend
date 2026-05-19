@@ -117,37 +117,72 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
       WHERE id = $1::text
       LIMIT 1
     ),
-    calc AS (
+    base AS (
       SELECT
         pi.*,
         COALESCE(array_length(pi.numbers, 1), 0)::int AS qty,
-        $2::int4 AS unit_cents,
+        COALESCE(d.cashback_percent, 100)::int AS raw_cashback_percent,
+        COALESCE(NULLIF(d.price_cents, 0), NULLIF(d.ticket_price_cents, 0), $2::int4)::int AS draw_unit_cents
+      FROM pi
+      LEFT JOIN public.draws d ON d.id = pi.draw_id
+    ),
+    calc AS (
+      SELECT
+        b.*,
+        LEAST(100, GREATEST(0, b.raw_cashback_percent))::int AS cashback_percent,
         (
           CASE
-            WHEN COALESCE(array_length(pi.numbers, 1), 0) > 0 THEN (COALESCE(array_length(pi.numbers, 1), 0) * $2::int4)
-            ELSE COALESCE(pi.amount_cents, 0)
+            WHEN b.qty > 0 THEN COALESCE(b.amount_cents, b.qty * b.draw_unit_cents, b.qty * $2::int4)
+            ELSE COALESCE(b.amount_cents, 0)
           END
-        )::int AS delta_cents
-      FROM pi
+        )::int AS gross_amount_cents,
+        (
+          CASE
+            WHEN b.qty > 0 THEN COALESCE(b.amount_cents, b.qty * b.draw_unit_cents, b.qty * $2::int4) / NULLIF(b.qty, 0)
+            ELSE COALESCE(b.amount_cents, $2::int4)
+          END
+        )::int AS unit_cents
+      FROM base b
+    ),
+    final_calc AS (
+      SELECT
+        c.*,
+        FLOOR((c.gross_amount_cents::numeric * c.cashback_percent::numeric) / 100)::int AS delta_cents
+      FROM calc c
     ),
     ul AS (
       SELECT
         u.id AS user_id,
         COALESCE(u.coupon_value_cents, 0)::int AS balance_before_cents
       FROM public.users u
-      JOIN calc c ON c.user_id = u.id
+      JOIN final_calc c ON c.user_id = u.id
       FOR UPDATE
     ),
     h AS (
       INSERT INTO public.coupon_balance_history
-        (user_id, payment_id, delta_cents, balance_before_cents, balance_after_cents,
-         event_type, channel, status, draw_id, reservation_id, run_trace_id, meta)
+        (
+          user_id,
+          payment_id,
+          delta_cents,
+          balance_before_cents,
+          balance_after_cents,
+          event_type,
+          channel,
+          status,
+          draw_id,
+          reservation_id,
+          run_trace_id,
+          meta,
+          gross_amount_cents,
+          cashback_percent,
+          cashback_amount_cents
+        )
       SELECT
         ul.user_id,
         c.id,
         c.delta_cents,
         ul.balance_before_cents,
-        (ul.balance_before_cents + c.delta_cents),
+        ul.balance_before_cents + c.delta_cents,
         'CREDIT_PURCHASE',
         $3::text,
         'approved',
@@ -156,11 +191,21 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         $4::text,
         (
           COALESCE($5::jsonb, '{}'::jsonb)
-          || jsonb_build_object('unit_cents', c.unit_cents, 'qty', c.qty, 'channel', $3::text)
-        )
-      FROM calc c
+          || jsonb_build_object(
+            'unit_cents', c.unit_cents,
+            'qty', c.qty,
+            'channel', $3::text,
+            'gross_amount_cents', c.gross_amount_cents,
+            'cashback_percent', c.cashback_percent,
+            'cashback_amount_cents', c.delta_cents
+          )
+        ),
+        c.gross_amount_cents,
+        c.cashback_percent,
+        c.delta_cents
+      FROM final_calc c
       JOIN ul ON true
-      WHERE c.status_l = 'approved'
+      WHERE c.status_l IN ('approved', 'paid', 'pago')
         AND COALESCE(c.coupon_credited, false) = false
         AND c.delta_cents > 0
       ON CONFLICT DO NOTHING
@@ -168,7 +213,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
     ),
     u_upd AS (
       UPDATE public.users usr
-         SET coupon_value_cents = usr.coupon_value_cents + h.delta_cents,
+         SET coupon_value_cents = COALESCE(usr.coupon_value_cents, 0) + h.delta_cents,
              coupon_updated_at  = now()
         FROM h
        WHERE usr.id = h.user_id
@@ -177,13 +222,16 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
     p_upd AS (
       UPDATE public.payments pay
          SET coupon_credited = true,
-             coupon_credited_at = now()
-        FROM calc c
+             coupon_credited_at = now(),
+             coupon_cashback_percent = c.cashback_percent,
+             coupon_amount_cents = c.delta_cents
+        FROM final_calc c
        WHERE pay.id = c.id
-         AND lower(pay.status) = 'approved'
-         AND pay.coupon_credited = false
+         AND lower(pay.status) IN ('approved', 'paid', 'pago')
+         AND COALESCE(pay.coupon_credited, false) = false
          AND (
-           EXISTS (SELECT 1 FROM h)
+           c.delta_cents = 0
+           OR EXISTS (SELECT 1 FROM h)
            OR EXISTS (
              SELECT 1
              FROM public.coupon_balance_history hh
@@ -197,18 +245,18 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
       (SELECT count(*)::int FROM h) AS history_rows,
       (SELECT count(*)::int FROM u_upd) AS user_rows,
       (SELECT count(*)::int FROM p_upd) AS payment_rows,
-      (SELECT c.user_id::int FROM calc c LIMIT 1) AS user_id,
-      (SELECT c.status_l::text FROM calc c LIMIT 1) AS status_l,
-      (SELECT c.qty::int FROM calc c LIMIT 1) AS qty,
-      (SELECT c.unit_cents::int FROM calc c LIMIT 1) AS unit_cents,
-      (SELECT c.delta_cents::int FROM calc c LIMIT 1) AS delta_cents,
+      (SELECT c.user_id::int FROM final_calc c LIMIT 1) AS user_id,
+      (SELECT c.status_l::text FROM final_calc c LIMIT 1) AS status_l,
+      (SELECT c.qty::int FROM final_calc c LIMIT 1) AS qty,
+      (SELECT c.unit_cents::int FROM final_calc c LIMIT 1) AS unit_cents,
+      (SELECT c.delta_cents::int FROM final_calc c LIMIT 1) AS delta_cents,
       (SELECT COALESCE(EXISTS(
         SELECT 1
         FROM public.coupon_balance_history hh
         WHERE hh.payment_id = $1::text
           AND hh.event_type = 'CREDIT_PURCHASE'
       ), false)) AS already_in_ledger,
-      (SELECT COALESCE(c.coupon_credited, false) FROM calc c LIMIT 1) AS already_credited
+      (SELECT COALESCE(c.coupon_credited, false) FROM final_calc c LIMIT 1) AS already_credited
   `;
 
   try {
@@ -234,6 +282,9 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
     if (history_rows === 1 && user_rows === 1) {
       action = "credited";
       reason = null;
+    } else if (payment_rows === 1 && Number(delta_cents || 0) === 0 && isFinal) {
+      action = "noop";
+      reason = "zero_cashback";
     } else if (!isFinal) {
       action = "noop";
       reason = "not_final";

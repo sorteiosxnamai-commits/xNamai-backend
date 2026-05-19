@@ -41,6 +41,16 @@ function normalizeText(value, fallback = "") {
   return text || fallback;
 }
 
+function normalizeCashbackPercent(value, fallback = 100) {
+  if (value === undefined || value === null || value === "") return fallback;
+
+  const parsed = Number.parseInt(String(value).replace("%", "").trim(), 10);
+
+  if (!Number.isFinite(parsed)) return fallback;
+
+  return Math.max(0, Math.min(100, parsed));
+}
+
 async function ensureAdminSchema() {
   await query(`
     CREATE TABLE IF NOT EXISTS app_config (
@@ -174,6 +184,7 @@ async function handleSummary(_req, res) {
         max_numbers_per_user: maxNumbers,
         promo_text: promoText,
         banner_title: bannerTitle,
+        cashback_percent: 100,
         draw: null,
         current_draw: null,
         currentDraw: null,
@@ -189,6 +200,8 @@ async function handleSummary(_req, res) {
     const reserved = toInt(draw.reserved_numbers, 0);
     const remaining = Math.max(0, total - sold - reserved);
 
+    const cashbackPercent = normalizeCashbackPercent(draw.cashback_percent, 100);
+
     const normalizedDraw = {
       ...draw,
       id: draw.id,
@@ -199,6 +212,7 @@ async function handleSummary(_req, res) {
       remaining_numbers: remaining,
       ticket_price_cents: toInt(draw.ticket_price_cents, config.ticket_price_cents),
       max_numbers_per_user: toInt(draw.max_numbers_per_user, config.max_numbers_per_user),
+      cashback_percent: cashbackPercent,
     };
 
     return res.json({
@@ -208,6 +222,7 @@ async function handleSummary(_req, res) {
       remaining,
       price_cents: normalizedDraw.ticket_price_cents,
       ticket_price_cents: normalizedDraw.ticket_price_cents,
+      cashback_percent: cashbackPercent,
       max_numbers_per_selection: config.max_numbers_per_selection,
       max_numbers_per_user: normalizedDraw.max_numbers_per_user,
       promo_text: normalizedDraw.promo_text || promoText,
@@ -256,6 +271,8 @@ router.patch("/config", async (req, res) => {
       currentConfig.promo_text || currentConfig.banner_title || ""
     );
 
+    const cashbackPercent = normalizeCashbackPercent(req.body.cashback_percent, 100);
+
     await client.query("BEGIN");
 
     await upsertConfig(client, "ticket_price_cents", ticketPriceCents);
@@ -272,10 +289,11 @@ router.patch("/config", async (req, res) => {
       SET
         ticket_price_cents = $1,
         max_numbers_per_user = $2,
-        promo_text = $3
-      WHERE LOWER(COALESCE(status, '')) = ANY($4)
+        promo_text = $3,
+        cashback_percent = $4
+      WHERE LOWER(COALESCE(status, '')) = ANY($5)
       `,
-      [ticketPriceCents, maxNumbers, promoText, OPEN_STATUSES]
+      [ticketPriceCents, maxNumbers, promoText, cashbackPercent, OPEN_STATUSES]
     );
 
     await client.query("COMMIT");
@@ -285,6 +303,7 @@ router.patch("/config", async (req, res) => {
       ticket_price_cents: ticketPriceCents,
       max_numbers_per_selection: maxNumbers,
       promo_text: promoText,
+      cashback_percent: cashbackPercent,
     });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
@@ -322,6 +341,8 @@ router.post("/new", async (req, res) => {
       currentConfig.max_numbers_per_selection
     );
 
+    const cashbackPercent = normalizeCashbackPercent(req.body.cashback_percent, 100);
+
     const finalTitle = title || prizeTitle || `Sorteio ${new Date().toLocaleDateString("pt-BR")}`;
 
     await client.query("BEGIN");
@@ -345,13 +366,14 @@ router.post("/new", async (req, res) => {
         status,
         ticket_price_cents,
         max_numbers_per_user,
+        cashback_percent,
         started_at,
         opened_at
       )
-      VALUES ($1, $2, $3, 'open', $4, $5, NOW(), NOW())
+      VALUES ($1, $2, $3, 'open', $4, $5, $6, NOW(), NOW())
       RETURNING *
       `,
-      [finalTitle, prizeTitle, promoText, ticketPriceCents, maxNumbers]
+      [finalTitle, prizeTitle, promoText, ticketPriceCents, maxNumbers, cashbackPercent]
     );
 
     const draw = inserted.rows[0];
@@ -384,6 +406,7 @@ router.post("/new", async (req, res) => {
       draw_id: draw.id,
       draw: {
         ...draw,
+        cashback_percent: normalizeCashbackPercent(draw.cashback_percent, 100),
         total_numbers: 100,
         sold_numbers: 0,
         reserved_numbers: 0,
