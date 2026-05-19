@@ -5,8 +5,6 @@ import {
   attachPaymentToPromotionalReservation,
   assignPromotionalNumbersToUser,
   createPromotionalReservation,
-  createPromotionalDraw,
-  createPromotionalNumbers,
   countPromotionalNumbersByContact,
   deletePromotionalDraw,
   getPromotionalDrawById,
@@ -15,7 +13,6 @@ import {
   getPromotionalParticipants,
   getPromotionalReservationForPayment,
   listActivePromotionalDraws,
-  listPromotionalDraws,
   listPromotionalParticipationsForUser,
   settlePromotionalPaymentApproved,
   updatePromotionalDraw,
@@ -92,34 +89,263 @@ export async function getNumbers(draw_id, { requireActive = false } = {}) {
   return { draw, numbers };
 }
 
+async function getTableColumns(client, tableName) {
+  const { rows } = await client.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+    `,
+    [tableName]
+  );
+
+  return new Set(rows.map((row) => row.column_name));
+}
+
+function addInsertValue(columnsSet, insertColumns, insertValues, placeholders, columnName, value) {
+  if (!columnsSet.has(columnName)) return;
+
+  insertColumns.push(columnName);
+  insertValues.push(value);
+  placeholders.push(`$${insertValues.length}`);
+}
+
+function addInsertSql(columnsSet, insertColumns, placeholders, columnName, sqlExpression) {
+  if (!columnsSet.has(columnName)) return;
+
+  insertColumns.push(columnName);
+  placeholders.push(sqlExpression);
+}
+
+function normalizePromotionalDrawRow(row, fallback = {}) {
+  if (!row) return null;
+
+  const price =
+    row.price_cents ??
+    row.ticket_price_cents ??
+    row.promotional_price_cents ??
+    fallback.price_cents ??
+    5500;
+
+  return {
+    ...row,
+    id: Number(row.id),
+    price_cents: Number(price),
+    ticket_price_cents: Number(row.ticket_price_cents ?? price),
+    promotional_price_cents: Number(row.promotional_price_cents ?? price),
+    number_start: Number(row.number_start ?? fallback.number_start ?? 0),
+    number_end: Number(row.number_end ?? fallback.number_end ?? 99),
+    max_numbers_per_user: Number(row.max_numbers_per_user ?? fallback.max_numbers_per_user ?? 1),
+    total_numbers: Number(row.total_numbers ?? 0),
+    available_numbers: Number(row.available_numbers ?? 0),
+    reserved_numbers: Number(row.reserved_numbers ?? 0),
+    sold_numbers: Number(row.sold_numbers ?? 0),
+    blocked_numbers: Number(row.blocked_numbers ?? 0),
+  };
+}
+
 export async function createDraw(payload) {
   const data = validateCreatePromotionalDraw(payload);
+
   const pool = await getPool();
   const client = await pool.connect();
 
   try {
+    console.log("[PROMOTIONAL_ADMIN_CREATE_DRAW_START]", {
+      title: data.title,
+      price_cents: data.price_cents,
+      number_start: data.number_start,
+      number_end: data.number_end,
+      max_numbers_per_user: data.max_numbers_per_user,
+      status: data.status,
+    });
+
     await client.query("BEGIN");
 
-    const draw = await createPromotionalDraw(data, client);
-    await createPromotionalNumbers(draw.id, data.number_start, data.number_end, client);
+    const drawColumns = await getTableColumns(client, "promotional_draws");
+    const numberColumns = await getTableColumns(client, "promotional_numbers");
+
+    if (!drawColumns.has("id")) {
+      throw new Error("Tabela public.promotional_draws inválida: coluna id não encontrada.");
+    }
+
+    if (!numberColumns.has("draw_id")) {
+      throw new Error("Tabela public.promotional_numbers inválida: coluna draw_id não encontrada.");
+    }
+
+    const insertColumns = [];
+    const insertValues = [];
+    const placeholders = [];
+
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "title", data.title);
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "description", data.description || "");
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "prize", data.prize || "");
+
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "price_cents", data.price_cents);
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "ticket_price_cents", data.price_cents);
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "promotional_price_cents", data.price_cents);
+
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "number_start", data.number_start);
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "number_end", data.number_end);
+    addInsertValue(
+      drawColumns,
+      insertColumns,
+      insertValues,
+      placeholders,
+      "max_numbers_per_user",
+      data.max_numbers_per_user
+    );
+
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "status", data.status || "draft");
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "banner_url", data.banner_url || null);
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "starts_at", data.starts_at || null);
+    addInsertValue(drawColumns, insertColumns, insertValues, placeholders, "ends_at", data.ends_at || null);
+
+    addInsertSql(drawColumns, insertColumns, placeholders, "created_at", "now()");
+    addInsertSql(drawColumns, insertColumns, placeholders, "updated_at", "now()");
+
+    if (!insertColumns.includes("title")) {
+      throw new Error("Tabela public.promotional_draws inválida: coluna title não encontrada.");
+    }
+
+    const createDrawSql = `
+      INSERT INTO public.promotional_draws (${insertColumns.join(", ")})
+      VALUES (${placeholders.join(", ")})
+      RETURNING *
+    `;
+
+    const drawResult = await client.query(createDrawSql, insertValues);
+    const draw = drawResult.rows[0];
+
+    if (!draw?.id) {
+      throw new Error("Falha ao criar sorteio promocional: INSERT não retornou id.");
+    }
+
+    const numberInsertColumns = [];
+    const numberSelectExpressions = [];
+
+    if (numberColumns.has("draw_id")) {
+      numberInsertColumns.push("draw_id");
+      numberSelectExpressions.push("$3::int");
+    }
+
+    if (numberColumns.has("n")) {
+      numberInsertColumns.push("n");
+      numberSelectExpressions.push("gs.n");
+    }
+
+    if (numberColumns.has("number_value")) {
+      numberInsertColumns.push("number_value");
+      numberSelectExpressions.push("gs.n");
+    }
+
+    if (numberColumns.has("number")) {
+      numberInsertColumns.push("number");
+      numberSelectExpressions.push("LPAD(gs.n::text, 2, '0')");
+    }
+
+    if (numberColumns.has("label")) {
+      numberInsertColumns.push("label");
+      numberSelectExpressions.push("LPAD(gs.n::text, 2, '0')");
+    }
+
+    if (numberColumns.has("status")) {
+      numberInsertColumns.push("status");
+      numberSelectExpressions.push("'available'");
+    }
+
+    if (numberColumns.has("created_at")) {
+      numberInsertColumns.push("created_at");
+      numberSelectExpressions.push("now()");
+    }
+
+    if (numberColumns.has("updated_at")) {
+      numberInsertColumns.push("updated_at");
+      numberSelectExpressions.push("now()");
+    }
+
+    const duplicateConditions = [];
+
+    if (numberColumns.has("n")) {
+      duplicateConditions.push("pn.n = gs.n");
+    }
+
+    if (numberColumns.has("number_value")) {
+      duplicateConditions.push("pn.number_value = gs.n");
+    }
+
+    if (numberColumns.has("number")) {
+      duplicateConditions.push("(pn.number::text = gs.n::text OR pn.number::text = LPAD(gs.n::text, 2, '0'))");
+    }
+
+    if (!duplicateConditions.length) {
+      throw new Error(
+        "Tabela public.promotional_numbers inválida: precisa de uma coluna n, number_value ou number."
+      );
+    }
+
+    const createNumbersSql = `
+      INSERT INTO public.promotional_numbers (${numberInsertColumns.join(", ")})
+      SELECT ${numberSelectExpressions.join(", ")}
+      FROM generate_series($1::int, $2::int) AS gs(n)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM public.promotional_numbers pn
+        WHERE pn.draw_id = $3::int
+          AND (${duplicateConditions.join(" OR ")})
+      )
+    `;
+
+    await client.query(createNumbersSql, [data.number_start, data.number_end, draw.id]);
+
+    const countResult = await client.query(
+      `
+        SELECT
+          COUNT(*)::int AS total_numbers,
+          COUNT(*) FILTER (WHERE status = 'available')::int AS available_numbers,
+          COUNT(*) FILTER (WHERE status = 'reserved')::int AS reserved_numbers,
+          COUNT(*) FILTER (WHERE status = 'sold')::int AS sold_numbers,
+          COUNT(*) FILTER (WHERE status = 'blocked')::int AS blocked_numbers
+        FROM public.promotional_numbers
+        WHERE draw_id = $1
+      `,
+      [draw.id]
+    );
 
     await client.query("COMMIT");
 
-    return getPromotionalDrawById(draw.id);
+    const counts = countResult.rows[0] || {};
+
+    const createdDraw = normalizePromotionalDrawRow(
+      {
+        ...draw,
+        ...counts,
+      },
+      data
+    );
+
+    console.log("[PROMOTIONAL_ADMIN_CREATE_DRAW_SUCCESS]", {
+      draw_id: createdDraw.id,
+      total_numbers: createdDraw.total_numbers,
+      available_numbers: createdDraw.available_numbers,
+    });
+
+    return createdDraw;
   } catch (err) {
-    console.error("[PROMOTIONAL_CREATE_DRAW_ERROR]", {
+    await client.query("ROLLBACK").catch(() => {});
+
+    console.error("[PROMOTIONAL_ADMIN_CREATE_DRAW_ERROR]", {
       code: err?.code,
       message: err?.message,
       detail: err?.detail,
       hint: err?.hint,
-      constraint: err?.constraint,
       table: err?.table,
       column: err?.column,
-      routine: err?.routine,
+      constraint: err?.constraint,
       stack: err?.stack,
     });
 
-    await client.query("ROLLBACK").catch(() => {});
     throw err;
   } finally {
     client.release();
@@ -475,7 +701,56 @@ export async function updateNumberStatus(draw_id, number, status) {
 }
 
 export async function listAdminDraws() {
-  return listPromotionalDraws();
+  const pool = await getPool();
+  const client = await pool.connect();
+
+  try {
+    const drawColumns = await getTableColumns(client, "promotional_draws");
+
+    const orderBy = drawColumns.has("created_at")
+      ? "d.created_at DESC, d.id DESC"
+      : "d.id DESC";
+
+    const { rows } = await client.query(`
+      SELECT
+        d.*,
+        COALESCE(c.total_numbers, 0)::int AS total_numbers,
+        COALESCE(c.available_numbers, 0)::int AS available_numbers,
+        COALESCE(c.reserved_numbers, 0)::int AS reserved_numbers,
+        COALESCE(c.sold_numbers, 0)::int AS sold_numbers,
+        COALESCE(c.blocked_numbers, 0)::int AS blocked_numbers
+      FROM public.promotional_draws d
+      LEFT JOIN (
+        SELECT
+          draw_id,
+          COUNT(*)::int AS total_numbers,
+          COUNT(*) FILTER (WHERE status = 'available')::int AS available_numbers,
+          COUNT(*) FILTER (WHERE status = 'reserved')::int AS reserved_numbers,
+          COUNT(*) FILTER (WHERE status = 'sold')::int AS sold_numbers,
+          COUNT(*) FILTER (WHERE status = 'blocked')::int AS blocked_numbers
+        FROM public.promotional_numbers
+        GROUP BY draw_id
+      ) c ON c.draw_id = d.id
+      ORDER BY ${orderBy}
+    `);
+
+    return rows.map((row) => normalizePromotionalDrawRow(row));
+  } catch (err) {
+    console.error("[PROMOTIONAL_ADMIN_LIST_DRAWS_ERROR]", {
+      code: err?.code,
+      message: err?.message,
+      detail: err?.detail,
+      hint: err?.hint,
+      table: err?.table,
+      column: err?.column,
+      constraint: err?.constraint,
+      stack: err?.stack,
+    });
+
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function listParticipants(draw_id) {
