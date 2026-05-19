@@ -1,6 +1,8 @@
 // backend/src/routes/numbers.js
 import { Router } from 'express';
 import { query } from '../db.js';
+import { ensureMainRaffleCompat } from '../services/mainRaffleCompat.js';
+import { cleanupExpiredMainReservations } from '../services/mainReservationExpiry.js';
 
 const router = Router();
 
@@ -21,30 +23,25 @@ function initialsFromNameOrEmail(name, email) {
 /**
  * GET /api/numbers
  * - Pega o draw aberto
- * - Lê todos os números do draw (0..99) a partir da tabela numbers
- * - Marca como "sold" (indisponível) os números que têm pagamento aprovado
- * - Marca como "reserved" os números com reserva ativa (não expirada)
- * - Faz lazy-expire das reservas vencidas (best-effort)
+ * - Garante o schema do sorteio principal
+ * - Expira reservas e números vencidos
+ * - Lê a grade direto de public.numbers (fonte da verdade)
+ * - Marca como "sold" os números com pagamento aprovado em payments
+ *   (inclui owner_initials)
+ * - Marca como "reserved" os números com reserved_until > now em public.numbers
  * - Retorna o status final para cada número
- * - (NOVO) Para números vendidos, inclui "owner_initials" (iniciais do comprador)
  */
 router.get('/', async (_req, res) => {
   try {
-    // 1) draw aberto
     const dr = await query(
       `SELECT id FROM draws WHERE status = 'open' ORDER BY id DESC LIMIT 1`
     );
     if (!dr.rows.length) return res.json({ drawId: null, numbers: [] });
     const drawId = dr.rows[0].id;
 
-    // 2) lista base de números 0..99
-    const base = await query(
-      `SELECT n FROM numbers WHERE draw_id = $1 ORDER BY n ASC`,
-      [drawId]
-    );
+    await ensureMainRaffleCompat();
+    await cleanupExpiredMainReservations(null, drawId);
 
-    // 3) pagos => SOLD + iniciais do comprador
-    //    Usamos UNNEST para explodir o array de números pagos
     const pays = await query(
       `
       SELECT
@@ -59,53 +56,66 @@ router.get('/', async (_req, res) => {
       `,
       [drawId]
     );
-    const sold = new Set();
+
     const initialsByN = new Map();
     for (const row of pays.rows || []) {
       const num = Number(row.n);
-      sold.add(num);
       const ini = initialsFromNameOrEmail(row.owner_name, row.owner_email);
       initialsByN.set(num, ini);
     }
 
-    // 4) reservas ativas; ignora expiradas (e tenta expirar em background)
-    const resvs = await query(
-      `SELECT id, numbers, status, expires_at
-         FROM reservations
-        WHERE draw_id = $1
-          AND lower(coalesce(status,'')) IN ('active','pending','reserved','')`,
+    const base = await query(
+      `
+      SELECT
+        COALESCE(n::int, number) AS n,
+        status,
+        payment_status,
+        reserved_until,
+        user_id
+      FROM public.numbers
+      WHERE draw_id = $1
+      ORDER BY COALESCE(n::int, number) ASC
+      `,
       [drawId]
     );
 
     const now = Date.now();
-    const reserved = new Set();
 
-    for (const r of resvs.rows || []) {
-      const exp = r.expires_at ? new Date(r.expires_at).getTime() : null;
-      const isExpired = exp && !Number.isNaN(exp) && exp < now;
+    const numbers = base.rows.map((row) => {
+      const num = Number(row.n);
+      const status = String(row.status || 'available').toLowerCase();
+      const paymentStatus = String(row.payment_status || 'pending').toLowerCase();
+      const reservedUntil = row.reserved_until
+        ? new Date(row.reserved_until).getTime()
+        : null;
 
-      if (isExpired) {
-        // best-effort: não bloqueia a resposta
-        query(`UPDATE reservations SET status = 'expired' WHERE id = $1`, [r.id])
-          .catch(() => {});
-        continue;
+      if (
+        ['sold', 'paid', 'approved', 'pago', 'vendido', 'aprovado'].includes(status) ||
+        ['paid', 'approved', 'pago'].includes(paymentStatus) ||
+        initialsByN.has(num)
+      ) {
+        return {
+          n: num,
+          status: 'sold',
+          owner_initials: initialsByN.get(num) || null,
+        };
       }
 
-      // reserva só se ainda não foi vendida
-      for (const n of (r.numbers || [])) {
-        const num = Number(n);
-        if (!sold.has(num)) reserved.add(num);
+      if (
+        ['reserved', 'pending', 'reservado', 'pendente'].includes(status) &&
+        reservedUntil &&
+        reservedUntil > now
+      ) {
+        return {
+          n: num,
+          status: 'reserved',
+        };
       }
-    }
 
-    // 5) status final por número (+ owner_initials quando sold)
-    const numbers = base.rows.map(({ n }) => {
-      const num = Number(n);
-      if (sold.has(num)) {
-        return { n: num, status: 'sold', owner_initials: initialsByN.get(num) || null };
-      }
-      if (reserved.has(num)) return { n: num, status: 'reserved' };
-      return { n: num, status: 'available' };
+      return {
+        n: num,
+        status: 'available',
+      };
     });
 
     res.json({ drawId, numbers });

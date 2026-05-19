@@ -7,6 +7,10 @@ import {
   ensureMainRaffleCompat,
   reservationIdIsUuid,
 } from '../services/mainRaffleCompat.js';
+import {
+  cleanupExpiredMainReservations,
+  ensureMainNumbersExist,
+} from '../services/mainReservationExpiry.js';
 import { getTicketPriceCents } from '../services/config.js';
 import { mpCreatePixPayment } from '../services/mercadopago.js';
 
@@ -107,6 +111,8 @@ router.post('/', requireAuth, async (req, res) => {
     txStarted = true;
 
     await ensureMainRaffleCompat(client);
+    await cleanupExpiredMainReservations(client, drawId);
+    await ensureMainNumbersExist(client, drawId, nums);
 
     const priceRow = await client.query(
       `
@@ -121,51 +127,6 @@ router.post('/', requireAuth, async (req, res) => {
     const amountCents = nums.length * priceCents;
     const groupId = randomUUID();
     const usesUuidId = await reservationIdIsUuid(client);
-
-    await client.query(
-      `INSERT INTO public.numbers (draw_id, n, number, status, created_at, updated_at)
-       SELECT $1, selected_number::smallint, selected_number::int, 'available', NOW(), NOW()
-         FROM UNNEST($2::int[]) AS selected_number
-        WHERE NOT EXISTS (
-          SELECT 1
-            FROM public.numbers existing
-           WHERE existing.draw_id = $1
-             AND COALESCE(existing.n::int, existing.number) = selected_number
-        )`,
-      [drawId, nums]
-    );
-
-    await client.query(
-      `UPDATE public.reservations
-          SET status = 'expired',
-              payment_status = 'expired',
-              updated_at = NOW()
-        WHERE draw_id = $1
-          AND expires_at IS NOT NULL
-          AND expires_at <= NOW()
-          AND LOWER(COALESCE(status, '')) IN ('active','pending','reserved','reservado','pendente')
-          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`,
-      [drawId]
-    );
-
-    await client.query(
-      `UPDATE public.numbers
-          SET status = 'available',
-              reservation_id = NULL,
-              user_id = NULL,
-              payment_status = 'pending',
-              reserved_until = NULL,
-              reserved_at = NULL,
-              payment_id = NULL,
-              updated_at = NOW()
-        WHERE draw_id = $1
-          AND COALESCE(n::int, number) = ANY($2::int[])
-          AND LOWER(COALESCE(status, '')) IN ('reserved','pending','reservado','pendente')
-          AND reserved_until IS NOT NULL
-          AND reserved_until <= NOW()
-          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`,
-      [drawId, nums]
-    );
 
     const locked = await client.query(
       `SELECT COALESCE(n::int, number) AS number, status, reservation_id, reserved_until, payment_status
@@ -257,20 +218,39 @@ router.post('/', requireAuth, async (req, res) => {
         ]
       );
 
-      await client.query(
-        `UPDATE public.numbers
-            SET status = 'reserved',
-                reservation_id = $3,
-                user_id = $4,
-                payment_status = 'pending',
-                reserved_until = $5,
-                reserved_at = NOW(),
-                payment_id = NULL,
-                updated_at = NOW()
-          WHERE draw_id = $1
-            AND COALESCE(n::int, number) = ANY($2::int[])`,
-        [drawId, nums, groupId, req.user.id, expiresAt]
+      const reservationIdForNumbers = groupId;
+
+      const updateNumbersResult = await client.query(
+        `
+        UPDATE public.numbers
+           SET status = 'reserved',
+               reservation_id = $3,
+               user_id = $4,
+               payment_status = 'pending',
+               payment_id = NULL,
+               reserved_at = NOW(),
+               reserved_until = $5,
+               updated_at = NOW()
+         WHERE draw_id = $1
+           AND COALESCE(n::int, number) = ANY($2::int[])
+           AND (
+             LOWER(COALESCE(status, 'available')) IN ('available', '')
+             OR (
+               LOWER(COALESCE(status, '')) IN ('reserved', 'pending', 'reservado', 'pendente')
+               AND reserved_until IS NOT NULL
+               AND reserved_until <= NOW()
+             )
+           )
+           AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'approved', 'pago')
+        `,
+        [drawId, nums, reservationIdForNumbers, req.user.id, expiresAt]
       );
+
+      if (Number(updateNumbersResult.rowCount || 0) !== nums.length) {
+        throw new Error(
+          `main_numbers_not_reserved:${updateNumbersResult.rowCount}/${nums.length}`
+        );
+      }
     } else {
       const inserted = await client.query(
         `INSERT INTO public.reservations (
@@ -327,21 +307,39 @@ router.post('/', requireAuth, async (req, res) => {
 
       const reservationRowId = inserted.rows[0]?.id;
       reservationIdForResponse = groupId;
+      const reservationIdForNumbers = String(reservationRowId);
 
-      await client.query(
-        `UPDATE public.numbers
-            SET status = 'reserved',
-                reservation_id = $3,
-                user_id = $4,
-                payment_status = 'pending',
-                reserved_until = $5,
-                reserved_at = NOW(),
-                payment_id = NULL,
-                updated_at = NOW()
-          WHERE draw_id = $1
-            AND COALESCE(n::int, number) = ANY($2::int[])`,
-        [drawId, nums, String(reservationRowId), req.user.id, expiresAt]
+      const updateNumbersResult = await client.query(
+        `
+        UPDATE public.numbers
+           SET status = 'reserved',
+               reservation_id = $3,
+               user_id = $4,
+               payment_status = 'pending',
+               payment_id = NULL,
+               reserved_at = NOW(),
+               reserved_until = $5,
+               updated_at = NOW()
+         WHERE draw_id = $1
+           AND COALESCE(n::int, number) = ANY($2::int[])
+           AND (
+             LOWER(COALESCE(status, 'available')) IN ('available', '')
+             OR (
+               LOWER(COALESCE(status, '')) IN ('reserved', 'pending', 'reservado', 'pendente')
+               AND reserved_until IS NOT NULL
+               AND reserved_until <= NOW()
+             )
+           )
+           AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'approved', 'pago')
+        `,
+        [drawId, nums, reservationIdForNumbers, req.user.id, expiresAt]
       );
+
+      if (Number(updateNumbersResult.rowCount || 0) !== nums.length) {
+        throw new Error(
+          `main_numbers_not_reserved:${updateNumbersResult.rowCount}/${nums.length}`
+        );
+      }
     }
 
     await client.query('COMMIT');
@@ -371,7 +369,7 @@ router.post('/', requireAuth, async (req, res) => {
       } catch {}
     }
 
-    console.error('[RESERVATION_CREATE_ERROR]', {
+    console.error('[MAIN_RESERVATION_CREATE_ERROR]', {
       code: err?.code,
       message: err?.message,
       detail: err?.detail,
