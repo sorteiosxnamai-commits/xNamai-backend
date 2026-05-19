@@ -1225,79 +1225,74 @@ export async function deletePromotionalDraw(id) {
 }
 
 export async function createPromotionalNumbers(draw_id, number_start, number_end, client = null) {
-  await ensurePromotionalAdminSchema(client);
+  await ensurePromotionalSchema(client);
 
-  const drawId = Number.parseInt(draw_id, 10);
-  const start = Number.parseInt(number_start ?? 0, 10);
-  const end = Number.parseInt(number_end ?? 99, 10);
+  const normalizedDrawId = Number.parseInt(draw_id, 10);
+  const start = Number.parseInt(number_start, 10);
+  const end = Number.parseInt(number_end, 10);
 
-  if (!Number.isInteger(drawId) || drawId <= 0) {
-    const err = new Error("draw_id promocional inválido ao criar números.");
-    err.status = 400;
-    err.code = "invalid_promotional_draw_id";
-    throw err;
+  if (
+    !Number.isInteger(normalizedDrawId) ||
+    !Number.isInteger(start) ||
+    !Number.isInteger(end)
+  ) {
+    return [];
   }
 
-  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end > 1000) {
-    const err = new Error("Intervalo de números promocionais inválido.");
-    err.status = 400;
-    err.code = "invalid_promotional_number_range";
-    throw err;
+  if (start < 0 || end < start) {
+    return [];
   }
 
-  const width = Math.max(2, String(end).length);
-
-  const { rows } = await dbQuery(client, `
-    WITH generated AS (
+  const { rows } = await dbQuery(
+    client,
+    `
+      WITH generated AS (
+        SELECT
+          $1::int AS draw_id,
+          gs::int AS n,
+          gs::int AS number_value,
+          LPAD(gs::text, 2, '0')::text AS number,
+          LPAD(gs::text, 2, '0')::text AS label,
+          'available'::text AS status
+        FROM generate_series($2::int, $3::int) AS gs
+      )
+      INSERT INTO public.promotional_numbers (
+        draw_id,
+        n,
+        number_value,
+        number,
+        label,
+        status,
+        created_at,
+        updated_at
+      )
       SELECT
-        $1::bigint AS draw_id,
-        gs::int AS n,
-        gs::int AS number_value,
-        LPAD(gs::text, $4::int, '0') AS number,
-        LPAD(gs::text, $4::int, '0') AS label
-      FROM generate_series($2::int, $3::int) AS gs
-    )
-    INSERT INTO public.promotional_numbers (
-      draw_id,
-      n,
-      number_value,
-      number,
-      label,
-      status,
-      payment_status,
-      created_at,
-      updated_at
-    )
-    SELECT
-      g.draw_id,
-      g.n,
-      g.number_value,
-      g.number,
-      g.label,
-      'available',
-      'pending',
-      NOW(),
-      NOW()
-    FROM generated g
-    WHERE NOT EXISTS (
-      SELECT 1
-      FROM public.promotional_numbers pn
-      WHERE pn.draw_id = g.draw_id
-        AND COALESCE(
-          pn.n,
-          pn.number_value,
-          NULLIF(regexp_replace(pn.number::text, '\\D', '', 'g'), '')::int
-        ) = g.n
-    )
-    RETURNING *
-  `, [
-    drawId,
-    start,
-    end,
-    width,
-  ]);
+        g.draw_id,
+        g.n,
+        g.number_value,
+        g.number,
+        g.label,
+        g.status,
+        NOW(),
+        NOW()
+      FROM generated g
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM public.promotional_numbers pn
+        WHERE pn.draw_id = g.draw_id
+          AND COALESCE(
+            pn.n,
+            pn.number_value,
+            NULLIF(regexp_replace(pn.number::text, '\\D', '', 'g'), '')::int
+          ) = g.n
+      )
+      ON CONFLICT DO NOTHING
+      RETURNING *
+    `,
+    [normalizedDrawId, start, end]
+  );
 
-  return rows;
+  return rows.map(normalizeNumberRow);
 }
 
 export async function updatePromotionalNumberStatus(draw_id, n, status) {
