@@ -182,6 +182,162 @@ async function ensurePromotionalRuntimeConstraints(client = null) {
   });
 }
 
+async function ensurePromotionalDrawCompatibility(client = null) {
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS prize TEXT DEFAULT ''
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS price_cents INTEGER DEFAULT 5500
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS ticket_price_cents INTEGER DEFAULT 5500
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS promotional_price_cents INTEGER DEFAULT 5500
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS number_start INTEGER DEFAULT 0
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS number_end INTEGER DEFAULT 99
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS max_numbers_per_user INTEGER DEFAULT 1
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'draft'
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS banner_url TEXT
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS ends_at TIMESTAMPTZ
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await dbQuery(client, `
+    UPDATE public.promotional_draws
+       SET price_cents = COALESCE(NULLIF(price_cents, 0), ticket_price_cents, promotional_price_cents, 5500),
+           ticket_price_cents = COALESCE(ticket_price_cents, NULLIF(price_cents, 0), promotional_price_cents, 5500),
+           promotional_price_cents = COALESCE(promotional_price_cents, NULLIF(price_cents, 0), ticket_price_cents, 5500),
+           number_start = COALESCE(number_start, 0),
+           number_end = COALESCE(number_end, 99),
+           max_numbers_per_user = COALESCE(NULLIF(max_numbers_per_user, 0), 1),
+           status = CASE
+             WHEN status IS NULL OR TRIM(status) = '' THEN 'draft'
+             WHEN LOWER(TRIM(status)) IN ('active', 'ativo', 'published', 'publicado', 'open', 'aberto') THEN 'active'
+             WHEN LOWER(TRIM(status)) IN ('inactive', 'inativo', 'disabled', 'desativado') THEN 'inactive'
+             WHEN LOWER(TRIM(status)) IN ('closed', 'fechado', 'ended', 'finalizado') THEN 'closed'
+             WHEN LOWER(TRIM(status)) IN ('draft', 'rascunho') THEN 'draft'
+             ELSE 'draft'
+           END,
+           updated_at = COALESCE(updated_at, NOW())
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ALTER COLUMN price_cents SET DEFAULT 5500
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ALTER COLUMN ticket_price_cents SET DEFAULT 5500
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ALTER COLUMN promotional_price_cents SET DEFAULT 5500
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ALTER COLUMN status SET DEFAULT 'draft'
+  `);
+
+  await dbQuery(client, `
+    DO $$
+    DECLARE
+      r RECORD;
+    BEGIN
+      FOR r IN
+        SELECT c.conname
+          FROM pg_constraint c
+          JOIN pg_class t ON t.oid = c.conrelid
+          JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public'
+           AND t.relname = 'promotional_draws'
+           AND c.contype = 'c'
+           AND pg_get_constraintdef(c.oid) ILIKE '%status%'
+      LOOP
+        EXECUTE format(
+          'ALTER TABLE public.promotional_draws DROP CONSTRAINT IF EXISTS %I',
+          r.conname
+        );
+      END LOOP;
+    END $$;
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    ADD CONSTRAINT promotional_draws_status_check
+    CHECK (
+      LOWER(TRIM(status)) IN (
+        'draft',
+        'active',
+        'inactive',
+        'closed',
+        'published',
+        'open'
+      )
+    )
+  `);
+
+  console.log("[PROMOTIONAL_DRAWS_SCHEMA_OK] promotional_draws compatible");
+}
+
 export async function ensurePromotionalSchema(client = null) {
   await dbQuery(client, `CREATE EXTENSION IF NOT EXISTS pgcrypto`);
 
@@ -460,6 +616,7 @@ export async function ensurePromotionalSchema(client = null) {
     ON public.promotional_payments(reservation_id)
   `);
 
+  await ensurePromotionalDrawCompatibility(client);
   await ensurePromotionalRuntimeConstraints(client);
 }
 
@@ -575,10 +732,18 @@ function drawSelect() {
       SELECT
         draw_id,
         COUNT(*)::int AS total_numbers,
-        COUNT(*) FILTER (WHERE status = 'available')::int AS available_numbers,
-        COUNT(*) FILTER (WHERE status = 'reserved')::int AS reserved_numbers,
-        COUNT(*) FILTER (WHERE status IN ('sold', 'paid'))::int AS sold_numbers,
-        COUNT(*) FILTER (WHERE status = 'blocked')::int AS blocked_numbers
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(status, 'available')) = 'available'
+        )::int AS available_numbers,
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(status, 'available')) IN ('reserved', 'pending')
+        )::int AS reserved_numbers,
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(status, 'available')) IN ('sold', 'paid', 'approved')
+        )::int AS sold_numbers,
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(status, 'available')) IN ('blocked', 'unavailable')
+        )::int AS blocked_numbers
       FROM public.promotional_numbers
       GROUP BY draw_id
     ) ns ON ns.draw_id = d.id
@@ -631,10 +796,10 @@ export async function listActivePromotionalDraws() {
 
   const { rows } = await query(`
     ${drawSelect()}
-    WHERE d.status IN ('active', 'published', 'open')
+    WHERE LOWER(COALESCE(d.status, 'draft')) IN ('active', 'published', 'open')
       AND (d.starts_at IS NULL OR d.starts_at <= NOW())
       AND (d.ends_at IS NULL OR d.ends_at >= NOW())
-    ORDER BY d.created_at DESC, d.id DESC
+    ORDER BY d.created_at DESC NULLS LAST, d.id DESC
   `);
 
   return rows;
@@ -646,7 +811,7 @@ export async function listPromotionalDraws() {
 
   const { rows } = await query(`
     ${drawSelect()}
-    ORDER BY d.created_at DESC, d.id DESC
+    ORDER BY d.created_at DESC NULLS LAST, d.id DESC
   `);
 
   return rows;
@@ -656,15 +821,11 @@ export async function getPromotionalDrawById(id, client = null) {
   await ensurePromotionalSchema(client);
   await releaseExpiredPromotionalReservations(client);
 
-  const { rows } = await dbQuery(
-    client,
-    `
-      ${drawSelect()}
-      WHERE d.id = $1
-      LIMIT 1
-    `,
-    [id]
-  );
+  const { rows } = await dbQuery(client, `
+    ${drawSelect()}
+    WHERE d.id = $1
+    LIMIT 1
+  `, [Number(id)]);
 
   return rows[0] || null;
 }
@@ -717,52 +878,96 @@ export async function getPromotionalNumbersAdmin(draw_id, client = null) {
 export async function createPromotionalDraw(payload, client = null) {
   await ensurePromotionalSchema(client);
 
-  const priceCents = Number(
-    payload.price_cents ||
-    payload.ticket_price_cents ||
-    payload.promotional_price_cents ||
-    5500
+  const priceCents = Number.parseInt(
+    payload.price_cents ??
+      payload.ticket_price_cents ??
+      payload.promotional_price_cents ??
+      5500,
+    10
   );
 
-  const { rows } = await dbQuery(
-    client,
-    `
-      INSERT INTO public.promotional_draws (
-        title,
-        description,
-        prize,
-        price_cents,
-        ticket_price_cents,
-        promotional_price_cents,
-        number_start,
-        number_end,
-        max_numbers_per_user,
-        status,
-        banner_url,
-        starts_at,
-        ends_at,
-        created_at,
-        updated_at
-      )
-      VALUES (
-        $1,$2,$3,$4,$4,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW()
-      )
-      RETURNING *
-    `,
-    [
-      payload.title,
-      payload.description || "",
-      payload.prize || "",
-      priceCents,
-      Number(payload.number_start ?? 0),
-      Number(payload.number_end ?? 99),
-      Number(payload.max_numbers_per_user ?? 1),
-      payload.status || "inactive",
-      payload.banner_url || null,
-      payload.starts_at || null,
-      payload.ends_at || null,
-    ]
-  );
+  const normalizedPriceCents =
+    Number.isInteger(priceCents) && priceCents > 0 ? priceCents : 5500;
+
+  const rawStatus = String(payload.status || "draft").trim().toLowerCase();
+
+  const statusAliases = {
+    ativo: "active",
+    active: "active",
+    published: "active",
+    publicado: "active",
+    open: "active",
+    aberto: "active",
+
+    inativo: "inactive",
+    inactive: "inactive",
+    disabled: "inactive",
+    desativado: "inactive",
+
+    fechado: "closed",
+    closed: "closed",
+    ended: "closed",
+    finalizado: "closed",
+
+    rascunho: "draft",
+    draft: "draft",
+  };
+
+  const status = statusAliases[rawStatus] || "draft";
+
+  const numberStart = Number.parseInt(payload.number_start ?? 0, 10);
+  const numberEnd = Number.parseInt(payload.number_end ?? 99, 10);
+  const maxNumbersPerUser = Number.parseInt(payload.max_numbers_per_user ?? 1, 10);
+
+  const { rows } = await dbQuery(client, `
+    INSERT INTO public.promotional_draws (
+      title,
+      description,
+      prize,
+      price_cents,
+      ticket_price_cents,
+      promotional_price_cents,
+      number_start,
+      number_end,
+      max_numbers_per_user,
+      status,
+      banner_url,
+      starts_at,
+      ends_at,
+      created_at,
+      updated_at
+    )
+    VALUES (
+      $1::text,
+      $2::text,
+      $3::text,
+      $4::int,
+      $4::int,
+      $4::int,
+      $5::int,
+      $6::int,
+      $7::int,
+      $8::text,
+      $9::text,
+      $10::timestamptz,
+      $11::timestamptz,
+      NOW(),
+      NOW()
+    )
+    RETURNING *
+  `, [
+    String(payload.title || "").trim(),
+    String(payload.description || ""),
+    String(payload.prize || ""),
+    normalizedPriceCents,
+    Number.isInteger(numberStart) ? numberStart : 0,
+    Number.isInteger(numberEnd) ? numberEnd : 99,
+    Number.isInteger(maxNumbersPerUser) && maxNumbersPerUser > 0 ? maxNumbersPerUser : 1,
+    status,
+    payload.banner_url || null,
+    payload.starts_at || null,
+    payload.ends_at || null,
+  ]);
 
   return rows[0];
 }
@@ -818,59 +1023,74 @@ export async function createPromotionalNumbers(draw_id, number_start, number_end
   const start = Number.parseInt(number_start ?? 0, 10);
   const end = Number.parseInt(number_end ?? 99, 10);
 
-  if (
-    !Number.isInteger(normalizedDrawId) ||
-    !Number.isInteger(start) ||
-    !Number.isInteger(end) ||
-    start < 0 ||
-    end < start ||
-    end > 1000
-  ) {
+  if (!Number.isInteger(normalizedDrawId) || normalizedDrawId <= 0) {
+    const err = new Error("draw_id promocional inválido ao criar números.");
+    err.status = 400;
+    err.code = "invalid_promotional_draw_id";
+    throw err;
+  }
+
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end > 1000) {
     const err = new Error("Intervalo de números promocionais inválido.");
     err.status = 400;
     err.code = "invalid_promotional_number_range";
     throw err;
   }
 
-  const { rows } = await dbQuery(
-    client,
-    `
-      INSERT INTO public.promotional_numbers (
-        draw_id,
-        n,
-        number_value,
-        number,
-        label,
-        status,
-        payment_status,
-        created_at,
-        updated_at
-      )
+  const width = Math.max(2, String(end).length);
+
+  const { rows } = await dbQuery(client, `
+    WITH generated AS (
       SELECT
         $1::bigint AS draw_id,
-        gs.n::int AS n,
-        gs.n::int AS number_value,
-        LPAD(gs.n::text, 2, '0') AS number,
-        LPAD(gs.n::text, 2, '0') AS label,
-        'available' AS status,
-        'pending' AS payment_status,
-        NOW() AS created_at,
-        NOW() AS updated_at
-      FROM generate_series($2::int, $3::int) AS gs(n)
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM public.promotional_numbers pn
-        WHERE pn.draw_id = $1::bigint
-          AND COALESCE(
-            pn.n,
-            pn.number_value,
-            NULLIF(regexp_replace(pn.number::text, '\\D', '', 'g'), '')::int
-          ) = gs.n
-      )
-      RETURNING *
-    `,
-    [normalizedDrawId, start, end]
-  );
+        gs::int AS n,
+        gs::int AS number_value,
+        LPAD(gs::text, $4::int, '0') AS number,
+        LPAD(gs::text, $4::int, '0') AS label,
+        'available'::text AS status,
+        'pending'::text AS payment_status
+      FROM generate_series($2::int, $3::int) AS gs
+    )
+    INSERT INTO public.promotional_numbers (
+      draw_id,
+      n,
+      number_value,
+      number,
+      label,
+      status,
+      payment_status,
+      created_at,
+      updated_at
+    )
+    SELECT
+      g.draw_id,
+      g.n,
+      g.number_value,
+      g.number,
+      g.label,
+      g.status,
+      g.payment_status,
+      NOW(),
+      NOW()
+    FROM generated g
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM public.promotional_numbers pn
+      WHERE pn.draw_id = g.draw_id
+        AND COALESCE(
+          pn.n,
+          pn.number_value,
+          NULLIF(regexp_replace(pn.number::text, '\\D', '', 'g'), '')::integer
+        ) = g.n
+    )
+    ON CONFLICT DO NOTHING
+    RETURNING *
+  `, [
+    normalizedDrawId,
+    start,
+    end,
+    width,
+  ]);
 
   return rows.map(normalizeNumberRow);
 }

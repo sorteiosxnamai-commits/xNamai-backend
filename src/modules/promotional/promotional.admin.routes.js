@@ -20,7 +20,8 @@ router.use(requireAuth, requireAdmin);
 function handleError(res, err, options = {}) {
   const status = err?.status || err?.statusCode || 500;
   const logTag = options.logTag || "[PROMOTIONAL_ERROR]";
-  console.error(logTag, {
+
+  const debug = {
     code: err?.code,
     message: err?.message,
     detail: err?.detail,
@@ -28,14 +29,19 @@ function handleError(res, err, options = {}) {
     constraint: err?.constraint,
     table: err?.table,
     column: err?.column,
+  };
+
+  console.error(logTag, {
+    ...debug,
     stack: err?.stack,
   });
 
   if (status >= 500) {
     return res.status(500).json({
       ok: false,
-      error: options.friendlyError || "Erro ao carregar campanhas promocionais",
+      error: options.friendlyError || "Erro no módulo promocional",
       code: err?.code || "PROMOTIONAL_ERROR",
+      debug,
     });
   }
 
@@ -43,6 +49,7 @@ function handleError(res, err, options = {}) {
     ok: false,
     error: err?.code || "promotional_admin_error",
     message: err?.message || "Erro no módulo promocional.",
+    debug,
     ...(err?.conflicts && { conflicts: err.conflicts }),
     ...(err?.details && { details: err.details }),
   });
@@ -53,7 +60,10 @@ router.get("/draws", async (_req, res) => {
     const draws = await listAdminDraws();
     return res.json({ ok: true, draws });
   } catch (err) {
-    return handleError(res, err);
+    return handleError(res, err, {
+      logTag: "[PROMOTIONAL_ADMIN_DRAWS_LIST_ERROR]",
+      friendlyError: "Erro ao carregar campanhas promocionais",
+    });
   }
 });
 
@@ -66,7 +76,10 @@ router.post("/draws", async (req, res) => {
       draw,
     });
   } catch (err) {
-    return handleError(res, err);
+    return handleError(res, err, {
+      logTag: "[PROMOTIONAL_ADMIN_DRAWS_CREATE_ERROR]",
+      friendlyError: "Erro ao criar campanha promocional",
+    });
   }
 });
 

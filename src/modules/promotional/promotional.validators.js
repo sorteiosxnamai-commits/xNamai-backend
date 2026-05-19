@@ -1,4 +1,25 @@
 const DRAW_STATUSES = ["draft", "active", "inactive", "closed"];
+const DRAW_STATUS_ALIASES = {
+  draft: "draft",
+  rascunho: "draft",
+
+  active: "active",
+  ativo: "active",
+  published: "active",
+  publicado: "active",
+  open: "active",
+  aberto: "active",
+
+  inactive: "inactive",
+  inativo: "inactive",
+  disabled: "inactive",
+  desativado: "inactive",
+
+  closed: "closed",
+  fechado: "closed",
+  ended: "closed",
+  finalizado: "closed",
+};
 const NUMBER_STATUSES = ["available", "reserved", "sold", "blocked"];
 const RESERVATION_STATUSES = ["pending", "paid", "expired", "cancelled"];
 
@@ -38,12 +59,17 @@ function sanitizeString(value, max = 255) {
 }
 
 export function validatePromotionalStatus(status) {
-  const normalized = String(status || "draft").trim().toLowerCase();
+  const raw = String(status || "draft").trim().toLowerCase();
+  const normalized = DRAW_STATUS_ALIASES[raw] || raw;
+
   if (!DRAW_STATUSES.includes(normalized)) {
     throw validationError("Status de sorteio promocional inválido.", {
+      received: status,
+      normalized,
       allowed: DRAW_STATUSES,
     });
   }
+
   return normalized;
 }
 
