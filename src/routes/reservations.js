@@ -92,19 +92,49 @@ router.post('/', requireAuth, async (req, res) => {
 
     await cleanupExpiredGlobal(client);
 
-    const dr = await client.query(
-      `SELECT id
-         FROM public.draws
-        WHERE status = 'open'
-     ORDER BY id DESC
-        LIMIT 1`
+    const requestedDrawId = Number(
+      req.body?.draw_id ??
+      req.body?.drawId ??
+      req.query?.draw_id ??
+      req.query?.drawId ??
+      0
     );
 
-    if (!dr.rows.length) {
-      return res.status(400).json({ ok: false, error: 'no_open_draw' });
+    let drawResult;
+
+    if (Number.isInteger(requestedDrawId) && requestedDrawId > 0) {
+      drawResult = await client.query(
+        `
+        SELECT id
+          FROM public.draws
+         WHERE id = $1
+           AND LOWER(COALESCE(status, 'open')) IN ('open', 'active', 'ativo')
+         LIMIT 1
+        `,
+        [requestedDrawId]
+      );
+    } else {
+      drawResult = await client.query(
+        `
+        SELECT id
+          FROM public.draws
+         WHERE LOWER(COALESCE(status, 'open')) IN ('open', 'active', 'ativo')
+      ORDER BY id DESC
+         LIMIT 1
+        `
+      );
     }
 
-    const drawId = Number(dr.rows[0].id);
+    if (!drawResult.rows.length) {
+      return res.status(400).json({
+        ok: false,
+        error: 'no_open_draw',
+        message: 'Nenhum sorteio principal aberto encontrado para reserva.',
+        draw_id: requestedDrawId || null,
+      });
+    }
+
+    const drawId = Number(drawResult.rows[0].id);
     const expiresAt = new Date(Date.now() + RESERVATION_TTL_MINUTES * 60 * 1000);
 
     await client.query('BEGIN');

@@ -6,15 +6,15 @@ import { cleanupExpiredMainReservations } from '../services/mainReservationExpir
 
 const router = Router();
 
-// gera duas iniciais a partir do nome; se não tiver nome, usa o usuário do e-mail
 function initialsFromNameOrEmail(name, email) {
   const nm = String(name || '').trim();
   if (nm) {
     const parts = nm.split(/\s+/).filter(Boolean);
     const first = parts[0]?.[0] || '';
-    const last = parts.length > 1 ? parts[parts.length - 1][0] : (parts[0]?.[1] || '');
+    const last = parts.length > 1 ? parts[parts.length - 1][0] : parts[0]?.[1] || '';
     return (first + last).toUpperCase();
   }
+
   const mail = String(email || '').trim();
   const user = mail.includes('@') ? mail.split('@')[0] : mail;
   return user.slice(0, 2).toUpperCase();
@@ -22,44 +22,82 @@ function initialsFromNameOrEmail(name, email) {
 
 /**
  * GET /api/numbers
- * - Pega o draw aberto
- * - Garante o schema do sorteio principal
- * - Expira reservas e números vencidos
- * - Lê a grade direto de public.numbers (fonte da verdade)
- * - Marca como "sold" os números com pagamento aprovado em payments
- *   (inclui owner_initials)
- * - Marca como "reserved" os números com reserved_until > now em public.numbers
- * - Retorna o status final para cada número
+ *
+ * Regras do Sorteio Principal:
+ * - status sold/paid/approved => indisponível.
+ * - status reserved/pending com reserved_until > NOW() => reservado por 30 minutos.
+ * - status reserved/pending com reserved_until NULL e user_id preenchido => reservado permanente pelo admin.
+ * - reserved_until vencido => volta para available pela limpeza.
+ *
+ * Aceita draw_id opcional:
+ *   /api/numbers?draw_id=10
+ *
+ * Se não vier draw_id, usa o sorteio aberto mais recente, preservando compatibilidade.
  */
-router.get('/', async (_req, res) => {
+router.get('/', async (req, res) => {
   try {
-    const dr = await query(
-      `SELECT id FROM draws WHERE status = 'open' ORDER BY id DESC LIMIT 1`
-    );
-    if (!dr.rows.length) return res.json({ drawId: null, numbers: [] });
-    const drawId = dr.rows[0].id;
-
     await ensureMainRaffleCompat();
+
+    const requestedDrawId = Number(req.query.draw_id || req.query.drawId || 0);
+
+    let drawId = null;
+
+    if (Number.isInteger(requestedDrawId) && requestedDrawId > 0) {
+      const dr = await query(
+        `SELECT id FROM public.draws WHERE id = $1 LIMIT 1`,
+        [requestedDrawId]
+      );
+
+      if (!dr.rows.length) {
+        return res.status(404).json({
+          ok: false,
+          error: 'draw_not_found',
+          drawId: requestedDrawId,
+          numbers: [],
+        });
+      }
+
+      drawId = Number(dr.rows[0].id);
+    } else {
+      const dr = await query(
+        `SELECT id FROM public.draws WHERE status = 'open' ORDER BY id DESC LIMIT 1`
+      );
+
+      if (!dr.rows.length) {
+        return res.json({
+          ok: true,
+          drawId: null,
+          draw_id: null,
+          numbers: [],
+        });
+      }
+
+      drawId = Number(dr.rows[0].id);
+    }
+
     await cleanupExpiredMainReservations(null, drawId);
 
     const pays = await query(
       `
       SELECT
-        num.n::int       AS n,
-        u.name           AS owner_name,
-        u.email          AS owner_email
-      FROM payments p
-      LEFT JOIN users u ON u.id = p.user_id
-      CROSS JOIN LATERAL unnest(p.numbers) AS num(n)
+        num.n::int AS n,
+        u.name AS owner_name,
+        u.email AS owner_email
+      FROM public.payments p
+      LEFT JOIN public.users u ON u.id = p.user_id
+      CROSS JOIN LATERAL UNNEST(COALESCE(p.numbers, '{}'::int[])) AS num(n)
       WHERE p.draw_id = $1
-        AND lower(p.status) IN ('approved','paid','pago')
+        AND LOWER(COALESCE(p.status, '')) IN ('approved', 'paid', 'pago')
       `,
       [drawId]
     );
 
     const initialsByN = new Map();
+
     for (const row of pays.rows || []) {
       const num = Number(row.n);
+      if (!Number.isInteger(num)) continue;
+
       const ini = initialsFromNameOrEmail(row.owner_name, row.owner_email);
       initialsByN.set(num, ini);
     }
@@ -71,7 +109,9 @@ router.get('/', async (_req, res) => {
         status,
         payment_status,
         reserved_until,
-        user_id
+        reserved_at,
+        user_id,
+        reservation_id
       FROM public.numbers
       WHERE draw_id = $1
       ORDER BY COALESCE(n::int, number) ASC
@@ -81,47 +121,93 @@ router.get('/', async (_req, res) => {
 
     const now = Date.now();
 
-    const numbers = base.rows.map((row) => {
-      const num = Number(row.n);
-      const status = String(row.status || 'available').toLowerCase();
-      const paymentStatus = String(row.payment_status || 'pending').toLowerCase();
-      const reservedUntil = row.reserved_until
-        ? new Date(row.reserved_until).getTime()
-        : null;
+    const numbers = base.rows
+      .map((row) => {
+        const num = Number(row.n);
+        if (!Number.isInteger(num)) return null;
 
-      if (
-        ['sold', 'paid', 'approved', 'pago', 'vendido', 'aprovado'].includes(status) ||
-        ['paid', 'approved', 'pago'].includes(paymentStatus) ||
-        initialsByN.has(num)
-      ) {
+        const status = String(row.status || 'available').toLowerCase();
+        const paymentStatus = String(row.payment_status || 'pending').toLowerCase();
+
+        const reservedUntilMs = row.reserved_until
+          ? new Date(row.reserved_until).getTime()
+          : null;
+
+        const isPaid =
+          ['sold', 'paid', 'approved', 'pago', 'vendido', 'aprovado'].includes(status) ||
+          ['paid', 'approved', 'pago'].includes(paymentStatus) ||
+          initialsByN.has(num);
+
+        if (isPaid) {
+          return {
+            n: num,
+            number: num,
+            label: String(num).padStart(2, '0'),
+            status: 'sold',
+            payment_status: 'paid',
+            owner_initials: initialsByN.get(num) || null,
+            reserved_until: row.reserved_until || null,
+          };
+        }
+
+        const isReservedStatus = ['reserved', 'pending', 'reservado', 'pendente'].includes(status);
+
+        const isTemporaryReservation =
+          isReservedStatus &&
+          reservedUntilMs &&
+          reservedUntilMs > now;
+
+        const isAdminPermanentReservation =
+          isReservedStatus &&
+          !reservedUntilMs &&
+          row.user_id != null;
+
+        if (isTemporaryReservation || isAdminPermanentReservation) {
+          return {
+            n: num,
+            number: num,
+            label: String(num).padStart(2, '0'),
+            status: 'reserved',
+            payment_status: paymentStatus || 'pending',
+            reserved_until: row.reserved_until || null,
+            permanent: Boolean(isAdminPermanentReservation),
+          };
+        }
+
         return {
           n: num,
-          status: 'sold',
-          owner_initials: initialsByN.get(num) || null,
+          number: num,
+          label: String(num).padStart(2, '0'),
+          status: 'available',
+          payment_status: paymentStatus || 'pending',
+          reserved_until: null,
         };
-      }
+      })
+      .filter(Boolean);
 
-      if (
-        ['reserved', 'pending', 'reservado', 'pendente'].includes(status) &&
-        reservedUntil &&
-        reservedUntil > now
-      ) {
-        return {
-          n: num,
-          status: 'reserved',
-        };
-      }
-
-      return {
-        n: num,
-        status: 'available',
-      };
+    return res.json({
+      ok: true,
+      drawId,
+      draw_id: drawId,
+      numbers,
+    });
+  } catch (err) {
+    console.error('[MAIN_NUMBERS_LIST_ERROR]', {
+      code: err?.code,
+      message: err?.message,
+      detail: err?.detail,
+      hint: err?.hint,
+      stack: err?.stack,
     });
 
-    res.json({ drawId, numbers });
-  } catch (err) {
-    console.error('GET /api/numbers failed', err);
-    res.status(500).json({ error: 'failed_to_list_numbers' });
+    return res.status(500).json({
+      ok: false,
+      error: 'failed_to_list_numbers',
+      message: err?.message || 'Falha ao listar números.',
+      code: err?.code || 'MAIN_NUMBERS_LIST_ERROR',
+      detail: err?.detail || null,
+      hint: err?.hint || null,
+    });
   }
 });
 
