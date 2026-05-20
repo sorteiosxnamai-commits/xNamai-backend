@@ -10,6 +10,11 @@ import {
 } from '../services/mainPaymentSettlement.js';
 import { getBackendPublicUrl } from '../utils/backendUrl.js';
 import {
+  getMercadoPagoAccessToken,
+  getMercadoPagoAuthHeader,
+  logMercadoPagoTokenHealth,
+} from '../services/mercadoPagoAuth.js';
+import {
   buildMercadoPagoPixPayload,
   normalizeCpf,
   parseBrazilPhone,
@@ -18,11 +23,25 @@ import {
 
 const router = Router();
 
-// Aceita MP_ACCESS_TOKEN (backend) ou REACT_APP_MP_ACCESS_TOKEN (Render)
-const mpClient = new MercadoPagoConfig({
-  accessToken: process.env.MP_ACCESS_TOKEN || process.env.REACT_APP_MP_ACCESS_TOKEN,
-});
-const mpPayment = new Payment(mpClient);
+let mpTokenHealthLogged = false;
+
+function ensureMpTokenHealthLogged() {
+  if (mpTokenHealthLogged) return;
+  mpTokenHealthLogged = true;
+  try {
+    logMercadoPagoTokenHealth();
+  } catch (e) {
+    console.warn('[MP_TOKEN_HEALTH] check failed:', e?.message || e);
+  }
+}
+
+function getMpPaymentClient() {
+  ensureMpTokenHealthLogged();
+  const client = new MercadoPagoConfig({
+    accessToken: getMercadoPagoAccessToken(),
+  });
+  return new Payment(client);
+}
 
 const PIX_EXP_MIN = Math.max(
   30,
@@ -187,10 +206,18 @@ async function _reconcilePendingPaymentsCore(minutes) {
 
   for (const { id } of rows) {
     try {
-      const resp = await mpPayment.get({ id: String(id) });
+      const resp = await getMpPaymentClient().get({ id: String(id) });
       const body = resp?.body || resp;
       const rawStatus = body?.status || body?.payment_status || 'pending';
       const approvedNow = isApprovedPaymentStatus(rawStatus);
+      const normalizedStatus = approvedNow ? 'approved' : normalizePaymentStatus(rawStatus);
+
+      console.log('[RECONCILE_MP_STATUS]', {
+        paymentId: id,
+        rawStatus,
+        normalizedStatus,
+        approvedNow,
+      });
 
       if (approvedNow) {
         const settled = await settleApprovedMainPayment(String(id), {
@@ -458,14 +485,12 @@ router.post('/pix', requireAuth, async (req, res) => {
       amount_cents: amountCents,
     });
 
-    const mpAccessToken =
-      process.env.MP_ACCESS_TOKEN || process.env.REACT_APP_MP_ACCESS_TOKEN;
     const idempotencyKey = `xnamai-main-${reservationId}`;
 
     const mpResponse = await fetch('https://api.mercadopago.com/v1/payments', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${mpAccessToken}`,
+        Authorization: getMercadoPagoAuthHeader(),
         'Content-Type': 'application/json',
         'X-Idempotency-Key': idempotencyKey,
       },
@@ -626,7 +651,7 @@ router.post('/pix', requireAuth, async (req, res) => {
 router.get('/:id/status', requireAuth, async (req, res) => {
   try {
     const paymentId = String(req.params.id);
-    const resp = await mpPayment.get({ id: paymentId });
+    const resp = await getMpPaymentClient().get({ id: paymentId });
     const body = resp?.body || resp;
 
     const rawStatus = body?.status || body?.payment_status || 'pending';
@@ -690,7 +715,7 @@ router.post('/webhook', async (req, res) => {
     if (type && type !== 'payment') return res.sendStatus(200);
     if (!paymentId) return res.sendStatus(200);
 
-    const resp = await mpPayment.get({ id: String(paymentId) });
+    const resp = await getMpPaymentClient().get({ id: String(paymentId) });
     const body = resp?.body || resp;
 
     const id = String(body.id || paymentId);
@@ -781,7 +806,7 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
     const paymentId = req.body?.id || req.body?.paymentId;
     if (!paymentId) return res.status(400).json({ error: 'missing_id' });
 
-    const resp = await mpPayment.get({ id: String(paymentId) });
+    const resp = await getMpPaymentClient().get({ id: String(paymentId) });
     const body = resp?.body || resp;
 
     const id = String(body?.id || paymentId);
