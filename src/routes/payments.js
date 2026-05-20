@@ -196,19 +196,36 @@ async function _reconcilePendingPaymentsCore(minutes) {
   const lookbackMin = Math.max(5, Number(minutes || 1440)); // default 24h
   const { rows } = await query(
     `SELECT id
-       FROM payments
-      WHERE lower(status) NOT IN ('approved','paid','pago')
-        AND COALESCE(created_at, now()) >= NOW() - ($1::int || ' minutes')::interval`,
+       FROM public.payments
+      WHERE LOWER(COALESCE(status, '')) IN ('pending','in_process','in_mediation')
+        AND COALESCE(created_at, NOW()) >= NOW() - ($1::int || ' minutes')::interval
+        AND COALESCE(provider, 'mercadopago') = 'mercadopago'
+      ORDER BY created_at DESC
+      LIMIT 50`,
     [lookbackMin]
   );
 
+  const TERMINAL_MP = new Set(['cancelled', 'canceled', 'rejected', 'refunded', 'charged_back']);
+
   let scanned = rows.length, updated = 0, approved = 0, failed = 0;
+
+  async function markRejected(paymentId, statusDetail) {
+    await query(
+      `UPDATE public.payments
+          SET status = 'rejected',
+              status_detail = $2,
+              updated_at = NOW()
+        WHERE id = $1`,
+      [paymentId, statusDetail || 'mp_payment_not_found']
+    );
+    updated++;
+  }
 
   for (const { id } of rows) {
     try {
       const resp = await getMpPaymentClient().get({ id: String(id) });
       const body = resp?.body || resp;
-      const rawStatus = body?.status || body?.payment_status || 'pending';
+      const rawStatus = String(body?.status || body?.payment_status || 'pending').toLowerCase();
       const approvedNow = isApprovedPaymentStatus(rawStatus);
       const normalizedStatus = approvedNow ? 'approved' : normalizePaymentStatus(rawStatus);
 
@@ -225,16 +242,32 @@ async function _reconcilePendingPaymentsCore(minutes) {
         });
         if (settled?.ok) approved++;
         updated++;
+      } else if (TERMINAL_MP.has(rawStatus) || normalizedStatus === 'rejected') {
+        await markRejected(id, body?.status_detail || rawStatus);
       } else {
         await query(
-          `UPDATE payments SET status = $2 WHERE id = $1`,
-          [id, normalizePaymentStatus(rawStatus)]
+          `UPDATE public.payments
+              SET status = $2,
+                  status_detail = COALESCE($3, status_detail),
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [id, normalizedStatus, body?.status_detail || null]
         );
         updated++;
       }
     } catch (e) {
       failed++;
-      console.warn('[reconcile] error for id', id, e?.message || e);
+      const msg = String(e?.message || e || '').toLowerCase();
+      const notFound =
+        e?.status === 404 ||
+        msg.includes('not found') ||
+        msg.includes('payment not found') ||
+        msg.includes('resource not found');
+      if (notFound) {
+        await markRejected(id, 'mp_payment_not_found').catch(() => {});
+      } else {
+        console.warn('[reconcile] error for id', id, e?.message || e);
+      }
     }
   }
 

@@ -1,151 +1,161 @@
 // backend/src/services/purchase_limit.js
 import { query } from "../db.js";
-import { fetchCurrentOpenDraw } from "./mainRaffleCompat.js";
 
-const STATUSES = [
-  "reservado", "pago", "pendente", "aprovado", "vendido", "indisponivel",
-  "confirmado", "processando", "aguardando",
-  "reserved", "paid", "pending", "approved", "sold", "taken",
-  "confirmed", "processing", "awaiting",
-];
+const PURCHASE_LIMIT_SQL = `
+WITH draw_cfg AS (
+  SELECT
+    id AS draw_id,
+    COALESCE(max_numbers_per_user, 5)::int AS max_numbers_per_user
+  FROM public.draws
+  WHERE id = $2
+  LIMIT 1
+),
+paid_numbers AS (
+  SELECT DISTINCT x.n::int AS n
+  FROM public.payments p
+  CROSS JOIN LATERAL unnest(COALESCE(p.numbers, '{}'::int[])) AS x(n)
+  WHERE p.user_id = $1
+    AND p.draw_id = $2
+    AND LOWER(COALESCE(p.status, '')) IN ('approved','paid','pago')
+),
+active_reserved_numbers AS (
+  SELECT DISTINCT x.n::int AS n
+  FROM public.reservations r
+  CROSS JOIN LATERAL unnest(COALESCE(r.numbers, '{}'::int[])) AS x(n)
+  WHERE r.user_id = $1
+    AND r.draw_id = $2
+    AND LOWER(COALESCE(r.status, '')) IN ('active','reserved','pending','reservado','pendente')
+    AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN ('paid','approved','pago','expired','cancelled','canceled')
+    AND COALESCE(r.expires_at, r.created_at + interval '30 minutes') > NOW()
+),
+all_used AS (
+  SELECT n FROM paid_numbers
+  UNION
+  SELECT n FROM active_reserved_numbers
+)
+SELECT
+  d.draw_id,
+  d.max_numbers_per_user,
+  (SELECT COUNT(*)::int FROM paid_numbers) AS paid_count,
+  (SELECT COUNT(*)::int FROM active_reserved_numbers) AS reserved_count,
+  (SELECT COUNT(*)::int FROM all_used) AS used_count,
+  GREATEST(0, d.max_numbers_per_user - (SELECT COUNT(*)::int FROM all_used)) AS remaining
+FROM draw_cfg d
+`;
 
-async function resolveUserColumn(table) {
-  const { rows } = await query(
-    `
-    SELECT column_name
-      FROM information_schema.columns
-     WHERE table_schema = 'public'
-       AND table_name = $1
-    `,
-    [table]
-  );
-  const cols = rows.map((r) => r.column_name);
-  const candidates = [
-    "user_id", "client_id", "customer_id", "account_id",
-    "buyer_id", "participant_id", "owner_id",
-  ];
-  return candidates.find((c) => cols.includes(c)) || null;
-}
-
-async function countViaNumbers(userId, drawId, userCol) {
-  const sql = `
-    SELECT COUNT(*)::int AS cnt
-      FROM numbers
-     WHERE draw_id = $1
-       AND ${userCol} = $2
-       AND LOWER(COALESCE(status, '')) = ANY($3)
-  `;
-  const { rows } = await query(sql, [
-    drawId,
-    userId,
-    STATUSES.map((s) => s.toLowerCase()),
-  ]);
-  return rows?.[0]?.cnt ?? 0;
-}
-
-async function countViaReservations(userId, drawId) {
-  const userCol = await resolveUserColumn("reservations");
-  if (!userCol) return 0;
-
-  const { rows: fkRows } = await query(
-    `
-    SELECT column_name
-      FROM information_schema.columns
-     WHERE table_schema = 'public'
-       AND table_name = 'reservations'
-       AND column_name IN ('number_id', 'numbers_id', 'num_id', 'n_id')
-    `
-  );
-  const numCol = fkRows?.[0]?.column_name || null;
-
-  const { rows: drawRows } = await query(
-    `
-    SELECT column_name
-      FROM information_schema.columns
-     WHERE table_schema = 'public'
-       AND table_name = 'reservations'
-       AND column_name IN ('draw_id', 'sorteio_id')
-    `
-  );
-  const drawCol = drawRows?.[0]?.column_name || null;
-
-  if (numCol) {
-    const sql = `
-      SELECT COUNT(*)::int AS cnt
-        FROM reservations r
-        JOIN numbers n ON n.id = r.${numCol}
-       WHERE n.draw_id = $1
-         AND r.${userCol} = $2
-         AND LOWER(COALESCE(n.status, r.status, '')) = ANY($3)
-    `;
-    const { rows } = await query(sql, [
-      drawId,
-      userId,
-      STATUSES.map((s) => s.toLowerCase()),
-    ]);
-    return rows?.[0]?.cnt ?? 0;
+export async function getPurchaseLimitUsage(userId, drawId) {
+  const uid = Number(userId);
+  const did = Number(drawId);
+  if (!Number.isInteger(uid) || uid <= 0 || !Number.isInteger(did) || did <= 0) {
+    const err = new Error("invalid_purchase_limit_params");
+    err.status = 400;
+    throw err;
   }
 
-  if (drawCol) {
-    const sql = `
-      SELECT COUNT(*)::int AS cnt
-        FROM reservations r
-       WHERE r.${drawCol} = $1
-         AND r.${userCol} = $2
-         AND LOWER(COALESCE(r.status, '')) = ANY($3)
-    `;
-    const { rows } = await query(sql, [
-      drawId,
-      userId,
-      STATUSES.map((s) => s.toLowerCase()),
-    ]);
-    return rows?.[0]?.cnt ?? 0;
+  const { rows } = await query(PURCHASE_LIMIT_SQL, [uid, did]);
+  if (!rows.length) {
+    const err = new Error("draw_not_found");
+    err.status = 404;
+    throw err;
   }
 
-  return 0;
+  const row = rows[0];
+  const max = Number(row.max_numbers_per_user || 5);
+  const used = Number(row.used_count || 0);
+  const remaining = Number(row.remaining ?? Math.max(0, max - used));
+
+  return {
+    draw_id: Number(row.draw_id),
+    max_numbers_per_user: max,
+    paid_count: Number(row.paid_count || 0),
+    reserved_count: Number(row.reserved_count || 0),
+    used_count: used,
+    remaining,
+  };
 }
 
+export async function checkPurchaseLimit(userId, drawId, add = 0) {
+  const usage = await getPurchaseLimitUsage(userId, drawId);
+  const requestedAdd = Math.max(0, Number(add) || 0);
+  const canBuy =
+    requestedAdd <= 0
+      ? usage.remaining > 0
+      : usage.used_count + requestedAdd <= usage.max_numbers_per_user;
+
+  let message = null;
+  if (!canBuy && requestedAdd > 0) {
+    const n = usage.remaining;
+    message =
+      n === 1
+        ? "Você pode selecionar apenas mais 1 número neste sorteio."
+        : n === 0
+          ? `Você já possui ${usage.used_count} de ${usage.max_numbers_per_user} números neste sorteio.`
+          : `Você pode selecionar apenas mais ${n} números neste sorteio.`;
+  }
+
+  return {
+    ok: true,
+    ...usage,
+    can_buy: canBuy,
+    requested_add: requestedAdd > 0 ? requestedAdd : undefined,
+    message,
+    blocked: !canBuy,
+    current: usage.used_count,
+    max: usage.max_numbers_per_user,
+  };
+}
+
+/** @deprecated use getPurchaseLimitUsage */
 export async function getMaxNumbersPerUserForDraw(drawId) {
-  const id = Number(drawId);
-  if (!Number.isInteger(id) || id <= 0) {
-    const current = await fetchCurrentOpenDraw();
-    return Number(current?.max_numbers_per_user || 5);
-  }
-
+  const usage = await getPurchaseLimitUsage(0, drawId).catch(() => null);
+  if (usage) return usage.max_numbers_per_user;
   const { rows } = await query(
-    `
-    SELECT COALESCE(max_numbers_per_user, 5)::int AS max_numbers_per_user
-      FROM public.draws
-     WHERE id = $1
-     LIMIT 1
-    `,
-    [id]
+    `SELECT COALESCE(max_numbers_per_user, 5)::int AS max_numbers_per_user
+       FROM public.draws WHERE id = $1 LIMIT 1`,
+    [Number(drawId)]
   );
-
   return Number(rows[0]?.max_numbers_per_user || 5);
 }
 
+/** @deprecated use getPurchaseLimitUsage */
 export async function getUserCountInDraw(userId, drawId) {
-  const userCol = await resolveUserColumn("numbers");
-  if (userCol) return countViaNumbers(userId, drawId, userCol);
-  return countViaReservations(userId, drawId);
+  const usage = await getPurchaseLimitUsage(userId, drawId);
+  return usage.used_count;
 }
 
+/** @deprecated use checkPurchaseLimit */
 export async function checkUserLimit(userId, drawId, addingCount = 1) {
-  const max = await getMaxNumbersPerUserForDraw(drawId);
-  const current = await getUserCountInDraw(userId, drawId);
-  const blocked = current >= max || current + addingCount > max;
-  return { blocked, current, max, max_numbers_per_user: max };
+  const out = await checkPurchaseLimit(userId, drawId, addingCount);
+  return {
+    blocked: out.blocked,
+    current: out.used_count,
+    max: out.max_numbers_per_user,
+    max_numbers_per_user: out.max_numbers_per_user,
+  };
 }
 
 export async function assertUserUnderLimit(userId, drawId, addingCount = 1) {
-  const { blocked, current, max } = await checkUserLimit(userId, drawId, addingCount);
-  if (blocked) {
-    const err = new Error("max_numbers_reached");
+  const usage = await getPurchaseLimitUsage(userId, drawId);
+  const add = Math.max(1, Number(addingCount) || 1);
+  if (usage.used_count + add > usage.max_numbers_per_user) {
+    const err = new Error("purchase_limit_exceeded");
     err.status = 409;
-    err.code = "max_numbers_reached";
-    err.payload = { current, max, max_numbers_per_user: max };
+    err.code = "purchase_limit_exceeded";
+    const remaining = usage.remaining;
+    err.payload = {
+      ok: false,
+      error: "purchase_limit_exceeded",
+      message:
+        remaining === 1
+          ? `Você já possui ${usage.used_count} de ${usage.max_numbers_per_user} números neste sorteio. É possível selecionar apenas mais 1.`
+          : remaining === 0
+            ? `Você já possui ${usage.used_count} de ${usage.max_numbers_per_user} números neste sorteio.`
+            : `Você já possui ${usage.used_count} de ${usage.max_numbers_per_user} números neste sorteio. É possível selecionar apenas mais ${remaining}.`,
+      used_count: usage.used_count,
+      max_numbers_per_user: usage.max_numbers_per_user,
+      remaining,
+    };
     throw err;
   }
-  return { current, max, max_numbers_per_user: max };
+  return usage;
 }
