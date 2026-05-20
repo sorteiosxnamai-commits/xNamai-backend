@@ -327,22 +327,21 @@ router.post('/pix', requireAuth, async (req, res) => {
       [rs.user_id]
     );
 
-    const user = userResult.rows[0] || {};
-
+    const dbUser = userResult.rows[0] || {};
     const incomingPayer = req.body?.payer || req.body?.customer || {};
 
     const safeUser = {
-      ...user,
+      ...dbUser,
 
       id:
-        user?.id ||
+        dbUser?.id ||
         rs.user_id ||
         req.user?.id ||
         incomingPayer?.id ||
         null,
 
       name:
-        user?.name ||
+        dbUser?.name ||
         rs.user_name ||
         req.user?.name ||
         incomingPayer?.name ||
@@ -350,63 +349,63 @@ router.post('/pix', requireAuth, async (req, res) => {
         'Cliente xNaMai',
 
       email:
-        user?.email ||
+        dbUser?.email ||
         rs.user_email ||
         req.user?.email ||
         incomingPayer?.email ||
         '',
 
       cpf:
-        user?.cpf ||
+        dbUser?.cpf ||
         incomingPayer?.cpf ||
         incomingPayer?.document ||
         incomingPayer?.document_number ||
         '',
 
       phone:
-        user?.phone ||
+        dbUser?.phone ||
         incomingPayer?.phone ||
         incomingPayer?.phone_number ||
         incomingPayer?.buyer_phone ||
         '',
 
       zip_code:
-        user?.zip_code ||
+        dbUser?.zip_code ||
         incomingPayer?.zip_code ||
         incomingPayer?.cep ||
         '',
 
       street:
-        user?.street ||
+        dbUser?.street ||
         incomingPayer?.street ||
         incomingPayer?.street_name ||
         '',
 
       street_number:
-        user?.street_number ||
+        dbUser?.street_number ||
         incomingPayer?.street_number ||
         incomingPayer?.number ||
         '',
 
       neighborhood:
-        user?.neighborhood ||
+        dbUser?.neighborhood ||
         incomingPayer?.neighborhood ||
         incomingPayer?.district ||
         '',
 
       city:
-        user?.city ||
+        dbUser?.city ||
         incomingPayer?.city ||
         '',
 
       state:
-        user?.state ||
+        dbUser?.state ||
         incomingPayer?.state ||
         incomingPayer?.uf ||
         '',
 
       created_at:
-        user?.created_at ||
+        dbUser?.created_at ||
         incomingPayer?.created_at ||
         null,
     };
@@ -444,7 +443,9 @@ router.post('/pix', requireAuth, async (req, res) => {
       cpf_present: Boolean(normalizeCpf(safeUser?.cpf)),
       cpf_masked: maskDocument(safeUser?.cpf),
       phone_present: Boolean(parseBrazilPhone(safeUser?.phone)),
-      address_present: Boolean(safeUser?.city || safeUser?.state || safeUser?.zip_code),
+      zip_present: Boolean(safeUser?.zip_code),
+      street_present: Boolean(safeUser?.street),
+      street_number_present: Boolean(safeUser?.street_number),
       city_present: Boolean(safeUser?.city),
       state_present: Boolean(safeUser?.state),
       numbers_count: Array.isArray(rs.numbers) ? rs.numbers.length : 0,

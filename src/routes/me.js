@@ -35,16 +35,36 @@ function statusLabel(status) {
 
 /**
  * GET /api/me
- * Retorna o usuário logado (id, name, email, is_admin).
+ * Retorna o usuário logado com perfil completo.
  */
 router.get('/', requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
-    // busca no banco pra garantir dados atualizados
+
+    await ensureUserProfileColumns();
+
     const r = await query(
-      'select id, name, email, is_admin from users where id = $1',
+      `
+      SELECT
+        id,
+        name,
+        email,
+        is_admin,
+        cpf,
+        phone,
+        zip_code,
+        street,
+        street_number,
+        neighborhood,
+        city,
+        state
+      FROM public.users
+      WHERE id = $1
+      LIMIT 1
+      `,
       [userId]
     );
+
     const u = r.rows[0] || req.user;
 
     return res.json({
@@ -53,6 +73,15 @@ router.get('/', requireAuth, async (req, res) => {
         name: u.name || null,
         email: u.email || null,
         is_admin: !!u.is_admin,
+
+        cpf: u.cpf || '',
+        phone: u.phone || '',
+        zip_code: u.zip_code || '',
+        street: u.street || '',
+        street_number: u.street_number || '',
+        neighborhood: u.neighborhood || '',
+        city: u.city || '',
+        state: u.state || '',
       },
     });
   } catch (e) {

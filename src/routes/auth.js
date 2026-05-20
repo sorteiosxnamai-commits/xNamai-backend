@@ -76,14 +76,44 @@ async function hydrateUserFromDB(id, email) {
     let r = null;
     if (id) {
       r = await query(
-        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents, city, state
+        `SELECT
+          id,
+          name,
+          email,
+          is_admin,
+          coupon_code,
+          coupon_updated_at,
+          coupon_value_cents,
+          cpf,
+          phone,
+          zip_code,
+          street,
+          street_number,
+          neighborhood,
+          city,
+          state
            FROM users WHERE id=$1 LIMIT 1`,
         [id]
       );
     }
     if ((!r || !r.rows.length) && email) {
       r = await query(
-        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents, city, state
+        `SELECT
+          id,
+          name,
+          email,
+          is_admin,
+          coupon_code,
+          coupon_updated_at,
+          coupon_value_cents,
+          cpf,
+          phone,
+          zip_code,
+          street,
+          street_number,
+          neighborhood,
+          city,
+          state
            FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
         [email]
       );
@@ -99,7 +129,22 @@ async function hydrateUserFromDB(id, email) {
         `UPDATE users
             SET coupon_code=$2, coupon_updated_at=NOW()
           WHERE id=$1
-        RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents, city, state`,
+        RETURNING
+          id,
+          name,
+          email,
+          is_admin,
+          coupon_code,
+          coupon_updated_at,
+          coupon_value_cents,
+          cpf,
+          phone,
+          zip_code,
+          street,
+          street_number,
+          neighborhood,
+          city,
+          state`,
         [u.id, code]
       );
       u = upd.rows[0];
@@ -113,6 +158,13 @@ async function hydrateUserFromDB(id, email) {
       coupon_code: u.coupon_code || null,
       coupon_updated_at: u.coupon_updated_at || null,
       coupon_value_cents: Number(u.coupon_value_cents || 0),
+
+      cpf: u.cpf || '',
+      phone: u.phone || '',
+      zip_code: u.zip_code || '',
+      street: u.street || '',
+      street_number: u.street_number || '',
+      neighborhood: u.neighborhood || '',
       city: u.city || '',
       state: u.state || '',
     };
