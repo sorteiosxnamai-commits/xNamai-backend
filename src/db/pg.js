@@ -32,22 +32,25 @@ function maskUrl(rawUrl) {
   }
 }
 
-const databaseUrl =
-  cleanUrl(process.env.DATABASE_URL) ||
-  cleanUrl(process.env.POSTGRES_URL) ||
-  cleanUrl(process.env.POSTGRES_PRISMA_URL);
-
-if (!databaseUrl) {
-  throw new Error("[pg] Nenhuma DATABASE_URL/POSTGRES_URL encontrada no .env");
+function resolveDatabaseUrl() {
+  return (
+    cleanUrl(process.env.DATABASE_URL) ||
+    cleanUrl(process.env.POSTGRES_URL) ||
+    cleanUrl(process.env.POSTGRES_PRISMA_URL) ||
+    ""
+  );
 }
-
-// Log seguro (sem senha/URL completa)
-console.log("[pg] usando DATABASE_URL:", maskUrl(databaseUrl));
 
 let pool;
 
 export async function getPool() {
+  const databaseUrl = resolveDatabaseUrl();
+  if (!databaseUrl) {
+    throw new Error("[pg] Nenhuma DATABASE_URL/POSTGRES_URL encontrada no .env");
+  }
+
   if (!pool) {
+    console.log("[pg] usando DATABASE_URL:", maskUrl(databaseUrl));
     pool = new Pool({
       connectionString: databaseUrl,
       ssl: { rejectUnauthorized: false },

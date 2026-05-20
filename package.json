@@ -6,7 +6,7 @@
     "node": "18.x"
   },
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node --trace-uncaught --trace-warnings src/index.js",
     "dev": "node --watch src/index.js",
     "analisar-autopay": "node src/scripts/analisar_recorrencia_autopay.js",
     "migrate": "node src/scripts/run_migration.js"
