@@ -187,10 +187,12 @@ export async function ensureMainRaffleCompat(client = null) {
   }
 }
 
-export async function getTicketPriceCents(client, drawId) {
+export async function getTicketPriceCents(client = null, drawId) {
   await ensureMainRaffleCompat(client);
 
-  const result = await client.query(
+  const q = runner(client);
+
+  const result = await q(
     `
     SELECT COALESCE(ticket_price_cents, price_cents, 5500)::int AS price_cents
       FROM public.draws

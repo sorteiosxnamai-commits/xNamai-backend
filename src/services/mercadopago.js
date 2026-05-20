@@ -1,28 +1,21 @@
 // backend/src/services/mercadopago.js
 // ESM
 import crypto from "node:crypto";
+import {
+  getMercadoPagoAccessToken,
+  getMercadoPagoAuthHeader,
+} from "./mercadoPagoAuth.js";
 
 const MP_BASE =
   (process.env.MP_BASE_URL && process.env.MP_BASE_URL.replace(/\/+$/, "")) ||
   "https://api.mercadopago.com";
 
-// Busca o token sempre que precisar (permite trocar env e redeploy sem cache em const)
 function getAccessToken() {
-  return (
-    process.env.MERCADOPAGO_ACCESS_TOKEN ||
-    process.env.MERCADO_PAGO_ACCESS_TOKEN ||
-    process.env.MP_ACCESS_TOKEN ||
-    process.env.REACT_APP_MP_ACCESS_TOKEN || // fallback (não recomendado)
-    ""
-  );
+  return getMercadoPagoAccessToken();
 }
 
 function ensureToken() {
-  if (!getAccessToken()) {
-    throw new Error(
-      "MP_ACCESS_TOKEN/MERCADOPAGO_ACCESS_TOKEN não configurado no servidor."
-    );
-  }
+  getMercadoPagoAccessToken();
 }
 
 async function mpFetch(
@@ -42,7 +35,7 @@ async function mpFetch(
     res = await fetch(`${MP_BASE}${path}`, {
       method,
       headers: {
-        Authorization: `Bearer ${getAccessToken()}`,
+        Authorization: getMercadoPagoAuthHeader(),
         "Content-Type": "application/json",
         Accept: "application/json",
         "User-Agent": "newstore-autopay/1.0",
