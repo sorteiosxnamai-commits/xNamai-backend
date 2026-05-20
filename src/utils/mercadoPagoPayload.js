@@ -92,20 +92,40 @@ function buildMercadoPagoPixPayload({
 
   const cpf = normalizeCpf(
     user?.cpf ||
-    reservation?.cpf ||
-    reservation?.buyer_document
+      reservation?.cpf ||
+      reservation?.buyer_document
   );
 
   const phone = parseBrazilPhone(
     user?.phone ||
-    reservation?.phone ||
-    reservation?.buyer_phone
+      reservation?.phone ||
+      reservation?.buyer_phone
   );
 
   const zipCode = normalizeCep(
     user?.zip_code ||
-    reservation?.zip_code
+      reservation?.zip_code
   );
+
+  const streetName = user?.street
+    ? String(user.street).trim().slice(0, 80)
+    : "";
+
+  const streetNumber = user?.street_number
+    ? String(user.street_number).trim().slice(0, 10)
+    : "";
+
+  const neighborhood = user?.neighborhood
+    ? String(user.neighborhood).trim().slice(0, 80)
+    : "";
+
+  const city = user?.city
+    ? String(user.city).trim().slice(0, 80)
+    : "";
+
+  const state = user?.state
+    ? String(user.state).trim().toUpperCase().slice(0, 2)
+    : "";
 
   const payer = {
     email,
@@ -121,16 +141,17 @@ function buildMercadoPagoPixPayload({
   }
 
   if (phone) {
-    payer.phone = phone;
+    payer.phone = {
+      area_code: phone.area_code,
+      number: phone.number,
+    };
   }
 
-  if (zipCode || user?.street || user?.street_number) {
+  if (zipCode || streetName || streetNumber) {
     payer.address = {
       ...(zipCode ? { zip_code: zipCode } : {}),
-      ...(user?.street ? { street_name: String(user.street).slice(0, 80) } : {}),
-      ...(user?.street_number
-        ? { street_number: String(user.street_number).slice(0, 10) }
-        : {}),
+      ...(streetName ? { street_name: streetName } : {}),
+      ...(streetNumber ? { street_number: streetNumber } : {}),
     };
   }
 
@@ -139,6 +160,7 @@ function buildMercadoPagoPixPayload({
     description: `xNaMai Sorteios - número(s) ${numbersLabel}`,
     payment_method_id: "pix",
     payer,
+
     external_reference: String(reservationId),
     notification_url: notificationUrl,
     date_of_expiration: expirationDate,
@@ -156,22 +178,20 @@ function buildMercadoPagoPixPayload({
       payer: {
         first_name,
         last_name,
-        ...(phone ? { phone } : {}),
-        ...(zipCode || user?.street || user?.street_number || user?.city || user?.state
+        ...(phone
+          ? {
+              phone: {
+                area_code: phone.area_code,
+                number: phone.number,
+              },
+            }
+          : {}),
+        ...(zipCode || streetName || streetNumber
           ? {
               address: {
                 ...(zipCode ? { zip_code: zipCode } : {}),
-                ...(user?.street ? { street_name: String(user.street).slice(0, 80) } : {}),
-                ...(user?.street_number
-                  ? { street_number: String(user.street_number).slice(0, 10) }
-                  : {}),
-                ...(user?.neighborhood
-                  ? { neighborhood: String(user.neighborhood).slice(0, 80) }
-                  : {}),
-                ...(user?.city ? { city: String(user.city).slice(0, 80) } : {}),
-                ...(user?.state
-                  ? { federal_unit: String(user.state).toUpperCase().slice(0, 2) }
-                  : {}),
+                ...(streetName ? { street_name: streetName } : {}),
+                ...(streetNumber ? { street_number: streetNumber } : {}),
               },
             }
           : {}),
@@ -186,6 +206,17 @@ function buildMercadoPagoPixPayload({
       reservation_id: reservationId,
       numbers: numbersList,
       numbers_count: numbersList.length,
+
+      customer_name: fullName,
+      customer_email: email,
+      customer_cpf_present: Boolean(cpf),
+      customer_phone_present: Boolean(phone),
+      customer_zip_code: zipCode || null,
+      customer_street: streetName || null,
+      customer_street_number: streetNumber || null,
+      customer_neighborhood: neighborhood || null,
+      customer_city: city || null,
+      customer_state: state || null,
     },
   };
 }

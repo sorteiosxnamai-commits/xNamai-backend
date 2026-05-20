@@ -334,7 +334,12 @@ router.post('/pix', requireAuth, async (req, res) => {
     const safeUser = {
       ...user,
 
-      id: user?.id || rs.user_id || req.user?.id || null,
+      id:
+        user?.id ||
+        rs.user_id ||
+        req.user?.id ||
+        incomingPayer?.id ||
+        null,
 
       name:
         user?.name ||
@@ -342,7 +347,6 @@ router.post('/pix', requireAuth, async (req, res) => {
         req.user?.name ||
         incomingPayer?.name ||
         incomingPayer?.full_name ||
-        incomingPayer?.payerName ||
         'Cliente xNaMai',
 
       email:
@@ -350,8 +354,7 @@ router.post('/pix', requireAuth, async (req, res) => {
         rs.user_email ||
         req.user?.email ||
         incomingPayer?.email ||
-        incomingPayer?.payerEmail ||
-        'comprador@xnamai.com',
+        '',
 
       cpf:
         user?.cpf ||
@@ -407,6 +410,14 @@ router.post('/pix', requireAuth, async (req, res) => {
         incomingPayer?.created_at ||
         null,
     };
+
+    if (!safeUser.email) {
+      return res.status(400).json({
+        ok: false,
+        code: 'missing_email',
+        message: 'Não foi possível gerar o PIX porque o usuário não possui e-mail cadastrado.',
+      });
+    }
 
     const drawResult = await query(
       `SELECT id, status FROM public.draws WHERE id = $1 LIMIT 1`,
@@ -469,7 +480,12 @@ router.post('/pix', requireAuth, async (req, res) => {
       return res.status(400).json({
         ok: false,
         code: 'mercado_pago_payment_rejected',
-        message: 'Pagamento recusado pelo provedor. Confira seus dados cadastrais e tente novamente.',
+        message:
+          mpData?.message ||
+          'Pagamento recusado pelo Mercado Pago. Verifique os detalhes técnicos retornados pelo provedor.',
+        provider_error: mpData?.error || null,
+        provider_status: mpResponse.status,
+        provider_cause: Array.isArray(mpData?.cause) ? mpData.cause : [],
       });
     }
 
