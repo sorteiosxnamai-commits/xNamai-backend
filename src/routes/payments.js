@@ -5,7 +5,6 @@ import { query, ensureUserProfileColumns } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getTicketPriceCents } from '../services/config.js';
 import { creditCouponOnApprovedPayment } from '../services/couponBalance.js';
-import { ensureMainRaffleCompat } from '../services/mainRaffleCompat.js';
 import {
   buildMercadoPagoPixPayload,
   normalizeCpf,
@@ -40,14 +39,18 @@ function isDebugMpEnabled() {
 // Helpers
 // -----------------------------------------------------------------------------
 
-const APPROVED_PAYMENT_STATUSES = new Set(['approved', 'paid', 'pago']);
-
 function normalizePaymentStatus(status) {
-  return String(status || '').trim().toLowerCase();
+  const s = String(status || '').toLowerCase().trim();
+
+  if (['approved', 'paid', 'pago'].includes(s)) return 'approved';
+  if (['rejected', 'cancelled', 'canceled', 'refunded', 'charged_back'].includes(s)) return 'rejected';
+  if (['pending', 'in_process', 'in_mediation'].includes(s)) return 'pending';
+
+  return s || 'pending';
 }
 
 function isApprovedPaymentStatus(status) {
-  return APPROVED_PAYMENT_STATUSES.has(normalizePaymentStatus(status));
+  return normalizePaymentStatus(status) === 'approved';
 }
 
 function normalizeNumbersList(value) {
@@ -169,15 +172,15 @@ async function finalizeDrawIfComplete(drawId) {
  * e marca a reserva (se houver) como 'paid'.
  */
 async function settleApprovedPayment(paymentId, fallbackDrawId = null, fallbackNumbers = []) {
-  await ensureMainRaffleCompat();
+  const pid = String(paymentId || '').trim();
 
-  const cleanPaymentId = String(paymentId || '').trim();
-
-  if (!cleanPaymentId) {
-    console.warn('[SETTLE_APPROVED_PAYMENT_SKIP] missing paymentId');
+  if (!pid) {
     return {
       ok: false,
       reason: 'missing_payment_id',
+      paymentRows: 0,
+      reservationRows: 0,
+      numberRows: 0,
     };
   }
 
@@ -187,115 +190,104 @@ async function settleApprovedPayment(paymentId, fallbackDrawId = null, fallbackN
         id,
         user_id,
         draw_id,
-        numbers,
-        amount_cents,
-        status,
-        coupon_credited
+        numbers
       FROM payments
-      WHERE id = $1
+      WHERE id::text = $1::text
       LIMIT 1
     `,
-    [cleanPaymentId]
+    [pid]
   );
 
   const payment = paymentRes.rows[0] || null;
 
   const drawId = Number(payment?.draw_id || fallbackDrawId || 0);
-  const userId = Number(payment?.user_id || 0);
-  const numbers = normalizeNumbersList(
-    payment?.numbers && normalizeNumbersList(payment.numbers).length
-      ? payment.numbers
-      : fallbackNumbers
-  );
 
-  if (!drawId || !numbers.length) {
+  const dbNumbers = normalizeNumbersList(payment?.numbers);
+  const numbers = dbNumbers.length ? dbNumbers : normalizeNumbersList(fallbackNumbers);
+
+  if (!drawId || numbers.length === 0) {
     console.warn('[SETTLE_APPROVED_PAYMENT_SKIP]', {
-      paymentId: cleanPaymentId,
+      paymentId: pid,
       drawId,
       numbers,
+      reason: 'missing_draw_or_numbers',
     });
 
     return {
       ok: false,
       reason: 'missing_draw_or_numbers',
-      paymentId: cleanPaymentId,
-      drawId,
-      numbers,
+      paymentRows: 0,
+      reservationRows: 0,
+      numberRows: 0,
     };
   }
 
-  await query('BEGIN');
+  const paymentUpdate = await query(
+    `
+      UPDATE payments
+         SET status = 'approved',
+             paid_at = COALESCE(paid_at, NOW())
+       WHERE id::text = $1::text
+       RETURNING id, status, paid_at
+    `,
+    [pid]
+  );
 
-  try {
-    await query(
-      `
-        UPDATE payments
-           SET status = 'approved',
-               paid_at = COALESCE(paid_at, NOW())
-         WHERE id = $1
-      `,
-      [cleanPaymentId]
-    );
+  const reservationLink = await query(
+    `SELECT id FROM reservations WHERE payment_id::text = $1::text LIMIT 1`,
+    [pid]
+  );
+  const linkedReservationId = reservationLink.rows[0]?.id || null;
 
-    await query(
-      `
-        UPDATE numbers
-           SET status = 'sold',
-               payment_status = 'paid',
-               payment_id = $1,
-               reserved_until = NULL,
-               reservation_id = NULL
-         WHERE draw_id = $2
-           AND n = ANY($3::int[])
-      `,
-      [cleanPaymentId, drawId, numbers]
-    );
+  const reservationUpdate = await query(
+    `
+      UPDATE reservations
+         SET status = 'paid',
+             payment_status = 'paid',
+             payment_id = COALESCE(payment_id, $1::text)
+       WHERE payment_id::text = $1::text
+          OR id::text = COALESCE($2::text, '')
+       RETURNING id, status, payment_status
+    `,
+    [pid, linkedReservationId ? String(linkedReservationId) : '']
+  );
 
-    await query(
-      `
-        UPDATE reservations
-           SET status = 'paid',
-               payment_status = 'paid',
-               payment_id = $1
-         WHERE payment_id = $1
-            OR (
-              draw_id = $2
-              AND user_id = $3
-              AND numbers && $4::int[]
-            )
-      `,
-      [cleanPaymentId, drawId, userId || null, numbers]
-    );
+  const numbersUpdate = await query(
+    `
+      UPDATE numbers
+         SET status = 'sold',
+             payment_status = 'paid',
+             payment_id = $1::text,
+             reservation_id = NULL,
+             reserved_until = NULL
+       WHERE draw_id = $2
+         AND (
+           n = ANY($3::int[])
+           OR number = ANY($3::int[])
+         )
+       RETURNING draw_id, n, number, status, payment_status, payment_id
+    `,
+    [pid, drawId, numbers]
+  );
 
-    await query('COMMIT');
+  console.log('[SETTLE_APPROVED_PAYMENT_OK]', {
+    paymentId: pid,
+    drawId,
+    numbers,
+    paymentRows: paymentUpdate.rowCount,
+    reservationRows: reservationUpdate.rowCount,
+    numberRows: numbersUpdate.rowCount,
+  });
 
-    console.log('[SETTLE_APPROVED_PAYMENT_OK]', {
-      paymentId: cleanPaymentId,
-      drawId,
-      userId,
-      numbers,
-    });
-
-    return {
-      ok: true,
-      paymentId: cleanPaymentId,
-      drawId,
-      userId,
-      numbers,
-    };
-  } catch (err) {
-    await query('ROLLBACK');
-
-    console.error('[SETTLE_APPROVED_PAYMENT_ERROR]', {
-      paymentId: cleanPaymentId,
-      drawId,
-      numbers,
-      message: err?.message,
-      code: err?.code,
-    });
-
-    throw err;
-  }
+  return {
+    ok: true,
+    reason: null,
+    paymentRows: paymentUpdate.rowCount,
+    reservationRows: reservationUpdate.rowCount,
+    numberRows: numbersUpdate.rowCount,
+    drawId,
+    numbers,
+  };
 }
 
 /**
@@ -739,34 +731,53 @@ router.post('/pix', requireAuth, async (req, res) => {
  */
 router.get('/:id/status', requireAuth, async (req, res) => {
   try {
-    const { id } = req.params;
-    const resp = await mpPayment.get({ id: String(id) });
+    const paymentId = String(req.params.id);
+    const resp = await mpPayment.get({ id: paymentId });
     const body = resp?.body || resp;
 
-    const rawStatus = body?.status || body?.payment_status || 'pending';
-    const approvedNow = isApprovedPaymentStatus(rawStatus);
+    const providerStatus = body?.status || body?.payment_status || 'pending';
+    const normalizedStatus = normalizePaymentStatus(providerStatus);
 
-    if (approvedNow) {
-      const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
-      if (pr.rows.length) {
-        const p = pr.rows[0];
-        await settleApprovedPayment(String(id), p.draw_id, p.numbers);
-        await creditCouponForApprovedPix(String(id), 'mercadopago_status_check', {
-          runTraceId: `mp.status#${String(id)}`,
-          numbers: p.numbers,
-          draw_id: p.draw_id,
+    if (isApprovedPaymentStatus(normalizedStatus)) {
+      const settled = await settleApprovedPayment(paymentId);
+
+      if (!settled.ok || settled.numberRows <= 0) {
+        console.warn('[PIX_APPROVED_BUT_NOT_SETTLED]', {
+          paymentId,
+          settled,
+        });
+
+        return res.status(409).json({
+          ok: false,
+          status: 'approved',
+          code: 'approved_but_not_settled',
+          message: 'Pagamento aprovado, mas os números ainda não foram consolidados no banco.',
+          settled,
         });
       }
-      return res.json({ id, status: 'approved' });
+
+      return res.json({
+        ok: true,
+        id: paymentId,
+        status: 'approved',
+        payment_status: 'approved',
+        settled: true,
+        numbers_status: 'sold',
+        drawId: settled.drawId,
+        numbers: settled.numbers,
+      });
     }
 
-    const normalizedStatus = normalizePaymentStatus(rawStatus);
     await query(
-      `UPDATE payments SET status = $2 WHERE id = $1`,
-      [String(id), normalizedStatus]
+      `UPDATE payments SET status = $2 WHERE id::text = $1::text`,
+      [paymentId, normalizedStatus]
     );
 
-    return res.json({ id, status: normalizedStatus });
+    return res.json({
+      ok: true,
+      id: paymentId,
+      status: normalizedStatus,
+    });
   } catch (e) {
     console.error('[status] error:', e);
     return res.status(500).json({ error: 'status_failed' });
