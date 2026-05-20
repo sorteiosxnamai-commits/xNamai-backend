@@ -101,13 +101,6 @@ async function ensurePromotionalAdminSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_draws ALTER COLUMN promotional_price_cents SET DEFAULT 5500`);
   await dbQuery(client, `ALTER TABLE public.promotional_draws ALTER COLUMN status SET DEFAULT 'inactive'`);
 
-  await dbQuery(client, `ALTER TABLE public.promotional_draws DROP CONSTRAINT IF EXISTS promotional_draws_status_check`);
-  await dbQuery(client, `
-    ALTER TABLE public.promotional_draws
-    ADD CONSTRAINT promotional_draws_status_check
-    CHECK (LOWER(TRIM(status::text)) IN ('draft', 'active', 'inactive', 'closed', 'published', 'open'))
-  `);
-
   await dbQuery(client, `
     CREATE TABLE IF NOT EXISTS public.promotional_numbers (
       id BIGSERIAL PRIMARY KEY,
@@ -183,20 +176,6 @@ async function ensurePromotionalAdminSchema(client = null) {
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ALTER COLUMN status SET DEFAULT 'available'`);
   await dbQuery(client, `ALTER TABLE public.promotional_numbers ALTER COLUMN payment_status SET DEFAULT 'pending'`);
 
-  await dbQuery(client, `ALTER TABLE public.promotional_numbers DROP CONSTRAINT IF EXISTS promotional_numbers_status_check`);
-  await dbQuery(client, `
-    ALTER TABLE public.promotional_numbers
-    ADD CONSTRAINT promotional_numbers_status_check
-    CHECK (LOWER(TRIM(status::text)) IN ('available', 'reserved', 'pending', 'sold', 'paid', 'approved', 'blocked', 'unavailable'))
-  `);
-
-  await dbQuery(client, `ALTER TABLE public.promotional_numbers DROP CONSTRAINT IF EXISTS promotional_numbers_payment_status_check`);
-  await dbQuery(client, `
-    ALTER TABLE public.promotional_numbers
-    ADD CONSTRAINT promotional_numbers_payment_status_check
-    CHECK (payment_status IS NULL OR LOWER(TRIM(payment_status::text)) IN ('pending', 'paid', 'approved', 'cancelled', 'canceled', 'expired'))
-  `);
-
   await dbQuery(client, `
     CREATE INDEX IF NOT EXISTS idx_promotional_numbers_draw_id
     ON public.promotional_numbers(draw_id)
@@ -267,52 +246,6 @@ async function ensurePromotionalRuntimeConstraints(client = null) {
 
   await dbQuery(client, `
     ALTER TABLE public.promotional_reservations
-    DROP CONSTRAINT IF EXISTS promotional_reservations_status_check
-  `);
-
-  await dbQuery(client, `
-    ALTER TABLE public.promotional_reservations
-    ADD CONSTRAINT promotional_reservations_status_check
-    CHECK (
-      LOWER(TRIM(status)) IN (
-        'reserved',
-        'pending',
-        'paid',
-        'approved',
-        'expired',
-        'cancelled',
-        'canceled',
-        'blocked',
-        'unavailable',
-        'sold'
-      )
-    )
-  `);
-
-  await dbQuery(client, `
-    ALTER TABLE public.promotional_reservations
-    DROP CONSTRAINT IF EXISTS promotional_reservations_payment_status_check
-  `);
-
-  await dbQuery(client, `
-    ALTER TABLE public.promotional_reservations
-    ADD CONSTRAINT promotional_reservations_payment_status_check
-    CHECK (
-      LOWER(TRIM(payment_status)) IN (
-        'pending',
-        'paid',
-        'approved',
-        'expired',
-        'cancelled',
-        'canceled',
-        'failed',
-        'refunded'
-      )
-    )
-  `);
-
-  await dbQuery(client, `
-    ALTER TABLE public.promotional_reservations
     ALTER COLUMN status SET DEFAULT 'reserved'
   `);
 
@@ -349,33 +282,6 @@ async function ensurePromotionalRuntimeConstraints(client = null) {
          ELSE 'available'
        END
   `);
-
-  await dbQuery(client, `
-    ALTER TABLE public.promotional_numbers
-    DROP CONSTRAINT IF EXISTS promotional_numbers_status_check
-  `);
-
-  await dbQuery(client, `
-    ALTER TABLE public.promotional_numbers
-    ADD CONSTRAINT promotional_numbers_status_check
-    CHECK (
-      LOWER(TRIM(status)) IN (
-        'available',
-        'reserved',
-        'sold',
-        'paid',
-        'approved',
-        'blocked',
-        'unavailable'
-      )
-    )
-  `);
-
-  console.log("[PROMOTIONAL_SCHEMA_FIX] runtime constraints ensured", {
-    promotional_reservations_status: true,
-    promotional_reservations_payment_status: true,
-    promotional_numbers_status: true,
-  });
 }
 
 async function ensurePromotionalDrawCompatibility(client = null) {
@@ -493,45 +399,190 @@ async function ensurePromotionalDrawCompatibility(client = null) {
     ALTER COLUMN status SET DEFAULT 'draft'
   `);
 
+  console.log("[PROMOTIONAL_DRAWS_SCHEMA_OK] promotional_draws compatible");
+}
+
+async function ensurePromotionalCheckConstraints(client = null) {
   await dbQuery(client, `
-    DO $$
-    DECLARE
-      r RECORD;
-    BEGIN
-      FOR r IN
-        SELECT c.conname
-          FROM pg_constraint c
-          JOIN pg_class t ON t.oid = c.conrelid
-          JOIN pg_namespace n ON n.oid = t.relnamespace
-         WHERE n.nspname = 'public'
-           AND t.relname = 'promotional_draws'
-           AND c.contype = 'c'
-           AND pg_get_constraintdef(c.oid) ILIKE '%status%'
-      LOOP
-        EXECUTE format(
-          'ALTER TABLE public.promotional_draws DROP CONSTRAINT IF EXISTS %I',
-          r.conname
-        );
-      END LOOP;
-    END $$;
+    UPDATE public.promotional_draws
+       SET status = 'active'
+     WHERE status IS NULL
+        OR TRIM(status) = ''
+  `);
+
+  await dbQuery(client, `
+    UPDATE public.promotional_numbers
+       SET status = 'available'
+     WHERE status IS NULL
+        OR TRIM(status) = ''
+  `);
+
+  await dbQuery(client, `
+    UPDATE public.promotional_numbers
+       SET payment_status = 'pending'
+     WHERE payment_status IS NULL
+        OR TRIM(payment_status) = ''
+  `);
+
+  await dbQuery(client, `
+    UPDATE public.promotional_reservations
+       SET status = 'reserved'
+     WHERE status IS NULL
+        OR TRIM(status) = ''
+  `);
+
+  await dbQuery(client, `
+    UPDATE public.promotional_reservations
+       SET payment_status = 'approved'
+     WHERE source = 'admin'
+       AND (
+         payment_status IS NULL
+         OR TRIM(payment_status) = ''
+         OR LOWER(payment_status) = 'pending'
+       )
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_draws
+    DROP CONSTRAINT IF EXISTS promotional_draws_status_check
   `);
 
   await dbQuery(client, `
     ALTER TABLE public.promotional_draws
     ADD CONSTRAINT promotional_draws_status_check
     CHECK (
-      LOWER(TRIM(status)) IN (
+      status IS NULL
+      OR LOWER(status) IN (
         'draft',
         'active',
         'inactive',
-        'closed',
         'published',
-        'open'
+        'open',
+        'paused',
+        'closed',
+        'archived',
+        'cancelled',
+        'canceled',
+        'ativo',
+        'publicado',
+        'aberto',
+        'pausado',
+        'encerrado',
+        'arquivado',
+        'cancelado'
       )
     )
   `);
 
-  console.log("[PROMOTIONAL_DRAWS_SCHEMA_OK] promotional_draws compatible");
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_numbers
+    DROP CONSTRAINT IF EXISTS promotional_numbers_status_check
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_numbers
+    ADD CONSTRAINT promotional_numbers_status_check
+    CHECK (
+      status IS NULL
+      OR LOWER(status) IN (
+        'available',
+        'reserved',
+        'pending',
+        'sold',
+        'blocked',
+        'unavailable',
+        'paid',
+        'approved',
+        'disponivel',
+        'reservado',
+        'vendido',
+        'bloqueado',
+        'indisponivel'
+      )
+    )
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_numbers
+    DROP CONSTRAINT IF EXISTS promotional_numbers_payment_status_check
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_numbers
+    ADD CONSTRAINT promotional_numbers_payment_status_check
+    CHECK (
+      payment_status IS NULL
+      OR LOWER(payment_status) IN (
+        'pending',
+        'approved',
+        'paid',
+        'pago',
+        'rejected',
+        'cancelled',
+        'canceled',
+        'expired',
+        'refunded',
+        'sem_pagamento'
+      )
+    )
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    DROP CONSTRAINT IF EXISTS promotional_reservations_status_check
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    ADD CONSTRAINT promotional_reservations_status_check
+    CHECK (
+      status IS NULL
+      OR LOWER(status) IN (
+        'pending',
+        'reserved',
+        'approved',
+        'paid',
+        'sold',
+        'cancelled',
+        'canceled',
+        'expired',
+        'blocked',
+        'reservado',
+        'aprovado',
+        'pago',
+        'vendido',
+        'cancelado',
+        'expirado',
+        'bloqueado'
+      )
+    )
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    DROP CONSTRAINT IF EXISTS promotional_reservations_payment_status_check
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_reservations
+    ADD CONSTRAINT promotional_reservations_payment_status_check
+    CHECK (
+      payment_status IS NULL
+      OR LOWER(payment_status) IN (
+        'pending',
+        'approved',
+        'paid',
+        'pago',
+        'rejected',
+        'cancelled',
+        'canceled',
+        'expired',
+        'refunded',
+        'sem_pagamento',
+        'failed'
+      )
+    )
+  `);
 }
 
 export async function ensurePromotionalSchema(client = null) {
@@ -814,6 +865,7 @@ export async function ensurePromotionalSchema(client = null) {
 
   await ensurePromotionalDrawCompatibility(client);
   await ensurePromotionalRuntimeConstraints(client);
+  await ensurePromotionalCheckConstraints(client);
 }
 
 export async function releaseExpiredPromotionalReservations(client = null, drawId = null) {
@@ -987,18 +1039,32 @@ function mapAdminNumberRow(row) {
 }
 
 export async function listActivePromotionalDraws() {
-  await ensurePromotionalSchema();
-  await releaseExpiredPromotionalReservations();
+  try {
+    await ensurePromotionalSchema();
+    await releaseExpiredPromotionalReservations();
 
-  const { rows } = await query(`
-    ${drawSelect()}
-    WHERE LOWER(COALESCE(d.status, 'draft')) IN ('active', 'published', 'open')
-      AND (d.starts_at IS NULL OR d.starts_at <= NOW())
-      AND (d.ends_at IS NULL OR d.ends_at >= NOW())
-    ORDER BY d.created_at DESC NULLS LAST, d.id DESC
-  `);
+    const { rows } = await query(`
+      ${drawSelect()}
+      WHERE LOWER(COALESCE(d.status, 'draft')) IN ('active', 'published', 'open')
+        AND (d.starts_at IS NULL OR d.starts_at <= NOW())
+        AND (d.ends_at IS NULL OR d.ends_at >= NOW())
+      ORDER BY d.created_at DESC NULLS LAST, d.id DESC
+    `);
 
-  return rows;
+    return rows;
+  } catch (err) {
+    console.error("[PROMOTIONAL_SCHEMA_OR_NUMBERS_ERROR]", {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      hint: err?.hint,
+      table: err?.table,
+      column: err?.column,
+      constraint: err?.constraint,
+      stack: err?.stack,
+    });
+    throw err;
+  }
 }
 
 export async function listPromotionalDraws() {
@@ -1040,48 +1106,76 @@ export async function getPromotionalDrawById(id) {
 }
 
 export async function getPromotionalNumbers(draw_id, client = null) {
-  await ensurePromotionalSchema(client);
-  await releaseExpiredPromotionalReservations(client);
-  const { rows } = await dbQuery(client, `
-    SELECT *
-    FROM public.promotional_numbers
-    WHERE draw_id = $1
-    ORDER BY COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) ASC
-  `, [draw_id]);
-  return rows.map(normalizeNumberRow);
+  try {
+    await ensurePromotionalSchema(client);
+    await releaseExpiredPromotionalReservations(client);
+    const { rows } = await dbQuery(client, `
+      SELECT *
+      FROM public.promotional_numbers
+      WHERE draw_id = $1
+      ORDER BY COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) ASC
+    `, [draw_id]);
+    return rows.map(normalizeNumberRow);
+  } catch (err) {
+    console.error("[PROMOTIONAL_SCHEMA_OR_NUMBERS_ERROR]", {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      hint: err?.hint,
+      table: err?.table,
+      column: err?.column,
+      constraint: err?.constraint,
+      stack: err?.stack,
+    });
+    throw err;
+  }
 }
 
 export async function getPromotionalNumbersAdmin(draw_id, client = null) {
-  await ensurePromotionalSchema(client);
-  await releaseExpiredPromotionalReservations(client);
-  const { rows } = await dbQuery(client, `
-    SELECT
-      id,
-      draw_id,
-      COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) AS n,
-      COALESCE(number, LPAD(COALESCE(n, number_value)::text, 2, '0')) AS number,
-      COALESCE(number_value, n, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) AS number_value,
-      label,
-      status,
-      user_id,
-      reservation_id,
-      reserved_by,
-      buyer_name,
-      buyer_email,
-      buyer_phone,
-      payment_status,
-      payment_id,
-      reserved_at,
-      reserved_until,
-      expires_at,
-      sold_at,
-      created_at,
-      updated_at
-    FROM public.promotional_numbers
-    WHERE draw_id = $1
-    ORDER BY COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) ASC
-  `, [draw_id]);
-  return rows.map(mapAdminNumberRow);
+  try {
+    await ensurePromotionalSchema(client);
+    await releaseExpiredPromotionalReservations(client);
+    const { rows } = await dbQuery(client, `
+      SELECT
+        id,
+        draw_id,
+        COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) AS n,
+        COALESCE(number, LPAD(COALESCE(n, number_value)::text, 2, '0')) AS number,
+        COALESCE(number_value, n, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) AS number_value,
+        label,
+        status,
+        user_id,
+        reservation_id,
+        reserved_by,
+        buyer_name,
+        buyer_email,
+        buyer_phone,
+        payment_status,
+        payment_id,
+        reserved_at,
+        reserved_until,
+        expires_at,
+        sold_at,
+        created_at,
+        updated_at
+      FROM public.promotional_numbers
+      WHERE draw_id = $1
+      ORDER BY COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) ASC
+    `, [draw_id]);
+    return rows.map(mapAdminNumberRow);
+  } catch (err) {
+    console.error("[PROMOTIONAL_SCHEMA_OR_NUMBERS_ERROR]", {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      hint: err?.hint,
+      table: err?.table,
+      column: err?.column,
+      constraint: err?.constraint,
+      stack: err?.stack,
+    });
+    throw err;
+  }
 }
 
 export async function createPromotionalDraw(data, client = null) {
