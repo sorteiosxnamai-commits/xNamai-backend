@@ -7,6 +7,17 @@ function runner(client) {
     : (sql, params = []) => query(sql, params);
 }
 
+const ACTIVE_RESERVATION_STATUSES = [
+  "active",
+  "pending",
+  "reserved",
+  "reservado",
+  "pendente",
+];
+
+const PAID_PAYMENT_STATUSES = ["paid", "approved", "pago"];
+const PAID_NUMBER_STATUSES = ["sold", "paid", "approved", "pago", "vendido", "aprovado"];
+
 export async function cleanupExpiredMainReservations(client = null, drawId = null) {
   const q = runner(client);
 
@@ -19,10 +30,10 @@ export async function cleanupExpiredMainReservations(client = null, drawId = nul
   if (drawId !== null && drawId !== undefined && drawId !== "") {
     params.push(Number(drawId));
     drawWhereReservations = `AND draw_id = $1`;
-    drawWhereNumbers = `AND draw_id = $1`;
+    drawWhereNumbers = `AND n.draw_id = $1`;
   }
 
-  await q(
+  const expiredReservationsResult = await q(
     `
     UPDATE public.reservations
        SET status = 'expired',
@@ -31,15 +42,18 @@ export async function cleanupExpiredMainReservations(client = null, drawId = nul
      WHERE expires_at IS NOT NULL
        AND expires_at <= NOW()
        ${drawWhereReservations}
-       AND LOWER(COALESCE(status, '')) IN ('active', 'pending', 'reserved', 'reservado', 'pendente')
-       AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'approved', 'pago')
+       AND LOWER(COALESCE(status, '')) IN (${ACTIVE_RESERVATION_STATUSES.map((s) => `'${s}'`).join(", ")})
+       AND LOWER(COALESCE(payment_status, 'pending')) NOT IN (${PAID_PAYMENT_STATUSES.map((s) => `'${s}'`).join(", ")})
+     RETURNING id, reservation_group_id, draw_id
     `,
     params
   );
 
-  await q(
+  const expiredReservations = Number(expiredReservationsResult.rowCount || 0);
+
+  const releasedNumbersResult = await q(
     `
-    UPDATE public.numbers
+    UPDATE public.numbers n
        SET status = 'available',
            reservation_id = NULL,
            user_id = NULL,
@@ -48,14 +62,48 @@ export async function cleanupExpiredMainReservations(client = null, drawId = nul
            reserved_at = NULL,
            reserved_until = NULL,
            updated_at = NOW()
-     WHERE reserved_until IS NOT NULL
-       AND reserved_until <= NOW()
+     WHERE (
+       (n.reserved_until IS NOT NULL AND n.reserved_until <= NOW())
+       OR EXISTS (
+         SELECT 1
+           FROM public.reservations r
+          WHERE r.expires_at IS NOT NULL
+            AND r.expires_at <= NOW()
+            ${drawWhereReservations.replace(/draw_id/g, "r.draw_id")}
+            AND LOWER(COALESCE(r.status, '')) = 'expired'
+            AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN (${PAID_PAYMENT_STATUSES.map((s) => `'${s}'`).join(", ")})
+            AND (
+              n.reservation_id::text = r.id::text
+              OR n.reservation_id::text = r.reservation_group_id::text
+              OR COALESCE(n.n::int, n.number) = ANY(COALESCE(r.numbers, '{}'::int[]))
+            )
+       )
+     )
        ${drawWhereNumbers}
-       AND LOWER(COALESCE(status, '')) IN ('reserved', 'pending', 'reservado', 'pendente')
-       AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'approved', 'pago')
+       AND LOWER(COALESCE(n.status, '')) NOT IN (${PAID_NUMBER_STATUSES.map((s) => `'${s}'`).join(", ")})
+       AND LOWER(COALESCE(n.payment_status, 'pending')) NOT IN (${PAID_PAYMENT_STATUSES.map((s) => `'${s}'`).join(", ")})
+     RETURNING COALESCE(n.n::int, n.number) AS num, n.draw_id
     `,
     params
   );
+
+  const releasedNumbers = Number(releasedNumbersResult.rowCount || 0);
+  const logDrawId =
+    drawId != null && drawId !== ""
+      ? Number(drawId)
+      : releasedNumbersResult.rows?.[0]?.draw_id ??
+        expiredReservationsResult.rows?.[0]?.draw_id ??
+        null;
+
+  if (expiredReservations > 0 || releasedNumbers > 0) {
+    console.log("[MAIN_RESERVATION_EXPIRED_CLEANUP]", {
+      drawId: logDrawId,
+      expiredReservations,
+      releasedNumbers,
+    });
+  }
+
+  return { expiredReservations, releasedNumbers, drawId: logDrawId };
 }
 
 export async function ensureMainNumbersExist(client, drawId, nums) {

@@ -3,9 +3,11 @@ import { Router } from 'express';
 import { MercadoPagoConfig, Payment } from 'mercadopago';
 import { query, ensureUserProfileColumns } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
-import { getTicketPriceCents } from '../services/config.js';
-import { creditCouponOnApprovedPayment } from '../services/couponBalance.js';
-import { ensureMainRaffleCompat } from '../services/mainRaffleCompat.js';
+import { ensureMainRaffleCompat, getTicketPriceCents } from '../services/mainRaffleCompat.js';
+import {
+  isApprovedPaymentStatus,
+  settleApprovedMainPayment,
+} from '../services/mainPaymentSettlement.js';
 import {
   buildMercadoPagoPixPayload,
   normalizeCpf,
@@ -40,53 +42,29 @@ function isDebugMpEnabled() {
 // Helpers
 // -----------------------------------------------------------------------------
 
-const APPROVED_PAYMENT_STATUSES = new Set(['approved', 'paid', 'pago']);
-
 function normalizePaymentStatus(status) {
   return String(status || '').trim().toLowerCase();
 }
 
-function isApprovedPaymentStatus(status) {
-  return APPROVED_PAYMENT_STATUSES.has(normalizePaymentStatus(status));
-}
+function resolveBackendPublicUrl(req) {
+  const candidates = [
+    process.env.BACKEND_PUBLIC_URL,
+    process.env.PUBLIC_BACKEND_URL,
+    process.env.PUBLIC_URL,
+  ]
+    .map((v) => (v ? String(v).replace(/\/$/, '') : ''))
+    .filter(Boolean);
 
-function normalizeNumbersList(value) {
-  if (Array.isArray(value)) {
-    return value
-      .map((n) => Number(n))
-      .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99);
+  if (candidates.length) return candidates[0];
+
+  const protoRaw = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  const proto = String(protoRaw).split(',')[0].trim() || 'https';
+  const host = req.get('host');
+  let fallback = `${proto}://${host}`.replace(/\/$/, '');
+  if (process.env.NODE_ENV === 'production' && !fallback.startsWith('https://')) {
+    fallback = fallback.replace(/^http:\/\//, 'https://');
   }
-
-  if (typeof value === 'string') {
-    return value
-      .replace(/[{}[\]\s]/g, '')
-      .split(',')
-      .map((n) => Number(n))
-      .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99);
-  }
-
-  return [];
-}
-
-async function creditCouponForApprovedPix(paymentId, source, meta = {}) {
-  try {
-    const creditResult = await creditCouponOnApprovedPayment(String(paymentId), {
-      channel: 'PIX',
-      source,
-      runTraceId: meta?.runTraceId != null ? String(meta.runTraceId) : null,
-      meta,
-    });
-    console.log('[PIX_APPROVED_CASHBACK]', { paymentId: String(paymentId), source, result: creditResult });
-    return creditResult;
-  } catch (creditErr) {
-    console.warn('[PIX_APPROVED_CASHBACK_WARN]', {
-      paymentId: String(paymentId),
-      source,
-      message: creditErr?.message,
-      code: creditErr?.code,
-    });
-    return null;
-  }
+  return fallback;
 }
 
 /**
@@ -165,140 +143,6 @@ async function finalizeDrawIfComplete(drawId) {
 }
 
 /**
- * Marca números como vendidos para um pagamento aprovado
- * e marca a reserva (se houver) como 'paid'.
- */
-async function settleApprovedPayment(paymentId, fallbackDrawId = null, fallbackNumbers = []) {
-  await ensureMainRaffleCompat();
-
-  const cleanPaymentId = String(paymentId || '').trim();
-
-  if (!cleanPaymentId) {
-    console.warn('[SETTLE_APPROVED_PAYMENT_SKIP] missing paymentId');
-    return {
-      ok: false,
-      reason: 'missing_payment_id',
-    };
-  }
-
-  const paymentRes = await query(
-    `
-      SELECT
-        id,
-        user_id,
-        draw_id,
-        numbers,
-        amount_cents,
-        status,
-        coupon_credited
-      FROM payments
-      WHERE id = $1
-      LIMIT 1
-    `,
-    [cleanPaymentId]
-  );
-
-  const payment = paymentRes.rows[0] || null;
-
-  const drawId = Number(payment?.draw_id || fallbackDrawId || 0);
-  const userId = Number(payment?.user_id || 0);
-  const numbers = normalizeNumbersList(
-    payment?.numbers && normalizeNumbersList(payment.numbers).length
-      ? payment.numbers
-      : fallbackNumbers
-  );
-
-  if (!drawId || !numbers.length) {
-    console.warn('[SETTLE_APPROVED_PAYMENT_SKIP]', {
-      paymentId: cleanPaymentId,
-      drawId,
-      numbers,
-    });
-
-    return {
-      ok: false,
-      reason: 'missing_draw_or_numbers',
-      paymentId: cleanPaymentId,
-      drawId,
-      numbers,
-    };
-  }
-
-  await query('BEGIN');
-
-  try {
-    await query(
-      `
-        UPDATE payments
-           SET status = 'approved',
-               paid_at = COALESCE(paid_at, NOW())
-         WHERE id = $1
-      `,
-      [cleanPaymentId]
-    );
-
-    await query(
-      `
-        UPDATE numbers
-           SET status = 'sold',
-               payment_status = 'paid',
-               payment_id = $1,
-               reserved_until = NULL,
-               reservation_id = NULL
-         WHERE draw_id = $2
-           AND n = ANY($3::int[])
-      `,
-      [cleanPaymentId, drawId, numbers]
-    );
-
-    await query(
-      `
-        UPDATE reservations
-           SET status = 'paid',
-               payment_status = 'paid',
-               payment_id = $1
-         WHERE payment_id = $1
-            OR (
-              draw_id = $2
-              AND user_id = $3
-              AND numbers && $4::int[]
-            )
-      `,
-      [cleanPaymentId, drawId, userId || null, numbers]
-    );
-
-    await query('COMMIT');
-
-    console.log('[SETTLE_APPROVED_PAYMENT_OK]', {
-      paymentId: cleanPaymentId,
-      drawId,
-      userId,
-      numbers,
-    });
-
-    return {
-      ok: true,
-      paymentId: cleanPaymentId,
-      drawId,
-      userId,
-      numbers,
-    };
-  } catch (err) {
-    await query('ROLLBACK');
-
-    console.error('[SETTLE_APPROVED_PAYMENT_ERROR]', {
-      paymentId: cleanPaymentId,
-      drawId,
-      numbers,
-      message: err?.message,
-      code: err?.code,
-    });
-
-    throw err;
-  }
-}
-
-/**
  * Varre pagamentos não aprovados nos últimos N minutos, reconcilia e assenta.
  * Reutilizada pelo endpoint /reconcile e pelo middleware autoReconcile.
  */
@@ -322,17 +166,10 @@ async function _reconcilePendingPaymentsCore(minutes) {
       const approvedNow = isApprovedPaymentStatus(rawStatus);
 
       if (approvedNow) {
-        const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
-        if (pr.rows.length) {
-          const { draw_id, numbers } = pr.rows[0];
-          await settleApprovedPayment(id, draw_id, numbers);
-          await creditCouponForApprovedPix(id, 'reconcile_sync', {
-            draw_id,
-            numbers,
-            unit_cents: 5500,
-          });
-          approved++;
-        }
+        const settled = await settleApprovedMainPayment(String(id), {
+          source: 'reconcile_sync',
+        });
+        if (settled?.ok) approved++;
         updated++;
       } else {
         await query(
@@ -389,13 +226,25 @@ router.post('/pix', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'missing_reservation' });
     }
 
-    // Carrega a reserva + (opcional) usuário
+    await ensureMainRaffleCompat();
+
+    // Carrega a reserva + (opcional) usuário (id ou reservation_group_id)
     const r = await query(
-      `SELECT r.id, r.user_id, r.draw_id, r.numbers, r.status, r.payment_status, r.expires_at,
-              u.email AS user_email, u.name AS user_name
+      `SELECT r.id,
+              r.reservation_group_id,
+              r.user_id,
+              r.draw_id,
+              r.numbers,
+              r.status,
+              r.payment_status,
+              r.expires_at,
+              u.email AS user_email,
+              u.name AS user_name
          FROM reservations r
     LEFT JOIN users u ON u.id = r.user_id
-        WHERE r.id = $1`,
+        WHERE r.id::text = $1::text
+           OR r.reservation_group_id::text = $1::text
+        LIMIT 1`,
       [reservationId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'reservation_not_found' });
@@ -419,24 +268,14 @@ router.post('/pix', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'reservation_expired' });
     }
 
-    // Valor (preço * quantidade) — vindo do banco
-    const priceCents = await getTicketPriceCents();
-    const amountCents = rs.numbers.length * priceCents;
+    const priceCents = await getTicketPriceCents(null, rs.draw_id);
+    const numbers = Array.isArray(rs.numbers) ? rs.numbers.map(Number) : [];
+    const amountCents = numbers.length * priceCents;
     const amount = Number((amountCents / 100).toFixed(2));
 
-    const publicUrl = process.env.PUBLIC_URL ? String(process.env.PUBLIC_URL).replace(/\/$/, '') : '';
-    let baseUrl = publicUrl;
-    if (!baseUrl) {
-      const protoRaw = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-      const proto = String(protoRaw).split(',')[0].trim() || 'https';
-      const host = req.get('host');
-      let fallback = `${proto}://${host}`.replace(/\/$/, '');
-      if (process.env.NODE_ENV === 'production' && !fallback.startsWith('https://')) {
-        fallback = fallback.replace(/^http:\/\//, 'https://');
-      }
-      baseUrl = fallback;
-    }
+    const baseUrl = resolveBackendPublicUrl(req);
     const notificationUrl = `${baseUrl}/api/payments/webhook`;
+    console.log('[MP_WEBHOOK_URL] notification_url=', notificationUrl);
     if (isDebugMpEnabled()) {
       console.log('[mp.pix] notification_url=', notificationUrl);
     }
@@ -645,15 +484,18 @@ router.post('/pix', requireAuth, async (req, res) => {
 
     const drawId = Number(rs.draw_id);
     const userId = Number(rs.user_id || req.user.id);
-    const numbers = rs.numbers;
     const createdStatus = normalizePaymentStatus(status);
 
-    // Persiste o pagamento
     await query(
-      `INSERT INTO payments (id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      `INSERT INTO payments (
+         id, user_id, draw_id, numbers, amount_cents, status,
+         provider, qr_code, qr_code_base64
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,'mercadopago',$7,$8)
        ON CONFLICT (id) DO UPDATE
          SET status = EXCLUDED.status,
+             provider = 'mercadopago',
+             amount_cents = COALESCE(EXCLUDED.amount_cents, payments.amount_cents),
              qr_code = COALESCE(EXCLUDED.qr_code, payments.qr_code),
              qr_code_base64 = COALESCE(EXCLUDED.qr_code_base64, payments.qr_code_base64)`,
       [
@@ -668,17 +510,19 @@ router.post('/pix', requireAuth, async (req, res) => {
       ]
     );
 
-    // Amarra a reserva ao pagamento
     await query(
       `UPDATE reservations
           SET payment_id = $2,
               payment_status = $3,
               amount_cents = COALESCE(amount_cents, $4),
+              total_amount_cents = COALESCE(total_amount_cents, $4),
               pix_qr_code = $5,
               pix_qr_code_base64 = $6,
               pix_copy_paste = $5,
+              pix_ticket_url = $7,
               updated_at = NOW()
-        WHERE id = $1`,
+        WHERE id::text = $1::text
+           OR reservation_group_id::text = $1::text`,
       [
         reservationId,
         String(id),
@@ -686,25 +530,23 @@ router.post('/pix', requireAuth, async (req, res) => {
         amountCents,
         qr_code || null,
         qr_code_base64 || null,
+        ticket_url || null,
       ]
     );
 
+    console.log('[MP_PIX_CREATED]', {
+      paymentId: String(id),
+      reservationId,
+      drawId,
+      numbers,
+      status: createdStatus,
+      notification_url: notificationUrl,
+    });
+
     if (isApprovedPaymentStatus(status)) {
-      console.log('[MP_PIX_CREATED_ALREADY_APPROVED]', {
-        paymentId: id,
-        drawId,
-        userId,
-        numbers,
-      });
-
-      await settleApprovedPayment(String(id), drawId, numbers);
-
-      await creditCouponForApprovedPix(String(id), 'mercadopago_create_immediate_approved', {
+      await settleApprovedMainPayment(String(id), {
+        source: 'mercadopago_create_immediate_approved',
         runTraceId: `mp.create.approved#${String(id)}`,
-        draw_id: drawId,
-        numbers,
-        amount_cents: amountCents,
-        reservation_id: reservationId,
       });
     }
 
@@ -745,28 +587,37 @@ router.get('/:id/status', requireAuth, async (req, res) => {
 
     const rawStatus = body?.status || body?.payment_status || 'pending';
     const approvedNow = isApprovedPaymentStatus(rawStatus);
+    const normalizedStatus = approvedNow ? 'approved' : normalizePaymentStatus(rawStatus);
 
-    if (approvedNow) {
-      const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
-      if (pr.rows.length) {
-        const p = pr.rows[0];
-        await settleApprovedPayment(String(id), p.draw_id, p.numbers);
-        await creditCouponForApprovedPix(String(id), 'mercadopago_status_check', {
-          runTraceId: `mp.status#${String(id)}`,
-          numbers: p.numbers,
-          draw_id: p.draw_id,
-        });
-      }
-      return res.json({ id, status: 'approved' });
-    }
-
-    const normalizedStatus = normalizePaymentStatus(rawStatus);
     await query(
       `UPDATE payments SET status = $2 WHERE id = $1`,
       [String(id), normalizedStatus]
     );
 
-    return res.json({ id, status: normalizedStatus });
+    let settlement = null;
+    if (approvedNow) {
+      settlement = await settleApprovedMainPayment(String(id), {
+        source: 'mercadopago_status_check',
+        runTraceId: `mp.status#${String(id)}`,
+        mpPayment: body,
+      });
+    }
+
+    const pr = await query(
+      `SELECT amount_cents, coupon_amount_cents, coupon_cashback_percent, status
+         FROM payments
+        WHERE id = $1`,
+      [String(id)]
+    );
+    const row = pr.rows[0] || {};
+
+    return res.json({
+      id,
+      status: normalizedStatus,
+      amount_cents: row.amount_cents ?? null,
+      coupon_amount_cents: row.coupon_amount_cents ?? settlement?.creditResult?.delta_cents ?? null,
+      coupon_cashback_percent: row.coupon_cashback_percent ?? null,
+    });
   } catch (e) {
     console.error('[status] error:', e);
     return res.status(500).json({ error: 'status_failed' });
@@ -779,7 +630,11 @@ router.get('/:id/status', requireAuth, async (req, res) => {
  */
 router.post('/webhook', async (req, res) => {
   try {
-    const paymentId = req.body?.data?.id || req.query?.id || req.body?.id;
+    const paymentId =
+      req.body?.data?.id ||
+      req.body?.id ||
+      req.query?.id ||
+      req.query?.['data.id'];
     const type = req.body?.type || req.query?.type;
 
     if (type && type !== 'payment') return res.sendStatus(200);
@@ -788,29 +643,29 @@ router.post('/webhook', async (req, res) => {
     const resp = await mpPayment.get({ id: String(paymentId) });
     const body = resp?.body || resp;
 
-    const id = String(body.id);
+    const id = String(body.id || paymentId);
     const rawStatus = body?.status || body?.payment_status || 'pending';
     const approvedNow = isApprovedPaymentStatus(rawStatus);
 
+    console.log('[MP_WEBHOOK_RECEIVED]', {
+      paymentId: id,
+      rawStatus,
+      external_reference: body?.external_reference || null,
+    });
+
+    await query(
+      `UPDATE payments SET status = $2 WHERE id = $1`,
+      [id, approvedNow ? 'approved' : normalizePaymentStatus(rawStatus)]
+    );
+
     if (approvedNow) {
-      const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
-      if (pr.rows.length) {
-        const p = pr.rows[0];
-        await settleApprovedPayment(id, p.draw_id, p.numbers);
-        await creditCouponForApprovedPix(id, 'mercadopago_webhook', {
-          runTraceId: req.headers['x-request-id'] ? String(req.headers['x-request-id']) : null,
-          numbers: p.numbers,
-          draw_id: p.draw_id,
-        });
-      }
-    } else {
-      await query(
-        `UPDATE payments SET status = $2 WHERE id = $1`,
-        [id, normalizePaymentStatus(rawStatus)]
-      );
+      await settleApprovedMainPayment(id, {
+        source: 'mercadopago_webhook',
+        runTraceId: req.headers['x-request-id'] ? String(req.headers['x-request-id']) : null,
+        mpPayment: body,
+      });
     }
 
-    // Sempre 200 para o MP não reenfileirar indefinidamente
     return res.sendStatus(200);
   } catch (e) {
     console.error('[webhook] error:', e);
@@ -880,27 +735,36 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
     const rawStatus = body?.status || body?.payment_status || 'pending';
     const approvedNow = isApprovedPaymentStatus(rawStatus);
 
-    if (approvedNow) {
-      const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
-      if (pr.rows.length) {
-        const p = pr.rows[0];
-        await settleApprovedPayment(id, p.draw_id, p.numbers);
-        await creditCouponForApprovedPix(id, 'mercadopago_webhook_replay', {
-          runTraceId: req.headers['x-request-id'] ? String(req.headers['x-request-id']) : null,
-          numbers: p.numbers,
-          draw_id: p.draw_id,
-        });
-      }
-      return res.json({ id, status: 'approved' });
-    }
-
-    const normalizedStatus = normalizePaymentStatus(rawStatus);
+    const normalizedStatus = approvedNow ? 'approved' : normalizePaymentStatus(rawStatus);
     await query(
       `UPDATE payments SET status = $2 WHERE id = $1`,
       [id, normalizedStatus]
     );
 
-    return res.json({ id, status: normalizedStatus });
+    let settlement = null;
+    if (approvedNow) {
+      settlement = await settleApprovedMainPayment(id, {
+        source: 'mercadopago_webhook_replay',
+        runTraceId: req.headers['x-request-id'] ? String(req.headers['x-request-id']) : null,
+        mpPayment: body,
+      });
+    }
+
+    const pr = await query(
+      `SELECT amount_cents, coupon_amount_cents, coupon_cashback_percent
+         FROM payments WHERE id = $1`,
+      [id]
+    );
+    const row = pr.rows[0] || {};
+
+    return res.json({
+      id,
+      status: normalizedStatus,
+      settlement,
+      amount_cents: row.amount_cents ?? null,
+      coupon_amount_cents: row.coupon_amount_cents ?? null,
+      coupon_cashback_percent: row.coupon_cashback_percent ?? null,
+    });
   } catch (e) {
     console.error('[webhook/replay] error:', e);
     return res.status(500).json({ error: 'replay_failed' });

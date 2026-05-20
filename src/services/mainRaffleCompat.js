@@ -53,11 +53,29 @@ export async function ensureMainRaffleCompat(client = null) {
   if (drawsExists) {
     await q(`ALTER TABLE public.draws ADD COLUMN IF NOT EXISTS price_cents INTEGER NOT NULL DEFAULT 5500`);
     await q(`ALTER TABLE public.draws ADD COLUMN IF NOT EXISTS ticket_price_cents INTEGER`);
+    await q(`ALTER TABLE public.draws ADD COLUMN IF NOT EXISTS cashback_percent INTEGER NOT NULL DEFAULT 100`);
     await q(`
       UPDATE public.draws
          SET ticket_price_cents = COALESCE(ticket_price_cents, price_cents, 5500),
-             price_cents = COALESCE(price_cents, ticket_price_cents, 5500)
+             price_cents = COALESCE(price_cents, ticket_price_cents, 5500),
+             cashback_percent = COALESCE(cashback_percent, 100)
     `);
+  }
+
+  const paymentsExists = await tableExists("payments", client);
+  if (paymentsExists) {
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'mercadopago'`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS coupon_credited BOOLEAN NOT NULL DEFAULT FALSE`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS coupon_credited_at TIMESTAMPTZ NULL`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS coupon_cashback_percent INTEGER NULL`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS coupon_amount_cents INTEGER NULL`);
+  }
+
+  const couponHistoryExists = await tableExists("coupon_balance_history", client);
+  if (couponHistoryExists) {
+    await q(`ALTER TABLE public.coupon_balance_history ADD COLUMN IF NOT EXISTS gross_amount_cents INTEGER NULL`);
+    await q(`ALTER TABLE public.coupon_balance_history ADD COLUMN IF NOT EXISTS cashback_percent INTEGER NULL`);
+    await q(`ALTER TABLE public.coupon_balance_history ADD COLUMN IF NOT EXISTS cashback_amount_cents INTEGER NULL`);
   }
 
   const numbersExists = await tableExists("numbers", client);

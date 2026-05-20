@@ -11,8 +11,12 @@ import {
   cleanupExpiredMainReservations,
   ensureMainNumbersExist,
 } from '../services/mainReservationExpiry.js';
-import { getTicketPriceCents } from '../services/config.js';
+import { getTicketPriceCents } from '../services/mainRaffleCompat.js';
 import { mpCreatePixPayment } from '../services/mercadopago.js';
+import {
+  isApprovedPaymentStatus,
+  settleApprovedMainPayment,
+} from '../services/mainPaymentSettlement.js';
 
 const router = Router();
 const RESERVATION_TTL_MINUTES = 30;
@@ -479,7 +483,7 @@ router.post('/:reservationId/pix', requireAuth, async (req, res) => {
       });
     }
 
-    const priceCents = await getTicketPriceCents();
+    const priceCents = await getTicketPriceCents(null, reservation.draw_id);
     const numbers = Array.isArray(reservation.numbers) ? reservation.numbers.map(Number) : [];
     const amountCents = numbers.length * priceCents;
 
@@ -501,10 +505,14 @@ router.post('/:reservationId/pix', requireAuth, async (req, res) => {
     });
 
     await query(
-      `INSERT INTO payments (id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      `INSERT INTO payments (
+         id, user_id, draw_id, numbers, amount_cents, status,
+         provider, qr_code, qr_code_base64
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,'mercadopago',$7,$8)
        ON CONFLICT (id) DO UPDATE
          SET status = EXCLUDED.status,
+             provider = 'mercadopago',
              qr_code = COALESCE(EXCLUDED.qr_code, payments.qr_code),
              qr_code_base64 = COALESCE(EXCLUDED.qr_code_base64, payments.qr_code_base64)`,
       [
@@ -519,17 +527,45 @@ router.post('/:reservationId/pix', requireAuth, async (req, res) => {
       ]
     );
 
+    const pixPaid = isApprovedPaymentStatus(pix.status);
+
     await query(
       `UPDATE reservations
           SET payment_id = $2,
-              payment_status = 'pending',
-              pix_qr_code = $3,
-              pix_qr_code_base64 = $4,
-              pix_copy_paste = $3,
+              payment_status = $3,
+              amount_cents = COALESCE(amount_cents, $4),
+              total_amount_cents = COALESCE(total_amount_cents, $4),
+              pix_qr_code = $5,
+              pix_qr_code_base64 = $6,
+              pix_copy_paste = $5,
+              pix_ticket_url = $7,
               updated_at = NOW()
-        WHERE id = $1`,
-      [reservationId, pix.payment_id, pix.qr_code || null, pix.qr_code_base64 || null]
+        WHERE id::text = $1::text
+           OR reservation_group_id::text = $1::text`,
+      [
+        reservationId,
+        pix.payment_id,
+        pixPaid ? 'paid' : 'pending',
+        amountCents,
+        pix.qr_code || null,
+        pix.qr_code_base64 || null,
+        pix.ticket_url || null,
+      ]
     );
+
+    console.log('[MP_PIX_CREATED]', {
+      paymentId: pix.payment_id,
+      reservationId,
+      drawId: reservation.draw_id,
+      numbers,
+      status: pix.status,
+    });
+
+    if (pixPaid) {
+      await settleApprovedMainPayment(String(pix.payment_id), {
+        source: 'reservations_pix_immediate_approved',
+      });
+    }
 
     return res.json({
       ok: true,

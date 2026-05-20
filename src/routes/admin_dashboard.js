@@ -71,6 +71,17 @@ async function ensureAdminSchema() {
   await query(`ALTER TABLE draws ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ DEFAULT NOW()`);
   await query(`ALTER TABLE draws ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ`);
   await query(`ALTER TABLE draws ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+  await query(`ALTER TABLE draws ADD COLUMN IF NOT EXISTS cashback_percent INTEGER NOT NULL DEFAULT 100`);
+
+  await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'mercadopago'`);
+  await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS coupon_credited BOOLEAN NOT NULL DEFAULT FALSE`);
+  await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS coupon_credited_at TIMESTAMPTZ NULL`);
+  await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS coupon_cashback_percent INTEGER NULL`);
+  await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS coupon_amount_cents INTEGER NULL`);
+
+  await query(`ALTER TABLE coupon_balance_history ADD COLUMN IF NOT EXISTS gross_amount_cents INTEGER NULL`);
+  await query(`ALTER TABLE coupon_balance_history ADD COLUMN IF NOT EXISTS cashback_percent INTEGER NULL`);
+  await query(`ALTER TABLE coupon_balance_history ADD COLUMN IF NOT EXISTS cashback_amount_cents INTEGER NULL`);
 
   await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS n SMALLINT`);
   await query(`ALTER TABLE numbers ADD COLUMN IF NOT EXISTS number INTEGER`);

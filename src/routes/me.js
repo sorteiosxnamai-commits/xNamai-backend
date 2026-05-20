@@ -2,7 +2,8 @@
 import { Router } from 'express';
 import { query, ensureUserProfileColumns } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
-import { getTicketPriceCents } from '../services/config.js';
+import { getTicketPriceCents } from '../services/mainRaffleCompat.js';
+import { cleanupExpiredMainReservations } from '../services/mainReservationExpiry.js';
 import {
   ensurePromotionalSchema,
   releaseExpiredPromotionalReservations,
@@ -19,18 +20,34 @@ function formatDay(value) {
 
 function paymentLabel(status) {
   const normalized = String(status || "pending").toLowerCase();
-  if (normalized === "paid") return "PAGO";
-  if (normalized === "cancelled") return "CANCELADO";
+  if (["approved", "paid", "pago"].includes(normalized)) return "PAGO";
+  if (["pending", "reserved"].includes(normalized)) return "PENDENTE";
   if (normalized === "expired") return "EXPIRADO";
+  if (["cancelled", "canceled"].includes(normalized)) return "CANCELADO";
   return "PENDENTE";
 }
 
 function statusLabel(status) {
   const normalized = String(status || "reserved").toLowerCase();
+  if (["paid", "approved", "pago"].includes(normalized)) return "PAGO";
+  if (normalized === "expired") return "EXPIRADO";
+  if (["cancelled", "canceled"].includes(normalized)) return "CANCELADO";
   if (normalized === "sorted") return "SORTEADO";
-  if (normalized === "cancelled") return "CANCELADO";
-  if (normalized === "paid") return "PAGO";
   return "ABERTO";
+}
+
+function derivePaymentStatus(row) {
+  const paymentStatus = String(row.p_status || "").toLowerCase();
+  if (["approved", "paid", "pago"].includes(paymentStatus)) return "paid";
+
+  const reservationPayment = String(row.payment_status || "pending").toLowerCase();
+  if (["paid", "approved", "pago"].includes(reservationPayment)) return "paid";
+
+  if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {
+    return "expired";
+  }
+
+  return "pending";
 }
 
 /**
@@ -98,38 +115,70 @@ router.get('/reservations', requireAuth, async (req, res) => {
     console.log("[ACCOUNT_RESERVATIONS]", { userId: req.user?.id });
     await ensurePromotionalSchema();
     await releaseExpiredPromotionalReservations();
+    await cleanupExpiredMainReservations();
+
     const userId = req.user.id;
     const r = await query(
-      `select id, draw_id, numbers, status, payment_status, amount_cents, created_at, expires_at
-         from reservations
-        where user_id = $1
-        order by created_at desc`,
+      `
+      SELECT
+        r.id,
+        r.reservation_group_id,
+        r.draw_id,
+        r.numbers,
+        r.status,
+        r.payment_status,
+        r.amount_cents,
+        r.created_at,
+        r.expires_at,
+        r.payment_id,
+        p.status AS p_status
+      FROM public.reservations r
+      LEFT JOIN public.payments p ON p.id = r.payment_id
+      WHERE r.user_id = $1
+      ORDER BY r.created_at DESC
+      `,
       [userId]
     );
 
-    const priceCents = await getTicketPriceCents();
-    const normalItems = r.rows.map(row => ({
-      type: "normal",
-      id: row.id,
-      reservation_id: row.id,
-      draw_id: row.draw_id,
-      draw_title: "Sorteio Principal",
-      numbers: row.numbers,
-      numbers_label: (Array.isArray(row.numbers) ? row.numbers : [])
-        .map((n) => String(n).padStart(2, "0"))
-        .join(", "),
-      amount_cents: Number(row.amount_cents || 0) || (Array.isArray(row.numbers) ? row.numbers.length : 0) * priceCents,
-      status: row.status,
-      status_label: statusLabel(row.status),
-      payment_status: row.payment_status || "pending",
-      payment_label: paymentLabel(row.payment_status),
-      can_pay:
-        String(row.payment_status || "pending").toLowerCase() === "pending" &&
-        !["cancelled", "expired"].includes(String(row.status || "").toLowerCase()),
-      created_at: row.created_at,
-      day: formatDay(row.created_at),
-      expires_at: row.expires_at
-    }));
+    const normalItems = await Promise.all(
+      r.rows.map(async (row) => {
+      const paymentStatus = derivePaymentStatus(row);
+      const reservationPublicId = row.reservation_group_id
+        ? String(row.reservation_group_id)
+        : String(row.id);
+      const unitPrice = row.draw_id
+        ? await getTicketPriceCents(null, row.draw_id)
+        : 5500;
+
+      return {
+        type: "normal",
+        id: reservationPublicId,
+        reservation_id: reservationPublicId,
+        raw_id: String(row.id),
+        draw_id: row.draw_id,
+        draw_title: "Sorteio Principal",
+        numbers: row.numbers,
+        numbers_label: (Array.isArray(row.numbers) ? row.numbers : [])
+          .map((n) => String(n).padStart(2, "0"))
+          .join(", "),
+        amount_cents:
+          Number(row.amount_cents || 0) ||
+          (Array.isArray(row.numbers) ? row.numbers.length : 0) * unitPrice,
+        status: row.status,
+        status_label: statusLabel(row.status),
+        payment_status: paymentStatus,
+        payment_label: paymentLabel(paymentStatus),
+        can_pay:
+          paymentStatus === "pending" &&
+          !["cancelled", "canceled", "expired"].includes(
+            String(row.status || "").toLowerCase()
+          ),
+        created_at: row.created_at,
+        day: formatDay(row.created_at),
+        expires_at: row.expires_at,
+      };
+    })
+    );
 
     let promotionalItems = [];
     try {

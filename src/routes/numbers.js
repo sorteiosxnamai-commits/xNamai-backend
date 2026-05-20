@@ -77,6 +77,24 @@ router.get('/', async (req, res) => {
 
     await cleanupExpiredMainReservations(null, drawId);
 
+    const expiredReservationLinks = await query(
+      `
+      SELECT id::text AS id, reservation_group_id::text AS group_id
+        FROM public.reservations
+       WHERE draw_id = $1
+         AND expires_at IS NOT NULL
+         AND expires_at <= NOW()
+         AND LOWER(COALESCE(status, '')) IN ('expired', 'cancelled', 'canceled')
+      `,
+      [drawId]
+    );
+
+    const expiredLinkIds = new Set();
+    for (const row of expiredReservationLinks.rows || []) {
+      if (row.id) expiredLinkIds.add(String(row.id));
+      if (row.group_id) expiredLinkIds.add(String(row.group_id));
+    }
+
     const pays = await query(
       `
       SELECT
@@ -157,10 +175,19 @@ router.get('/', async (req, res) => {
           reservedUntilMs &&
           reservedUntilMs > now;
 
+        const reservationLink = row.reservation_id
+          ? String(row.reservation_id)
+          : null;
+
+        const linkedToExpiredReservation =
+          reservationLink && expiredLinkIds.has(reservationLink);
+
         const isAdminPermanentReservation =
           isReservedStatus &&
           !reservedUntilMs &&
-          row.user_id != null;
+          row.user_id != null &&
+          !linkedToExpiredReservation &&
+          paymentStatus === 'pending';
 
         if (isTemporaryReservation || isAdminPermanentReservation) {
           return {
