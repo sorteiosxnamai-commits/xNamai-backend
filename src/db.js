@@ -18,4 +18,4 @@ export async function ensureUserProfileColumns() {
   } catch (e) {
     console.warn('[db] ensureUserProfileColumns:', e?.message || e);
   }
-}
+} 
