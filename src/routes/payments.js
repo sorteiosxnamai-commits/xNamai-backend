@@ -327,30 +327,86 @@ router.post('/pix', requireAuth, async (req, res) => {
       [rs.user_id]
     );
 
-    const user = userResult.rows[0];
+    const user = userResult.rows[0] || {};
 
-    if (!user?.email) {
-      return res.status(400).json({
-        ok: false,
-        code: 'missing_required_payer_data',
-        message: 'Complete seu e-mail antes de gerar o PIX.',
-        missing_fields: ['email'],
-      });
-    }
+    const incomingPayer = req.body?.payer || req.body?.customer || {};
 
-    const missingFields = [];
+    const safeUser = {
+      ...user,
 
-    if (!normalizeCpf(user?.cpf)) missingFields.push('cpf');
-    if (!parseBrazilPhone(user?.phone)) missingFields.push('phone');
+      id: user?.id || rs.user_id || req.user?.id || null,
 
-    if (missingFields.length) {
-      return res.status(400).json({
-        ok: false,
-        code: 'missing_required_payer_data',
-        message: 'Complete CPF e telefone antes de gerar o PIX.',
-        missing_fields: missingFields,
-      });
-    }
+      name:
+        user?.name ||
+        rs.user_name ||
+        req.user?.name ||
+        incomingPayer?.name ||
+        incomingPayer?.full_name ||
+        incomingPayer?.payerName ||
+        'Cliente xNaMai',
+
+      email:
+        user?.email ||
+        rs.user_email ||
+        req.user?.email ||
+        incomingPayer?.email ||
+        incomingPayer?.payerEmail ||
+        'comprador@xnamai.com',
+
+      cpf:
+        user?.cpf ||
+        incomingPayer?.cpf ||
+        incomingPayer?.document ||
+        incomingPayer?.document_number ||
+        '',
+
+      phone:
+        user?.phone ||
+        incomingPayer?.phone ||
+        incomingPayer?.phone_number ||
+        incomingPayer?.buyer_phone ||
+        '',
+
+      zip_code:
+        user?.zip_code ||
+        incomingPayer?.zip_code ||
+        incomingPayer?.cep ||
+        '',
+
+      street:
+        user?.street ||
+        incomingPayer?.street ||
+        incomingPayer?.street_name ||
+        '',
+
+      street_number:
+        user?.street_number ||
+        incomingPayer?.street_number ||
+        incomingPayer?.number ||
+        '',
+
+      neighborhood:
+        user?.neighborhood ||
+        incomingPayer?.neighborhood ||
+        incomingPayer?.district ||
+        '',
+
+      city:
+        user?.city ||
+        incomingPayer?.city ||
+        '',
+
+      state:
+        user?.state ||
+        incomingPayer?.state ||
+        incomingPayer?.uf ||
+        '',
+
+      created_at:
+        user?.created_at ||
+        incomingPayer?.created_at ||
+        null,
+    };
 
     const drawResult = await query(
       `SELECT id, status FROM public.draws WHERE id = $1 LIMIT 1`,
@@ -359,7 +415,7 @@ router.post('/pix', requireAuth, async (req, res) => {
     const draw = drawResult.rows[0] || { id: rs.draw_id };
 
     const mpPayload = buildMercadoPagoPixPayload({
-      user,
+      user: safeUser,
       draw,
       reservation: rs,
       numbers: rs.numbers,
@@ -372,12 +428,14 @@ router.post('/pix', requireAuth, async (req, res) => {
 
     console.log('[MP_PIX_PAYLOAD_SUMMARY]', {
       reservation_id: reservationId,
-      user_id: user?.id,
-      email_present: Boolean(user?.email),
-      cpf_present: Boolean(user?.cpf),
-      cpf_masked: maskDocument(user?.cpf),
-      phone_present: Boolean(user?.phone),
-      address_present: Boolean(user?.zip_code && user?.street),
+      user_id: safeUser?.id,
+      email_present: Boolean(safeUser?.email),
+      cpf_present: Boolean(normalizeCpf(safeUser?.cpf)),
+      cpf_masked: maskDocument(safeUser?.cpf),
+      phone_present: Boolean(parseBrazilPhone(safeUser?.phone)),
+      address_present: Boolean(safeUser?.city || safeUser?.state || safeUser?.zip_code),
+      city_present: Boolean(safeUser?.city),
+      state_present: Boolean(safeUser?.state),
       numbers_count: Array.isArray(rs.numbers) ? rs.numbers.length : 0,
       amount_cents: amountCents,
     });
@@ -402,7 +460,7 @@ router.post('/pix', requireAuth, async (req, res) => {
       console.error('[MP_PIX_CREATE_ERROR]', {
         status: mpResponse.status,
         reservation_id: reservationId,
-        user_id: user?.id,
+        user_id: safeUser?.id,
         message: mpData?.message,
         error: mpData?.error,
         cause: mpData?.cause,
