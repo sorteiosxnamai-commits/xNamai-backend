@@ -1066,129 +1066,30 @@ router.get("/:drawId/numbers", async (req, res) => {
   }
 });
 
-async function checkoutHandler(req, res) {
-  const drawId = toInt(req.params.drawId);
-  const numbers = normalizeNumbers(req.body);
+function respondPublicPurchaseDisabled(res) {
+  return res.status(403).json({
+    ok: false,
+    code: "promotional_public_purchase_disabled",
+    error: "promotional_public_purchase_disabled",
+    message:
+      "Este sorteio promocional não permite compra pelo site. O número deve ser atribuído pelo administrador.",
+  });
+}
 
-  if (!drawId) {
-    return res.status(400).json({
-      ok: false,
-      message: "ID do sorteio promocional inválido.",
-    });
-  }
-
-  if (!numbers.length) {
-    return res.status(400).json({
-      ok: false,
-      message: "Selecione pelo menos um número promocional.",
-    });
-  }
-
-  const pool = await getPool();
-  const client = await pool.connect();
-
-  let reservation;
-
-  try {
-    res.set("X-XNAMAI-PROMOTIONAL-DIRECT", SOURCE);
-
-    await client.query("BEGIN");
-    await ensurePromotionalDirectSchema(client);
-
-    const draw = mapDraw(await getDraw(client, drawId));
-
-    if (!draw) {
-      const err = new Error("Sorteio promocional não encontrado.");
-      err.status = 404;
-      throw err;
-    }
-
-    reservation = await createReservation(client, req, draw, numbers);
-
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    client.release();
-    return sendError(res, err);
-  }
-
-  client.release();
-
-  try {
-    const pix = await attachPix(req, reservation.reservation_id || reservation.id, drawId);
-
-    return res.status(201).json({
-      ok: true,
-      reservation,
-      pix,
-      payment: pix,
-      data: {
-        reservation,
-        pix,
-        payment: pix,
-      },
-      source: SOURCE,
-    });
-  } catch (pixErr) {
-    return res.status(201).json({
-      ok: true,
-      reservation,
-      pix: null,
-      payment: null,
-      pix_error: {
-        message: pixErr?.message || "Reserva criada, mas não foi possível gerar o PIX agora.",
-        code: pixErr?.code || null,
-        detail: pixErr?.detail || null,
-      },
-      source: SOURCE,
-    });
-  }
+async function checkoutHandler(_req, res) {
+  return respondPublicPurchaseDisabled(res);
 }
 
 router.post("/:drawId/checkout", requireAuth, checkoutHandler);
 router.post("/:drawId/reservations", requireAuth, checkoutHandler);
 router.post("/:drawId/reserve", requireAuth, checkoutHandler);
 
-router.post("/:drawId/reservations/:reservationId/pix", requireAuth, async (req, res) => {
-  try {
-    res.set("X-XNAMAI-PROMOTIONAL-DIRECT", SOURCE);
-
-    const pix = await attachPix(req, req.params.reservationId, req.params.drawId);
-
-    return res.json({
-      ok: true,
-      pix,
-      payment: pix,
-      data: {
-        pix,
-        payment: pix,
-      },
-      source: SOURCE,
-    });
-  } catch (err) {
-    return sendError(res, err, "Não foi possível gerar PIX promocional.");
-  }
+router.post("/:drawId/reservations/:reservationId/pix", requireAuth, (req, res) => {
+  return respondPublicPurchaseDisabled(res);
 });
 
-router.post("/reservations/:reservationId/pix", requireAuth, async (req, res) => {
-  try {
-    res.set("X-XNAMAI-PROMOTIONAL-DIRECT", SOURCE);
-
-    const pix = await attachPix(req, req.params.reservationId, null);
-
-    return res.json({
-      ok: true,
-      pix,
-      payment: pix,
-      data: {
-        pix,
-        payment: pix,
-      },
-      source: SOURCE,
-    });
-  } catch (err) {
-    return sendError(res, err, "Não foi possível gerar PIX promocional.");
-  }
+router.post("/reservations/:reservationId/pix", requireAuth, (req, res) => {
+  return respondPublicPurchaseDisabled(res);
 });
 
 export default router;

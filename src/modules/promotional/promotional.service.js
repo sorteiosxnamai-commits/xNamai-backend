@@ -4,8 +4,6 @@ import {
   attachPromotionalPixPayment,
   attachPaymentToPromotionalReservation,
   assignPromotionalNumbersToUser,
-  createPromotionalReservation,
-  countPromotionalNumbersByContact,
   deletePromotionalDraw,
   getPromotionalDrawById,
   getPromotionalNumbers,
@@ -13,6 +11,7 @@ import {
   getPromotionalParticipants,
   getPromotionalReservationForPayment,
   listActivePromotionalDraws,
+  getPromotionalAssignmentForUser as getPromotionalAssignmentForUserRepo,
   listPromotionalParticipationsForUser,
   settlePromotionalPaymentApproved,
   updatePromotionalDraw,
@@ -23,7 +22,6 @@ import {
   validateCreatePromotionalDraw,
   validateNumberStatus,
   validatePromotionalStatus,
-  validateReservationPayload,
   validateUpdatePromotionalDraw,
 } from "./promotional.validators.js";
 
@@ -399,107 +397,16 @@ function formatDay(value) {
   }).format(new Date(value));
 }
 
-export async function reserveNumbers(input = {}, user = null) {
-  const drawId = Number.parseInt(input.drawId ?? input.draw_id, 10);
-  const numbers = (input.numbers || [])
-    .map((value) => Number.parseInt(String(value).trim(), 10))
-    .filter((value) => Number.isInteger(value) && value >= 0 && value <= 99);
-
-  const userId = input.userId != null
-    ? Number.parseInt(input.userId, 10)
-    : user?.id != null
-      ? Number.parseInt(user.id, 10)
-      : null;
-
-  const customer = input.customer || null;
-  const payload = {
-    numbers,
-    ...(customer && typeof customer === "object" ? customer : {}),
-    buyer_email: input.buyer_email || customer?.email || user?.email || "",
-    buyer_name: input.buyer_name || customer?.name || user?.name || user?.nome || "",
-    buyer_phone: input.buyer_phone || customer?.phone || user?.phone || null,
-  };
-
-  const userEmail = String(payload.buyer_email || user?.email || "").trim();
-  const userName = String(
-    payload.buyer_name || user?.name || user?.nome || userEmail
-  ).trim();
-
-  if (!Number.isInteger(drawId) || drawId <= 0) {
-    throw httpError(400, "invalid_promotional_draw", "ID do sorteio promocional inválido.");
-  }
-
-  if (!numbers.length) {
-    throw httpError(400, "no_numbers", "Nenhum número selecionado.");
-  }
-
-  if (!Number.isInteger(userId) || !userEmail) {
-    throw httpError(401, "login_required", "Usuário não autenticado.");
-  }
-
-  const draw = await getPublicDraw(drawId);
-  const data = validateReservationPayload(
-    {
-      ...payload,
-      numbers,
-      name: userName,
-      email: userEmail,
-      phone: payload.buyer_phone || null,
-      buyer_name: userName,
-      buyer_email: userEmail,
-      buyer_phone: payload.buyer_phone || null,
-    },
-    {
-      id: userId,
-      email: userEmail,
-      name: userName,
-    }
+export async function reserveNumbers(_input = {}, _user = null) {
+  throw httpError(
+    403,
+    "promotional_public_purchase_disabled",
+    "Este sorteio promocional não permite reserva pública. O número deve ser atribuído pelo administrador."
   );
+}
 
-  if (data.numbers.length > Number(draw.max_numbers_per_user || 1)) {
-    throw httpError(400, "invalid_number", "Quantidade de números acima do limite permitido.");
-  }
-
-  const alreadyReserved = await countPromotionalNumbersByContact(
-    draw.id,
-    data.email,
-    data.phone,
-    data.user_id
-  );
-  if (alreadyReserved + data.numbers.length > Number(draw.max_numbers_per_user || 1)) {
-    throw httpError(400, "number_unavailable", "Quantidade de números acima do limite por participante.");
-  }
-
-  const outOfRange = data.numbers.filter(
-    (n) => n < Number(draw.number_start) || n > Number(draw.number_end)
-  );
-  if (outOfRange.length) {
-    const err = httpError(400, "invalid_number", "Número fora do intervalo do sorteio promocional.");
-    err.conflicts = outOfRange;
-    throw err;
-  }
-
-  const priceCents = Number(draw.price_cents || 0);
-  const totalCents = data.numbers.length * priceCents;
-
-  if (!Number.isFinite(priceCents) || priceCents <= 0 || totalCents <= 0) {
-    throw httpError(
-      400,
-      "promotional_amount_invalid",
-      "Sorteio promocional sem valor configurado. Defina o valor no admin."
-    );
-  }
-
-  const result = await createPromotionalReservation({
-    drawId,
-    userId,
-    numbers: data.numbers,
-    buyerName: data.name,
-    buyerEmail: data.email,
-    buyerPhone: data.phone,
-    source: "public",
-  });
-  return result;
+export async function getPromotionalAssignmentForUser(drawId, user = null) {
+  return getPromotionalAssignmentForUserRepo(drawId, user);
 }
 
 export async function assignNumbersToUser(draw_id, payload = {}) {
@@ -636,7 +543,13 @@ export async function listMyParticipations(user = null) {
   return rows.map((row) => {
     const numbers = Array.isArray(row.numbers) ? row.numbers.map(Number) : [];
     const priceCents = Number(row.price_cents || 0);
-    const amountCents = Number(row.amount_cents || row.total_cents || 0) || numbers.length * priceCents;
+    const isAdminAssignment =
+      String(row.source || "").toLowerCase() === "admin" ||
+      String(row.payment_status || "").toLowerCase() === "approved";
+    const amountCents = isAdminAssignment
+      ? 0
+      : Number(row.amount_cents || row.total_cents || 0) || numbers.length * priceCents;
+
     return {
       type: "promotional",
       draw_id: Number(row.draw_id),
@@ -645,16 +558,22 @@ export async function listMyParticipations(user = null) {
       numbers,
       numbers_label: numbers.map((n) => String(n).padStart(2, "0")).join(", "),
       day: formatDay(row.created_at),
+      source: row.source || null,
       payment_status: row.payment_status || "pending",
-      payment_label: mapPaymentStatus(row.payment_status),
+      payment_label: isAdminAssignment
+        ? "Sem pagamento necessário"
+        : mapPaymentStatus(row.payment_status),
       status: row.reservation_status || "reserved",
-      status_label: mapReservationStatus(row.reservation_status),
-      can_pay:
-        String(row.payment_status || "pending").toLowerCase() === "pending" &&
-        ["reserved", "pending", "active"].includes(String(row.reservation_status || "reserved").toLowerCase()),
+      status_label: isAdminAssignment
+        ? "Atribuído pelo admin"
+        : mapReservationStatus(row.reservation_status),
+      can_pay: isAdminAssignment
+        ? false
+        : String(row.payment_status || "pending").toLowerCase() === "pending" &&
+          ["reserved", "pending", "active"].includes(String(row.reservation_status || "reserved").toLowerCase()),
       reservation_id: row.reservation_id,
       payment_id: row.payment_id || null,
-      price_cents: priceCents,
+      price_cents: isAdminAssignment ? 0 : priceCents,
       amount_cents: amountCents,
       total_cents: amountCents,
       created_at: row.created_at,
