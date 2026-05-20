@@ -1,6 +1,6 @@
 // src/routes/me.js
 import { Router } from 'express';
-import { query } from '../db.js';
+import { query, ensureUserProfileColumns } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getTicketPriceCents } from '../services/config.js';
 import {
@@ -326,6 +326,110 @@ router.get('/purchase-history', requireAuth, async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: 'purchase_history_failed',
+    });
+  }
+});
+
+/**
+ * PATCH /api/me/profile
+ * Atualiza CPF, telefone e endereço do usuário logado.
+ */
+router.patch('/profile', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user?.id || req.userId;
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        code: 'unauthorized',
+        message: 'Faça login para atualizar seus dados.',
+      });
+    }
+
+    const cleanDigits = (value) => String(value || '').replace(/\D/g, '');
+
+    const cpf = cleanDigits(req.body.cpf);
+    const phone = cleanDigits(req.body.phone);
+    const zipCode = cleanDigits(req.body.zip_code);
+
+    if (cpf && cpf.length !== 11) {
+      return res.status(400).json({
+        ok: false,
+        code: 'invalid_cpf',
+        message: 'CPF inválido.',
+      });
+    }
+
+    if (phone && phone.length < 10) {
+      return res.status(400).json({
+        ok: false,
+        code: 'invalid_phone',
+        message: 'Telefone inválido.',
+      });
+    }
+
+    if (zipCode && zipCode.length !== 8) {
+      return res.status(400).json({
+        ok: false,
+        code: 'invalid_zip_code',
+        message: 'CEP inválido.',
+      });
+    }
+
+    await ensureUserProfileColumns();
+
+    const result = await query(
+      `
+      UPDATE public.users
+         SET cpf = COALESCE(NULLIF($1, ''), cpf),
+             phone = COALESCE(NULLIF($2, ''), phone),
+             zip_code = COALESCE(NULLIF($3, ''), zip_code),
+             street = COALESCE(NULLIF($4, ''), street),
+             street_number = COALESCE(NULLIF($5, ''), street_number),
+             neighborhood = COALESCE(NULLIF($6, ''), neighborhood),
+             city = COALESCE(NULLIF($7, ''), city),
+             state = COALESCE(NULLIF(UPPER($8), ''), state)
+       WHERE id = $9
+       RETURNING
+         id,
+         name,
+         email,
+         phone,
+         zip_code,
+         street,
+         street_number,
+         neighborhood,
+         city,
+         state
+      `,
+      [
+        cpf,
+        phone,
+        zipCode,
+        req.body.street || '',
+        req.body.street_number || '',
+        req.body.neighborhood || '',
+        req.body.city || '',
+        req.body.state || '',
+        userId,
+      ]
+    );
+
+    return res.json({
+      ok: true,
+      user: result.rows[0],
+    });
+  } catch (err) {
+    console.error('[ME_PROFILE_UPDATE_ERROR]', {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+    });
+
+    return res.status(500).json({
+      ok: false,
+      code: 'profile_update_failed',
+      message: 'Não foi possível atualizar seus dados.',
     });
   }
 });

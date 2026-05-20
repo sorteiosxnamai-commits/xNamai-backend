@@ -47,7 +47,12 @@ async function ensureUserColumns() {
         ADD COLUMN IF NOT EXISTS coupon_value_cents int4 DEFAULT 0,
         ADD COLUMN IF NOT EXISTS phone text,
         ADD COLUMN IF NOT EXISTS city text,
-        ADD COLUMN IF NOT EXISTS state text
+        ADD COLUMN IF NOT EXISTS state text,
+        ADD COLUMN IF NOT EXISTS cpf text,
+        ADD COLUMN IF NOT EXISTS zip_code text,
+        ADD COLUMN IF NOT EXISTS street text,
+        ADD COLUMN IF NOT EXISTS street_number text,
+        ADD COLUMN IF NOT EXISTS neighborhood text
     `);
   } catch (e) {
     // ok ignorar; se não conseguir, o fallback do hydrate cobre

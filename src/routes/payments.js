@@ -1,11 +1,16 @@
 // src/routes/payments.js
 import { Router } from 'express';
 import { MercadoPagoConfig, Payment } from 'mercadopago';
-import { query } from '../db.js';
+import { query, ensureUserProfileColumns } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
-import { v4 as uuidv4 } from 'uuid';
 import { getTicketPriceCents } from '../services/config.js';
 import { creditCouponOnApprovedPayment } from '../services/couponBalance.js';
+import {
+  buildMercadoPagoPixPayload,
+  normalizeCpf,
+  parseBrazilPhone,
+  maskDocument,
+} from '../utils/mercadoPagoPayload.js';
 
 const router = Router();
 
@@ -276,12 +281,8 @@ router.post('/pix', requireAuth, async (req, res) => {
 
     // Valor (preço * quantidade) — vindo do banco
     const priceCents = await getTicketPriceCents();
-    const amount = Number(((rs.numbers.length * priceCents) / 100).toFixed(2));
-
-    // Descrição e webhook
-    const description = `Sorteio New Store - números ${rs.numbers
-      .map((n) => n.toString().padStart(2, '0'))
-      .join(', ')}`;
+    const amountCents = rs.numbers.length * priceCents;
+    const amount = Number((amountCents / 100).toFixed(2));
 
     const publicUrl = process.env.PUBLIC_URL ? String(process.env.PUBLIC_URL).replace(/\/$/, '') : '';
     let baseUrl = publicUrl;
@@ -291,34 +292,130 @@ router.post('/pix', requireAuth, async (req, res) => {
       const host = req.get('host');
       let fallback = `${proto}://${host}`.replace(/\/$/, '');
       if (process.env.NODE_ENV === 'production' && !fallback.startsWith('https://')) {
-        // apenas no fallback (se PUBLIC_URL estiver correto, respeitamos)
         fallback = fallback.replace(/^http:\/\//, 'https://');
       }
       baseUrl = fallback;
     }
-    const notification_url = `${baseUrl}/api/payments/webhook`;
+    const notificationUrl = `${baseUrl}/api/payments/webhook`;
     if (isDebugMpEnabled()) {
-      console.log('[mp.pix] notification_url=', notification_url);
+      console.log('[mp.pix] notification_url=', notificationUrl);
     }
 
-    // E-mail do pagador
-    const payerEmail = rs.user_email || req.user?.email || 'comprador@example.com';
+    const expirationDate = new Date(Date.now() + PIX_EXP_MIN * 60 * 1000).toISOString();
 
-    // Cria pagamento PIX no Mercado Pago (idempotente)
-    const mpResp = await mpPayment.create({
-      body: {
-        transaction_amount: amount,
-        description,
-        payment_method_id: 'pix',
-        payer: { email: payerEmail },
-        external_reference: String(reservationId),
-        notification_url,
-        date_of_expiration: new Date(Date.now() + PIX_EXP_MIN * 60 * 1000).toISOString()
-      },
-      requestOptions: { idempotencyKey: uuidv4() },
+    await ensureUserProfileColumns();
+
+    const userResult = await query(
+      `
+      SELECT
+        id,
+        name,
+        email,
+        cpf,
+        phone,
+        zip_code,
+        street,
+        street_number,
+        neighborhood,
+        city,
+        state,
+        created_at
+      FROM public.users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [rs.user_id]
+    );
+
+    const user = userResult.rows[0];
+
+    if (!user?.email) {
+      return res.status(400).json({
+        ok: false,
+        code: 'missing_required_payer_data',
+        message: 'Complete seu e-mail antes de gerar o PIX.',
+        missing_fields: ['email'],
+      });
+    }
+
+    const missingFields = [];
+
+    if (!normalizeCpf(user?.cpf)) missingFields.push('cpf');
+    if (!parseBrazilPhone(user?.phone)) missingFields.push('phone');
+
+    if (missingFields.length) {
+      return res.status(400).json({
+        ok: false,
+        code: 'missing_required_payer_data',
+        message: 'Complete CPF e telefone antes de gerar o PIX.',
+        missing_fields: missingFields,
+      });
+    }
+
+    const drawResult = await query(
+      `SELECT id, status FROM public.draws WHERE id = $1 LIMIT 1`,
+      [rs.draw_id]
+    );
+    const draw = drawResult.rows[0] || { id: rs.draw_id };
+
+    const mpPayload = buildMercadoPagoPixPayload({
+      user,
+      draw,
+      reservation: rs,
+      numbers: rs.numbers,
+      amountCents,
+      ticketPriceCents: priceCents,
+      reservationId,
+      notificationUrl,
+      expirationDate,
     });
 
-    const body = mpResp?.body || mpResp;
+    console.log('[MP_PIX_PAYLOAD_SUMMARY]', {
+      reservation_id: reservationId,
+      user_id: user?.id,
+      email_present: Boolean(user?.email),
+      cpf_present: Boolean(user?.cpf),
+      cpf_masked: maskDocument(user?.cpf),
+      phone_present: Boolean(user?.phone),
+      address_present: Boolean(user?.zip_code && user?.street),
+      numbers_count: Array.isArray(rs.numbers) ? rs.numbers.length : 0,
+      amount_cents: amountCents,
+    });
+
+    const mpAccessToken =
+      process.env.MP_ACCESS_TOKEN || process.env.REACT_APP_MP_ACCESS_TOKEN;
+    const idempotencyKey = `xnamai-main-${reservationId}`;
+
+    const mpResponse = await fetch('https://api.mercadopago.com/v1/payments', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${mpAccessToken}`,
+        'Content-Type': 'application/json',
+        'X-Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify(mpPayload),
+    });
+
+    const mpData = await mpResponse.json().catch(() => ({}));
+
+    if (!mpResponse.ok) {
+      console.error('[MP_PIX_CREATE_ERROR]', {
+        status: mpResponse.status,
+        reservation_id: reservationId,
+        user_id: user?.id,
+        message: mpData?.message,
+        error: mpData?.error,
+        cause: mpData?.cause,
+      });
+
+      return res.status(400).json({
+        ok: false,
+        code: 'mercado_pago_payment_rejected',
+        message: 'Pagamento recusado pelo provedor. Confira seus dados cadastrais e tente novamente.',
+      });
+    }
+
+    const body = mpData;
     const { id, status, point_of_interaction } = body || {};
     if (isDebugMpEnabled()) {
       console.log('[mp.pix] created payment', { id: id != null ? String(id) : null, status: status || null });
@@ -344,7 +441,7 @@ router.post('/pix', requireAuth, async (req, res) => {
         rs.user_id || req.user.id,
         rs.draw_id,
         rs.numbers,
-        rs.numbers.length * priceCents,
+        amountCents,
         status,
         qr_code || null,
         qr_code_base64 || null,
@@ -362,7 +459,7 @@ router.post('/pix', requireAuth, async (req, res) => {
               pix_copy_paste = $4,
               updated_at = NOW()
         WHERE id = $1`,
-      [reservationId, String(id), rs.numbers.length * priceCents, qr_code || null, qr_code_base64 || null]
+      [reservationId, String(id), amountCents, qr_code || null, qr_code_base64 || null]
     );
 
     return res.json({
