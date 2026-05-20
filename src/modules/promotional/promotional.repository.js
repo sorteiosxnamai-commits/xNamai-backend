@@ -863,6 +863,70 @@ export async function ensurePromotionalSchema(client = null) {
     ON public.promotional_payments(reservation_id)
   `);
 
+  await dbQuery(client, `
+    CREATE TABLE IF NOT EXISTS public.promotional_user_allowances (
+      id SERIAL PRIMARY KEY,
+      draw_id BIGINT NOT NULL REFERENCES public.promotional_draws(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL,
+      buyer_name TEXT,
+      buyer_email TEXT,
+      buyer_phone TEXT,
+      allowed_quantity INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      source TEXT NOT NULL DEFAULT 'admin',
+      notes TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(draw_id, user_id)
+    )
+  `);
+
+  await dbQuery(client, `ALTER TABLE public.promotional_user_allowances ADD COLUMN IF NOT EXISTS buyer_name TEXT`);
+  await dbQuery(client, `ALTER TABLE public.promotional_user_allowances ADD COLUMN IF NOT EXISTS buyer_email TEXT`);
+  await dbQuery(client, `ALTER TABLE public.promotional_user_allowances ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
+  await dbQuery(client, `ALTER TABLE public.promotional_user_allowances ADD COLUMN IF NOT EXISTS allowed_quantity INTEGER NOT NULL DEFAULT 0`);
+  await dbQuery(client, `ALTER TABLE public.promotional_user_allowances ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`);
+  await dbQuery(client, `ALTER TABLE public.promotional_user_allowances ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'admin'`);
+  await dbQuery(client, `ALTER TABLE public.promotional_user_allowances ADD COLUMN IF NOT EXISTS notes TEXT`);
+  await dbQuery(client, `ALTER TABLE public.promotional_user_allowances ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+  await dbQuery(client, `ALTER TABLE public.promotional_user_allowances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
+  await dbQuery(client, `
+    CREATE INDEX IF NOT EXISTS promotional_user_allowances_draw_idx
+    ON public.promotional_user_allowances(draw_id)
+  `);
+  await dbQuery(client, `
+    CREATE INDEX IF NOT EXISTS promotional_user_allowances_user_idx
+    ON public.promotional_user_allowances(user_id)
+  `);
+  await dbQuery(client, `
+    CREATE INDEX IF NOT EXISTS promotional_user_allowances_status_idx
+    ON public.promotional_user_allowances(status)
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_user_allowances
+    DROP CONSTRAINT IF EXISTS promotional_user_allowances_quantity_check
+  `);
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_user_allowances
+    ADD CONSTRAINT promotional_user_allowances_quantity_check
+    CHECK (allowed_quantity >= 0)
+  `);
+
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_user_allowances
+    DROP CONSTRAINT IF EXISTS promotional_user_allowances_status_check
+  `);
+  await dbQuery(client, `
+    ALTER TABLE public.promotional_user_allowances
+    ADD CONSTRAINT promotional_user_allowances_status_check
+    CHECK (
+      status IS NULL
+      OR LOWER(status) IN ('active', 'cancelled', 'canceled', 'inactive')
+    )
+  `);
+
   await ensurePromotionalDrawCompatibility(client);
   await ensurePromotionalRuntimeConstraints(client);
   await ensurePromotionalCheckConstraints(client);
@@ -1550,7 +1614,233 @@ export async function listPromotionalParticipationsForUser(user_id, email) {
   return rows;
 }
 
-export async function getPromotionalAssignmentForUser(drawId, user = null) {
+function formatPromotionalNumbersLabel(numbers = []) {
+  return [...numbers]
+    .map((n) => Number(n))
+    .filter((n) => Number.isInteger(n))
+    .sort((a, b) => a - b)
+    .map((n) => String(n).padStart(2, "0"))
+    .join(", ");
+}
+
+function buildPromotionalAllowanceView(allowanceRow, claimedNumbers = [], drawTitle = "") {
+  const allowedQuantity = Number(allowanceRow?.allowed_quantity || 0);
+  const numbers = [...new Set(
+    (claimedNumbers || [])
+      .map((n) => Number.parseInt(n, 10))
+      .filter((n) => Number.isInteger(n) && n >= 0)
+  )].sort((a, b) => a - b);
+  const claimedQuantity = numbers.length;
+  const remainingQuantity = Math.max(0, allowedQuantity - claimedQuantity);
+  const isActive = String(allowanceRow?.status || "inactive").toLowerCase() === "active";
+
+  return {
+    draw_id: Number(allowanceRow?.draw_id),
+    draw_title: drawTitle || "",
+    user_id: Number(allowanceRow?.user_id),
+    name: allowanceRow?.buyer_name || "",
+    email: allowanceRow?.buyer_email || "",
+    phone: allowanceRow?.buyer_phone || "",
+    buyer_name: allowanceRow?.buyer_name || "",
+    buyer_email: allowanceRow?.buyer_email || "",
+    buyer_phone: allowanceRow?.buyer_phone || "",
+    allowed_quantity: allowedQuantity,
+    claimed_quantity: claimedQuantity,
+    remaining_quantity: remainingQuantity,
+    numbers,
+    numbers_label: formatPromotionalNumbersLabel(numbers),
+    status: allowanceRow?.status || "inactive",
+    source: allowanceRow?.source || "admin",
+    has_allowance: isActive && allowedQuantity > 0,
+    can_choose: isActive && remainingQuantity > 0,
+    can_pay: false,
+    payment_label: "Sem pagamento necessário",
+    message: isActive && allowedQuantity > 0
+      ? (remainingQuantity > 0
+        ? `Você pode escolher mais ${remainingQuantity} número(s).`
+        : "Você já escolheu todos os números liberados.")
+      : "Você ainda não possui números liberados para este sorteio promocional.",
+  };
+}
+
+export async function getClaimedPromotionalNumbersForUser(drawId, userId, client = null) {
+  const { rows } = await dbQuery(client, `
+    SELECT
+      COALESCE(
+        n::int,
+        number_value::int,
+        NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer
+      ) AS n
+    FROM public.promotional_numbers
+    WHERE draw_id = $1::int
+      AND user_id = $2::int
+      AND LOWER(COALESCE(status, 'available')) NOT IN ('available', 'cancelled', 'canceled', 'expired')
+    ORDER BY 1 ASC
+  `, [drawId, userId]);
+
+  return rows.map((row) => Number(row.n));
+}
+
+export async function getPromotionalUserAllowanceRow(drawId, userId, client = null) {
+  const { rows } = await dbQuery(client, `
+    SELECT *
+    FROM public.promotional_user_allowances
+    WHERE draw_id = $1::int
+      AND user_id = $2::int
+    LIMIT 1
+  `, [drawId, userId]);
+
+  return rows[0] || null;
+}
+
+export async function upsertPromotionalUserAllowance({
+  drawId,
+  userId,
+  allowedQuantity,
+  buyer = {},
+  notes = null,
+} = {}) {
+  await ensurePromotionalSchema();
+
+  const normalizedDrawId = Number.parseInt(drawId, 10);
+  const normalizedUserId = Number.parseInt(userId, 10);
+  const quantity = Number.parseInt(allowedQuantity, 10);
+
+  if (!Number.isInteger(normalizedDrawId) || normalizedDrawId <= 0) {
+    const err = new Error("Sorteio promocional inválido.");
+    err.status = 400;
+    err.code = "invalid_promotional_draw";
+    throw err;
+  }
+
+  if (!Number.isInteger(normalizedUserId) || normalizedUserId <= 0) {
+    const err = new Error("Usuário inválido para liberação promocional.");
+    err.status = 400;
+    err.code = "invalid_promotional_allowance";
+    throw err;
+  }
+
+  if (!Number.isInteger(quantity) || quantity < 0) {
+    const err = new Error("Quantidade liberada inválida.");
+    err.status = 400;
+    err.code = "invalid_promotional_allowance";
+    throw err;
+  }
+
+  const drawResult = await query(`
+    SELECT id, title
+    FROM public.promotional_draws
+    WHERE id = $1
+    LIMIT 1
+  `, [normalizedDrawId]);
+
+  if (!drawResult.rows.length) {
+    const err = new Error("Sorteio promocional não encontrado.");
+    err.status = 404;
+    err.code = "promotional_draw_not_found";
+    throw err;
+  }
+
+  const claimedNumbers = await getClaimedPromotionalNumbersForUser(normalizedDrawId, normalizedUserId);
+  const warning = claimedNumbers.length > quantity
+    ? "Este usuário já escolheu mais números do que o novo limite informado."
+    : null;
+
+  const buyerName = String(buyer.buyer_name || buyer.name || "").trim();
+  const buyerEmail = String(buyer.buyer_email || buyer.email || "").trim();
+  const buyerPhone = String(buyer.buyer_phone || buyer.phone || "").trim();
+
+  const { rows } = await query(`
+    INSERT INTO public.promotional_user_allowances (
+      draw_id,
+      user_id,
+      buyer_name,
+      buyer_email,
+      buyer_phone,
+      allowed_quantity,
+      status,
+      source,
+      notes,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, 'active', 'admin', $7, NOW(), NOW())
+    ON CONFLICT (draw_id, user_id)
+    DO UPDATE SET
+      allowed_quantity = EXCLUDED.allowed_quantity,
+      buyer_name = COALESCE(NULLIF(EXCLUDED.buyer_name, ''), public.promotional_user_allowances.buyer_name),
+      buyer_email = COALESCE(NULLIF(EXCLUDED.buyer_email, ''), public.promotional_user_allowances.buyer_email),
+      buyer_phone = COALESCE(NULLIF(EXCLUDED.buyer_phone, ''), public.promotional_user_allowances.buyer_phone),
+      status = 'active',
+      notes = COALESCE(EXCLUDED.notes, public.promotional_user_allowances.notes),
+      updated_at = NOW()
+    RETURNING *
+  `, [
+    normalizedDrawId,
+    normalizedUserId,
+    buyerName,
+    buyerEmail,
+    buyerPhone,
+    quantity,
+    notes,
+  ]);
+
+  const allowance = buildPromotionalAllowanceView(
+    rows[0],
+    claimedNumbers,
+    drawResult.rows[0].title || ""
+  );
+
+  return {
+    ok: true,
+    allowance,
+    ...(warning ? { warning } : {}),
+  };
+}
+
+export async function listPromotionalUserAllowances(drawId) {
+  await ensurePromotionalSchema();
+
+  const normalizedDrawId = Number.parseInt(drawId, 10);
+  if (!Number.isInteger(normalizedDrawId) || normalizedDrawId <= 0) {
+    const err = new Error("Sorteio promocional inválido.");
+    err.status = 400;
+    err.code = "invalid_promotional_draw";
+    throw err;
+  }
+
+  const { rows } = await query(`
+    SELECT *
+    FROM public.promotional_user_allowances
+    WHERE draw_id = $1
+    ORDER BY created_at DESC, id DESC
+  `, [normalizedDrawId]);
+
+  const allowances = [];
+  for (const row of rows) {
+    const claimedNumbers = await getClaimedPromotionalNumbersForUser(normalizedDrawId, row.user_id);
+    const view = buildPromotionalAllowanceView(row, claimedNumbers);
+    allowances.push({
+      user_id: view.user_id,
+      name: view.name,
+      email: view.email,
+      phone: view.phone,
+      allowed_quantity: view.allowed_quantity,
+      claimed_quantity: view.claimed_quantity,
+      remaining_quantity: view.remaining_quantity,
+      numbers: view.numbers,
+      numbers_label: view.numbers_label,
+      status: view.status,
+    });
+  }
+
+  return {
+    draw_id: normalizedDrawId,
+    allowances,
+  };
+}
+
+export async function getPromotionalUserAllowanceForUser(drawId, user = null) {
   await ensurePromotionalSchema();
   await releaseExpiredPromotionalReservations();
 
@@ -1572,69 +1862,414 @@ export async function getPromotionalAssignmentForUser(drawId, user = null) {
     throw err;
   }
 
-  const { rows } = await query(`
-    SELECT
-      COALESCE(r.reservation_id::text, r.id::text) AS reservation_id,
-      r.draw_id,
-      r.user_id,
-      r.numbers,
-      r.buyer_name,
-      r.buyer_email,
-      r.buyer_phone,
-      r.status,
-      r.payment_status,
-      r.source,
-      r.created_at,
-      d.title AS draw_title
-    FROM public.promotional_reservations r
-    JOIN public.promotional_draws d ON d.id = r.draw_id
-    WHERE r.draw_id = $1
-      AND (
-        r.user_id = $2
-        OR LOWER(r.buyer_email) = LOWER($3)
-      )
-      AND LOWER(COALESCE(r.status, '')) NOT IN ('cancelled', 'canceled', 'expired')
-    ORDER BY
-      CASE WHEN LOWER(COALESCE(r.source, '')) = 'admin' THEN 0 ELSE 1 END,
-      r.created_at DESC
+  const drawResult = await query(`
+    SELECT id, title
+    FROM public.promotional_draws
+    WHERE id = $1
     LIMIT 1
-  `, [normalizedDrawId, userId, userEmail]);
+  `, [normalizedDrawId]);
 
-  if (!rows.length) {
+  const drawTitle = drawResult.rows[0]?.title || "";
+  const allowanceRow = await getPromotionalUserAllowanceRow(normalizedDrawId, userId);
+  const claimedNumbers = await getClaimedPromotionalNumbersForUser(normalizedDrawId, userId);
+
+  if (!allowanceRow || String(allowanceRow.status || "").toLowerCase() !== "active") {
     return {
-      has_assignment: false,
-      numbers: [],
-      message: "Você ainda não possui número atribuído neste sorteio promocional.",
+      ok: true,
+      has_allowance: false,
+      allowed_quantity: 0,
+      claimed_quantity: claimedNumbers.length,
+      remaining_quantity: 0,
+      numbers: claimedNumbers,
+      numbers_label: formatPromotionalNumbersLabel(claimedNumbers),
+      can_choose: false,
+      can_pay: false,
+      payment_label: "Sem pagamento necessário",
+      draw_id: normalizedDrawId,
+      draw_title: drawTitle,
+      message: "Você ainda não possui números liberados para este sorteio promocional.",
     };
   }
 
-  const row = rows[0];
-  const numbers = Array.isArray(row.numbers) ? row.numbers.map(Number) : [];
-  const source = String(row.source || "admin").toLowerCase() === "admin" ? "admin" : String(row.source || "public");
-  const isAdmin = source === "admin" || String(row.payment_status || "").toLowerCase() === "approved";
+  return {
+    ok: true,
+    ...buildPromotionalAllowanceView(allowanceRow, claimedNumbers, drawTitle),
+  };
+}
+
+export async function claimPromotionalNumbersForUser(drawId, user = null, numbersInput = []) {
+  const pool = await getPool();
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensurePromotionalSchema(client);
+    await releaseExpiredPromotionalReservations(client, drawId);
+
+    const normalizedDrawId = Number.parseInt(drawId, 10);
+    const userId = Number.parseInt(user?.id, 10);
+    const userEmail = String(user?.email || "").trim();
+
+    if (!Number.isInteger(normalizedDrawId) || normalizedDrawId <= 0) {
+      const err = new Error("ID do sorteio promocional inválido.");
+      err.status = 400;
+      err.code = "invalid_promotional_draw";
+      throw err;
+    }
+
+    if (!Number.isInteger(userId) || !userEmail) {
+      const err = new Error("Usuário não autenticado.");
+      err.status = 401;
+      err.code = "login_required";
+      throw err;
+    }
+
+    const requestedNumbers = [...new Set(
+      (Array.isArray(numbersInput) ? numbersInput : [])
+        .map((n) => Number.parseInt(n, 10))
+        .filter((n) => Number.isInteger(n) && n >= 0)
+    )];
+
+    if (!requestedNumbers.length) {
+      const err = new Error("Nenhum número selecionado.");
+      err.status = 400;
+      err.code = "no_numbers";
+      throw err;
+    }
+
+    const allowanceRow = await getPromotionalUserAllowanceRow(normalizedDrawId, userId, client);
+    if (!allowanceRow || String(allowanceRow.status || "").toLowerCase() !== "active") {
+      const err = new Error("Você não possui liberação ativa para escolher números neste sorteio promocional.");
+      err.status = 403;
+      err.code = "promotional_no_allowance";
+      throw err;
+    }
+
+    const allowedQuantity = Number(allowanceRow.allowed_quantity || 0);
+    if (allowedQuantity <= 0) {
+      const err = new Error("Você não possui liberação ativa para escolher números neste sorteio promocional.");
+      err.status = 403;
+      err.code = "promotional_no_allowance";
+      throw err;
+    }
+
+    const drawResult = await client.query(`
+      SELECT id, title, price_cents, number_start, number_end
+      FROM public.promotional_draws
+      WHERE id = $1
+      LIMIT 1
+    `, [normalizedDrawId]);
+
+    if (!drawResult.rowCount) {
+      const err = new Error("Sorteio promocional não encontrado.");
+      err.status = 404;
+      err.code = "promotional_draw_not_found";
+      throw err;
+    }
+
+    const draw = drawResult.rows[0];
+    const start = Number.parseInt(draw.number_start ?? 0, 10);
+    const end = Number.parseInt(draw.number_end ?? 99, 10);
+    const outsideRange = requestedNumbers.filter((n) => n < start || n > end);
+    if (outsideRange.length) {
+      const err = new Error("Número fora do intervalo do sorteio promocional.");
+      err.status = 400;
+      err.code = "invalid_number";
+      err.conflicts = outsideRange;
+      throw err;
+    }
+
+    const alreadyClaimed = await getClaimedPromotionalNumbersForUser(normalizedDrawId, userId, client);
+    const newNumbers = requestedNumbers.filter((n) => !alreadyClaimed.includes(n));
+
+    if (!newNumbers.length) {
+      const view = buildPromotionalAllowanceView(allowanceRow, alreadyClaimed, draw.title || "");
+      await client.query("COMMIT");
+      return {
+        ok: true,
+        claimed: true,
+        ...view,
+        message: "Números promocionais escolhidos com sucesso.",
+      };
+    }
+
+    const remainingQuantity = Math.max(0, allowedQuantity - alreadyClaimed.length);
+    if (newNumbers.length > remainingQuantity) {
+      const err = new Error("Você não pode escolher mais números do que a quantidade liberada pelo administrador.");
+      err.status = 409;
+      err.code = "promotional_allowance_limit_exceeded";
+      throw err;
+    }
+
+    await createPromotionalNumbers(normalizedDrawId, start, end, client);
+
+    const locked = await client.query(`
+      SELECT
+        id,
+        COALESCE(n, number_value, NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer) AS number,
+        status,
+        payment_status,
+        user_id,
+        reservation_id,
+        COALESCE(expires_at, reserved_until) AS expires_at
+      FROM public.promotional_numbers
+      WHERE draw_id = $1::int
+        AND COALESCE(
+          n::int,
+          number_value::int,
+          NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer
+        ) = ANY($2::int[])
+      ORDER BY COALESCE(
+        n::int,
+        number_value::int,
+        NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer
+      ) ASC
+      FOR UPDATE
+    `, [normalizedDrawId, newNumbers]);
+
+    const found = new Set(locked.rows.map((row) => Number(row.number)));
+    const missing = newNumbers.filter((n) => !found.has(n));
+    if (missing.length) {
+      const err = new Error("Número promocional não encontrado neste sorteio.");
+      err.status = 404;
+      err.code = "invalid_number";
+      err.conflicts = missing;
+      throw err;
+    }
+
+    const conflicts = locked.rows
+      .filter((row) => {
+        const numberStatus = String(row.status || "").toLowerCase();
+        const paymentStatus = String(row.payment_status || "").toLowerCase();
+        const rowUserId = Number(row.user_id);
+        if (rowUserId === userId) return false;
+
+        const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : null;
+        const activeReservation =
+          row.reservation_id &&
+          expiresAt &&
+          Number.isFinite(expiresAt) &&
+          expiresAt > Date.now();
+
+        if (numberStatus === "available") return false;
+        if (
+          numberStatus === "reserved" &&
+          !activeReservation &&
+          !["paid", "approved", "pago"].includes(paymentStatus)
+        ) {
+          return false;
+        }
+
+        return (
+          ["reserved", "sold", "blocked", "unavailable", "pending"].includes(numberStatus) ||
+          ["paid", "approved", "pago"].includes(paymentStatus) ||
+          activeReservation
+        );
+      })
+      .map((row) => Number(row.number));
+
+    if (conflicts.length) {
+      const err = new Error("Um ou mais números selecionados já estão ocupados.");
+      err.status = 409;
+      err.code = "promotional_number_unavailable";
+      err.conflicts = conflicts;
+      throw err;
+    }
+
+    const buyerName = String(allowanceRow.buyer_name || user?.name || user?.nome || userEmail).trim();
+    const buyerEmail = String(allowanceRow.buyer_email || userEmail).trim();
+    const buyerPhone = String(allowanceRow.buyer_phone || user?.phone || "").trim();
+    const allNumbers = [...new Set([...alreadyClaimed, ...newNumbers])].sort((a, b) => a - b);
+    const reservationId = randomUUID();
+    const idUsesUuid = await promotionalReservationIdUsesUuid(client);
+
+    const existingReservation = await client.query(`
+      SELECT id, reservation_id, numbers
+      FROM public.promotional_reservations
+      WHERE draw_id = $1
+        AND user_id = $2
+        AND LOWER(COALESCE(status, '')) NOT IN ('cancelled', 'canceled', 'expired')
+        AND LOWER(COALESCE(source, '')) IN ('allowance_claim', 'user_claim')
+      ORDER BY updated_at DESC NULLS LAST, created_at DESC
+      LIMIT 1
+      FOR UPDATE
+    `, [normalizedDrawId, userId]);
+
+    let activeReservationId = null;
+
+    if (existingReservation.rowCount) {
+      activeReservationId =
+        existingReservation.rows[0].reservation_id || existingReservation.rows[0].id;
+
+      await client.query(`
+        UPDATE public.promotional_reservations
+        SET numbers = $3::int[],
+            buyer_name = $4,
+            buyer_email = $5,
+            buyer_phone = $6,
+            status = 'reserved',
+            payment_status = 'approved',
+            total_cents = 0,
+            amount_cents = 0,
+            expires_at = NULL,
+            updated_at = NOW()
+        WHERE draw_id = $1
+          AND (id::text = $2::text OR reservation_id::text = $2::text)
+      `, [
+        normalizedDrawId,
+        String(activeReservationId),
+        allNumbers,
+        buyerName || buyerEmail,
+        buyerEmail,
+        buyerPhone,
+      ]);
+    } else if (idUsesUuid) {
+      await client.query(
+        `
+        INSERT INTO public.promotional_reservations (
+          id,
+          reservation_id,
+          draw_id,
+          user_id,
+          numbers,
+          buyer_name,
+          buyer_email,
+          buyer_phone,
+          price_cents,
+          total_cents,
+          amount_cents,
+          source,
+          status,
+          payment_status,
+          expires_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1, $1, $2, $3, $4::int[], $5, $6, $7, 0, 0, 0,
+          'allowance_claim', 'reserved', 'approved', NULL, NOW(), NOW()
+        )
+        `,
+        [
+          reservationId,
+          normalizedDrawId,
+          userId,
+          allNumbers,
+          buyerName || buyerEmail,
+          buyerEmail,
+          buyerPhone,
+        ]
+      );
+      activeReservationId = reservationId;
+    } else {
+      await client.query(
+        `
+        INSERT INTO public.promotional_reservations (
+          reservation_id,
+          draw_id,
+          user_id,
+          numbers,
+          buyer_name,
+          buyer_email,
+          buyer_phone,
+          price_cents,
+          total_cents,
+          amount_cents,
+          source,
+          status,
+          payment_status,
+          expires_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1, $2, $3, $4::int[], $5, $6, $7, 0, 0, 0,
+          'allowance_claim', 'reserved', 'approved', NULL, NOW(), NOW()
+        )
+        `,
+        [
+          reservationId,
+          normalizedDrawId,
+          userId,
+          allNumbers,
+          buyerName || buyerEmail,
+          buyerEmail,
+          buyerPhone,
+        ]
+      );
+      activeReservationId = reservationId;
+    }
+
+    await client.query(`
+      UPDATE public.promotional_numbers
+      SET status = 'reserved',
+          reservation_id = $3,
+          reserved_by = $7,
+          buyer_name = $4,
+          buyer_email = $5,
+          buyer_phone = $6,
+          user_id = $8,
+          payment_status = 'approved',
+          reserved_at = NOW(),
+          expires_at = NULL,
+          reserved_until = NULL,
+          updated_at = NOW()
+      WHERE draw_id = $1
+        AND COALESCE(
+          n::int,
+          number_value::int,
+          NULLIF(regexp_replace(number::text, '\\D', '', 'g'), '')::integer
+        ) = ANY($2::int[])
+    `, [
+      normalizedDrawId,
+      newNumbers,
+      activeReservationId,
+      buyerName || buyerEmail,
+      buyerEmail,
+      buyerPhone,
+      String(userId),
+      userId,
+    ]);
+
+    await client.query("COMMIT");
+
+    const view = buildPromotionalAllowanceView(allowanceRow, allNumbers, draw.title || "");
+    return {
+      ok: true,
+      claimed: true,
+      ...view,
+      message: "Números promocionais escolhidos com sucesso.",
+    };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[PROMOTIONAL_ALLOWANCE_ERROR]", {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      hint: err?.hint,
+      table: err?.table,
+      column: err?.column,
+      constraint: err?.constraint,
+      stack: err?.stack,
+    });
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function getPromotionalAssignmentForUser(drawId, user = null) {
+  const allowance = await getPromotionalUserAllowanceForUser(drawId, user);
+  const hasAllowance = Boolean(allowance.has_allowance);
+  const claimedQuantity = Number(allowance.claimed_quantity || 0);
 
   return {
-    has_assignment: true,
-    draw_id: normalizedDrawId,
-    draw_title: row.draw_title || "",
-    reservation_id: row.reservation_id,
-    source: isAdmin ? "admin" : source,
-    status: row.status || "reserved",
-    status_label: isAdmin ? "Atribuído pelo admin" : mapReservationStatusLabel(row.status),
-    payment_status: row.payment_status || (isAdmin ? "approved" : "pending"),
-    payment_label: isAdmin ? "Sem pagamento necessário" : "Pendente",
+    ...allowance,
+    has_allowance: hasAllowance,
+    has_assignment: hasAllowance || claimedQuantity > 0,
     can_pay: false,
-    numbers,
-    numbers_label: numbers.map((n) => String(n).padStart(2, "0")).join(", "),
-    buyer_name: row.buyer_name || "",
-    buyer_email: row.buyer_email || "",
-    buyer_phone: row.buyer_phone || "",
-    created_at: row.created_at,
-    draw: {
-      id: normalizedDrawId,
-      title: row.draw_title || "",
-    },
-    reservation: row,
+    payment_label: "Sem pagamento necessário",
+    status_label: claimedQuantity > 0 ? "Números escolhidos" : "Aguardando escolha",
   };
 }
 

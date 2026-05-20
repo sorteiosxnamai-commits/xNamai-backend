@@ -1072,7 +1072,7 @@ function respondPublicPurchaseDisabled(res) {
     code: "promotional_public_purchase_disabled",
     error: "promotional_public_purchase_disabled",
     message:
-      "Este sorteio promocional não permite compra pelo site. O número deve ser atribuído pelo administrador.",
+      "Este sorteio promocional não permite compra pelo site. Os números precisam ser liberados pelo administrador.",
   });
 }
 

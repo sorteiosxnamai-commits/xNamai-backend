@@ -8,9 +8,11 @@ import {
   getAdminDraw,
   getNumbers,
   listAdminDraws,
+  listDrawAllowances,
   listParticipants,
   updateDraw,
   updateNumberStatus,
+  upsertUserAllowance,
 } from "./promotional.service.js";
 
 const router = Router();
@@ -170,6 +172,50 @@ router.patch("/draws/:id/numbers/:number", async (req, res) => {
     return handleError(res, err, {
       logTag: "[PROMOTIONAL_ADMIN_NUMBERS_ERROR]",
       friendlyError: "Erro ao processar número promocional.",
+    });
+  }
+});
+
+router.post("/draws/:id/allowances", async (req, res) => {
+  try {
+    const result = await upsertUserAllowance(req.params.id, req.body || {});
+    return res.status(201).json(result);
+  } catch (err) {
+    console.error("[PROMOTIONAL_ALLOWANCE_ERROR]", {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      hint: err?.hint,
+      table: err?.table,
+      column: err?.column,
+      constraint: err?.constraint,
+      stack: err?.stack,
+    });
+    return handleError(res, err, {
+      logTag: "[PROMOTIONAL_ADMIN_ALLOWANCE_UPSERT_ERROR]",
+      friendlyError: "Erro ao liberar quantidade promocional.",
+    });
+  }
+});
+
+router.get("/draws/:id/allowances", async (req, res) => {
+  try {
+    const data = await listDrawAllowances(req.params.id);
+    return res.json({ ok: true, ...data });
+  } catch (err) {
+    console.error("[PROMOTIONAL_ALLOWANCE_ERROR]", {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      hint: err?.hint,
+      table: err?.table,
+      column: err?.column,
+      constraint: err?.constraint,
+      stack: err?.stack,
+    });
+    return handleError(res, err, {
+      logTag: "[PROMOTIONAL_ADMIN_ALLOWANCE_LIST_ERROR]",
+      friendlyError: "Erro ao listar liberações promocionais.",
     });
   }
 });

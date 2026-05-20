@@ -11,8 +11,13 @@ import {
   getPromotionalParticipants,
   getPromotionalReservationForPayment,
   listActivePromotionalDraws,
+  claimPromotionalNumbersForUser,
+  createPromotionalNumbers,
   getPromotionalAssignmentForUser as getPromotionalAssignmentForUserRepo,
+  getPromotionalUserAllowanceForUser,
   listPromotionalParticipationsForUser,
+  listPromotionalUserAllowances,
+  upsertPromotionalUserAllowance,
   settlePromotionalPaymentApproved,
   updatePromotionalDraw,
   updatePromotionalDrawStatus,
@@ -85,6 +90,93 @@ export async function getNumbers(draw_id, { requireActive = false } = {}) {
     ? await getPromotionalNumbers(draw.id)
     : await getPromotionalNumbersAdmin(draw.id);
   return { draw, numbers };
+}
+
+export async function getPublicNumbersGrid(draw_id, user = null) {
+  const draw = await getPublicDraw(draw_id);
+  const start = Number(draw.number_start ?? 0);
+  const end = Number(draw.number_end ?? 99);
+
+  await createPromotionalNumbers(draw.id, start, end);
+
+  const rows = await getPromotionalNumbers(draw.id);
+  const userId = user?.id != null ? Number.parseInt(user.id, 10) : null;
+  const byNumber = new Map();
+
+  for (const row of rows) {
+    const n = Number(row.n ?? row.number_value ?? row.number);
+    if (Number.isInteger(n)) {
+      byNumber.set(n, row);
+    }
+  }
+
+  const numbers = [];
+  let occupied = 0;
+
+  for (let n = start; n <= end; n += 1) {
+    const row = byNumber.get(n);
+    const status = String(row?.status || "available").toLowerCase();
+    const isAvailable = status === "available";
+    const isOccupied = !isAvailable;
+    const isMine = Boolean(
+      userId != null &&
+      isOccupied &&
+      Number(row?.user_id) === userId
+    );
+
+    if (isOccupied) occupied += 1;
+
+    numbers.push({
+      n,
+      label: String(n).padStart(2, "0"),
+      status: row?.status || "available",
+      is_available: isAvailable,
+      is_occupied: isOccupied,
+      is_mine: isMine,
+    });
+  }
+
+  const total = end - start + 1;
+
+  return {
+    draw_id: Number(draw.id),
+    numbers,
+    summary: {
+      total,
+      occupied,
+      available: Math.max(0, total - occupied),
+    },
+  };
+}
+
+export async function upsertUserAllowance(draw_id, payload = {}) {
+  await getAdminDraw(draw_id);
+  return upsertPromotionalUserAllowance({
+    drawId: draw_id,
+    userId: payload.user_id || payload.userId,
+    allowedQuantity: payload.allowed_quantity ?? payload.allowedQuantity,
+    buyer: {
+      buyer_name: payload.buyer_name || payload.name,
+      buyer_email: payload.buyer_email || payload.email,
+      buyer_phone: payload.buyer_phone || payload.phone,
+    },
+    notes: payload.notes || null,
+  });
+}
+
+export async function listDrawAllowances(draw_id) {
+  await getAdminDraw(draw_id);
+  return listPromotionalUserAllowances(draw_id);
+}
+
+export async function getMyAllowance(drawId, user = null) {
+  await getPublicDraw(drawId);
+  return getPromotionalUserAllowanceForUser(drawId, user);
+}
+
+export async function claimNumbers(drawId, numbers = [], user = null) {
+  await getPublicDraw(drawId);
+  return claimPromotionalNumbersForUser(drawId, user, numbers);
 }
 
 async function getTableColumns(client, tableName) {
@@ -401,7 +493,7 @@ export async function reserveNumbers(_input = {}, _user = null) {
   throw httpError(
     403,
     "promotional_public_purchase_disabled",
-    "Este sorteio promocional não permite reserva pública. O número deve ser atribuído pelo administrador."
+    "Este sorteio promocional não permite compra pelo site. Os números precisam ser liberados pelo administrador."
   );
 }
 
@@ -543,8 +635,9 @@ export async function listMyParticipations(user = null) {
   return rows.map((row) => {
     const numbers = Array.isArray(row.numbers) ? row.numbers.map(Number) : [];
     const priceCents = Number(row.price_cents || 0);
+    const source = String(row.source || "").toLowerCase();
     const isAdminAssignment =
-      String(row.source || "").toLowerCase() === "admin" ||
+      ["admin", "allowance_claim", "user_claim"].includes(source) ||
       String(row.payment_status || "").toLowerCase() === "approved";
     const amountCents = isAdminAssignment
       ? 0
@@ -565,7 +658,7 @@ export async function listMyParticipations(user = null) {
         : mapPaymentStatus(row.payment_status),
       status: row.reservation_status || "reserved",
       status_label: isAdminAssignment
-        ? "Atribuído pelo admin"
+        ? (source === "admin" ? "Atribuído pelo admin" : "Números escolhidos")
         : mapReservationStatus(row.reservation_status),
       can_pay: isAdminAssignment
         ? false
