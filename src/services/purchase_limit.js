@@ -1,120 +1,128 @@
 // backend/src/services/purchase_limit.js
 import { query } from "../db.js";
+import { fetchCurrentOpenDraw } from "./mainRaffleCompat.js";
 
-const MAX = Number(process.env.MAX_NUMBERS_PER_USER || 20);
-
-// Status que devem CONTAR para o limite (reservado OU pago OU pendente etc.)
 const STATUSES = [
-  // pt
   "reservado", "pago", "pendente", "aprovado", "vendido", "indisponivel",
   "confirmado", "processando", "aguardando",
-  // en
   "reserved", "paid", "pending", "approved", "sold", "taken",
   "confirmed", "processing", "awaiting",
 ];
 
-// ————————————————————————————————
-// util: descobrir coluna de usuário na tabela
 async function resolveUserColumn(table) {
   const { rows } = await query(
     `
-    select column_name
-      from information_schema.columns
-     where table_schema = 'public'
-       and table_name   = $1
+    SELECT column_name
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = $1
     `,
     [table]
   );
-  const cols = rows.map(r => r.column_name);
-
-  // nomes comuns
+  const cols = rows.map((r) => r.column_name);
   const candidates = [
     "user_id", "client_id", "customer_id", "account_id",
-    "buyer_id", "participant_id", "owner_id"
+    "buyer_id", "participant_id", "owner_id",
   ];
-  return candidates.find(c => cols.includes(c)) || null;
+  return candidates.find((c) => cols.includes(c)) || null;
 }
 
-// conta via tabela numbers (se ela guardar o usuário)
 async function countViaNumbers(userId, drawId, userCol) {
   const sql = `
-    select count(*)::int as cnt
-      from numbers
-     where draw_id = $1
-       and ${userCol} = $2
-       and lower(coalesce(status, '')) = ANY($3)
+    SELECT COUNT(*)::int AS cnt
+      FROM numbers
+     WHERE draw_id = $1
+       AND ${userCol} = $2
+       AND LOWER(COALESCE(status, '')) = ANY($3)
   `;
   const { rows } = await query(sql, [
     drawId,
     userId,
-    STATUSES.map(s => s.toLowerCase()),
+    STATUSES.map((s) => s.toLowerCase()),
   ]);
   return rows?.[0]?.cnt ?? 0;
 }
 
-// fallback: conta via reservations (se numbers não guardar o usuário)
 async function countViaReservations(userId, drawId) {
   const userCol = await resolveUserColumn("reservations");
   if (!userCol) return 0;
 
-  // tenta achar coluna FK para numbers
   const { rows: fkRows } = await query(
     `
-    select column_name
-      from information_schema.columns
-     where table_schema = 'public'
-       and table_name   = 'reservations'
-       and column_name in ('number_id','numbers_id','num_id','n_id')
+    SELECT column_name
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'reservations'
+       AND column_name IN ('number_id', 'numbers_id', 'num_id', 'n_id')
     `
   );
   const numCol = fkRows?.[0]?.column_name || null;
 
-  // tenta draw_id direto em reservations
   const { rows: drawRows } = await query(
     `
-    select column_name
-      from information_schema.columns
-     where table_schema = 'public'
-       and table_name   = 'reservations'
-       and column_name in ('draw_id','sorteio_id')
+    SELECT column_name
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'reservations'
+       AND column_name IN ('draw_id', 'sorteio_id')
     `
   );
   const drawCol = drawRows?.[0]?.column_name || null;
 
   if (numCol) {
     const sql = `
-      select count(*)::int as cnt
-        from reservations r
-        join numbers n on n.id = r.${numCol}
-       where n.draw_id = $1
-         and r.${userCol} = $2
-         and lower(coalesce(n.status, r.status, '')) = ANY($3)
+      SELECT COUNT(*)::int AS cnt
+        FROM reservations r
+        JOIN numbers n ON n.id = r.${numCol}
+       WHERE n.draw_id = $1
+         AND r.${userCol} = $2
+         AND LOWER(COALESCE(n.status, r.status, '')) = ANY($3)
     `;
     const { rows } = await query(sql, [
       drawId,
       userId,
-      STATUSES.map(s => s.toLowerCase()),
+      STATUSES.map((s) => s.toLowerCase()),
     ]);
     return rows?.[0]?.cnt ?? 0;
   }
 
   if (drawCol) {
     const sql = `
-      select count(*)::int as cnt
-        from reservations r
-       where r.${drawCol} = $1
-         and r.${userCol} = $2
-         and lower(coalesce(r.status, '')) = ANY($3)
+      SELECT COUNT(*)::int AS cnt
+        FROM reservations r
+       WHERE r.${drawCol} = $1
+         AND r.${userCol} = $2
+         AND LOWER(COALESCE(r.status, '')) = ANY($3)
     `;
     const { rows } = await query(sql, [
       drawId,
       userId,
-      STATUSES.map(s => s.toLowerCase()),
+      STATUSES.map((s) => s.toLowerCase()),
     ]);
     return rows?.[0]?.cnt ?? 0;
   }
 
   return 0;
+}
+
+export async function getMaxNumbersPerUserForDraw(drawId) {
+  const id = Number(drawId);
+  if (!Number.isInteger(id) || id <= 0) {
+    const current = await fetchCurrentOpenDraw();
+    return Number(current?.max_numbers_per_user || 5);
+  }
+
+  const { rows } = await query(
+    `
+    SELECT COALESCE(max_numbers_per_user, 5)::int AS max_numbers_per_user
+      FROM public.draws
+     WHERE id = $1
+     LIMIT 1
+    `,
+    [id]
+  );
+
+  return Number(rows[0]?.max_numbers_per_user || 5);
 }
 
 export async function getUserCountInDraw(userId, drawId) {
@@ -124,9 +132,10 @@ export async function getUserCountInDraw(userId, drawId) {
 }
 
 export async function checkUserLimit(userId, drawId, addingCount = 1) {
+  const max = await getMaxNumbersPerUserForDraw(drawId);
   const current = await getUserCountInDraw(userId, drawId);
-  const blocked = current >= MAX || current + addingCount > MAX;
-  return { blocked, current, max: MAX };
+  const blocked = current >= max || current + addingCount > max;
+  return { blocked, current, max, max_numbers_per_user: max };
 }
 
 export async function assertUserUnderLimit(userId, drawId, addingCount = 1) {
@@ -135,8 +144,8 @@ export async function assertUserUnderLimit(userId, drawId, addingCount = 1) {
     const err = new Error("max_numbers_reached");
     err.status = 409;
     err.code = "max_numbers_reached";
-    err.payload = { current, max };
+    err.payload = { current, max, max_numbers_per_user: max };
     throw err;
   }
-  return { current, max };
+  return { current, max, max_numbers_per_user: max };
 }

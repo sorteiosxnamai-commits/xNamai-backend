@@ -264,10 +264,7 @@ async function handleSummary(_req, res) {
     const config = await getConfigObject();
     const draw = await getActiveDraw();
     const priceCents = toInt(config.ticket_price_cents ?? config.price_cents, 5500);
-    const maxNumbers = toInt(
-      config.max_numbers_per_selection ?? config.max_numbers_per_user,
-      5
-    );
+    const maxNumbers = 5;
     const promoText = String(config.promo_text || config.banner_title || "");
     const bannerTitle = String(config.banner_title || config.promo_text || "");
 
@@ -310,8 +307,13 @@ async function handleSummary(_req, res) {
       reserved_numbers: reserved,
       remaining_numbers: remaining,
       ticket_price_cents: toInt(draw.ticket_price_cents, config.ticket_price_cents),
-      max_numbers_per_user: toInt(draw.max_numbers_per_user, config.max_numbers_per_user),
+      max_numbers_per_user: Number(draw.max_numbers_per_user || 5),
       cashback_percent: cashbackPercent,
+      title: draw.title || draw.product_name || draw.prize_title || null,
+      prize: draw.prize_title || draw.title || null,
+      promo_text: draw.promo_text || draw.banner_title || promoText,
+      banner_title: draw.banner_title || draw.promo_text || bannerTitle,
+      status: String(draw.status || "open").toLowerCase(),
     };
 
     return res.json({
@@ -322,7 +324,7 @@ async function handleSummary(_req, res) {
       price_cents: normalizedDraw.ticket_price_cents,
       ticket_price_cents: normalizedDraw.ticket_price_cents,
       cashback_percent: cashbackPercent,
-      max_numbers_per_selection: config.max_numbers_per_selection,
+      max_numbers_per_selection: normalizedDraw.max_numbers_per_user,
       max_numbers_per_user: normalizedDraw.max_numbers_per_user,
       promo_text: normalizedDraw.promo_text || promoText,
       banner_title: normalizedDraw.banner_title || bannerTitle,

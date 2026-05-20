@@ -126,6 +126,15 @@ export async function cleanupExpiredMainReservations(client = null, drawId = nul
            )
          )
        )
+       AND NOT EXISTS (
+         SELECT 1
+           FROM public.reservations active_r
+          WHERE active_r.draw_id = n.draw_id
+            AND COALESCE(n.n::int, n.number) = ANY(COALESCE(active_r.numbers, '{}'::int[]))
+            AND LOWER(COALESCE(active_r.status, '')) IN ('reserved', 'active', 'pending', 'reservado', 'pendente')
+            AND LOWER(COALESCE(active_r.payment_status, 'pending')) NOT IN ('paid', 'approved', 'pago', 'expired', 'cancelled', 'canceled')
+            AND COALESCE(active_r.expires_at, active_r.created_at + interval '30 minutes') > NOW()
+       )
        ${drawWhereNumbers}
      RETURNING COALESCE(n.n::int, n.number) AS num, n.draw_id
     `,

@@ -187,6 +187,85 @@ export async function ensureMainRaffleCompat(client = null) {
   }
 }
 
+const OPEN_DRAW_STATUSES = ["open", "active", "aberto", "ativo"];
+
+const MAIN_DRAW_SELECT = `
+  d.id,
+  d.status,
+  COALESCE(d.title, d.product_name, d.prize_title) AS title,
+  COALESCE(d.prize_title, d.title, d.product_name) AS prize,
+  COALESCE(d.promo_text, d.banner_title, '') AS promo_text,
+  COALESCE(d.banner_title, d.promo_text, '') AS banner_title,
+  COALESCE(d.ticket_price_cents, d.price_cents, 5500)::int AS ticket_price_cents,
+  COALESCE(d.price_cents, d.ticket_price_cents, 5500)::int AS price_cents,
+  COALESCE(d.max_numbers_per_user, 5)::int AS max_numbers_per_user,
+  COALESCE(d.cashback_percent, 100)::int AS cashback_percent,
+  COALESCE(d.opened_at, d.created_at) AS opened_at,
+  d.closed_at,
+  d.realized_at,
+  d.winner_user_id,
+  d.created_at
+`;
+
+export function normalizeMainDrawPayload(row) {
+  if (!row) return null;
+
+  const ticketCents = Number(row.ticket_price_cents ?? row.price_cents ?? 5500);
+
+  return {
+    id: Number(row.id),
+    status: String(row.status || "open").toLowerCase(),
+    title: row.title || row.product_name || row.prize_title || null,
+    prize: row.prize || row.prize_title || row.title || null,
+    promo_text: row.promo_text || row.banner_title || "",
+    banner_title: row.banner_title || row.promo_text || "",
+    ticket_price_cents: ticketCents,
+    price_cents: Number(row.price_cents ?? ticketCents),
+    max_numbers_per_user: Number(row.max_numbers_per_user || 5),
+    cashback_percent: Number(row.cashback_percent ?? 100),
+    opened_at: row.opened_at || null,
+    closed_at: row.closed_at || null,
+    realized_at: row.realized_at || null,
+    winner_user_id: row.winner_user_id ?? null,
+    created_at: row.created_at || null,
+  };
+}
+
+export async function fetchCurrentOpenDraw(client = null) {
+  await ensureMainRaffleCompat(client);
+
+  const q = runner(client);
+  const result = await q(
+    `
+    SELECT ${MAIN_DRAW_SELECT}
+      FROM public.draws d
+     WHERE LOWER(COALESCE(d.status, '')) = ANY($1::text[])
+     ORDER BY d.id DESC
+     LIMIT 1
+    `,
+    [OPEN_DRAW_STATUSES]
+  );
+
+  return normalizeMainDrawPayload(result.rows[0] || null);
+}
+
+export async function fetchDrawById(drawId, client = null) {
+  await ensureMainRaffleCompat(client);
+
+  const q = runner(client);
+  const result = await q(
+    `
+    SELECT ${MAIN_DRAW_SELECT}
+      FROM public.draws d
+     WHERE d.id = $1
+     LIMIT 1
+    `,
+    [Number(drawId)]
+  );
+
+  return normalizeMainDrawPayload(result.rows[0] || null);
+}
+
 export async function getTicketPriceCents(client = null, drawId) {
   await ensureMainRaffleCompat(client);
 

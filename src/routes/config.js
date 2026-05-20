@@ -8,6 +8,7 @@ import {
   getMaxNumbersPerSelection,
   setMaxNumbersPerSelection,
 } from "../services/config.js";
+import { fetchCurrentOpenDraw } from "../services/mainRaffleCompat.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = Router();
@@ -18,16 +19,31 @@ const router = Router();
  */
 router.get("/", async (_req, res) => {
   try {
-    const [price_cents, banner_title, max_numbers_per_selection] = await Promise.all([
+    const currentDraw = await fetchCurrentOpenDraw();
+    const [fallbackPrice, banner_title, fallbackMaxSelection] = await Promise.all([
       getTicketPriceCents(),
       getBannerTitle(),
       getMaxNumbersPerSelection(),
     ]);
 
+    const ticket_price_cents =
+      currentDraw?.ticket_price_cents ?? fallbackPrice;
+    const max_numbers_per_user = Number(
+      currentDraw?.max_numbers_per_user ?? fallbackMaxSelection ?? 5
+    );
+
     res.json({
-      ticket_price_cents: price_cents,
-      banner_title,
-      max_numbers_per_selection,
+      ok: true,
+      ticket_price_cents,
+      price_cents: currentDraw?.price_cents ?? ticket_price_cents,
+      banner_title: currentDraw?.banner_title || banner_title,
+      promo_text: currentDraw?.promo_text || "",
+      max_numbers_per_user,
+      max_numbers_per_selection: max_numbers_per_user,
+      cashback_percent: Number(currentDraw?.cashback_percent ?? 100),
+      draw_id: currentDraw?.id ?? null,
+      current_draw: currentDraw,
+      currentDraw: currentDraw,
     });
   } catch (e) {
     console.error("[config][GET] error", e);
