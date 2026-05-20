@@ -69,6 +69,43 @@ export async function ensureMainRaffleCompat(client = null) {
     await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS coupon_credited_at TIMESTAMPTZ NULL`);
     await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS coupon_cashback_percent INTEGER NULL`);
     await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS coupon_amount_cents INTEGER NULL`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS provider_payment_id TEXT NULL`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS external_reference TEXT NULL`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS pix_qr_code TEXT NULL`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS pix_qr_code_base64 TEXT NULL`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS pix_ticket_url TEXT NULL`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS pix_copy_paste TEXT NULL`);
+    await q(`ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS raw JSONB NULL`);
+  }
+
+  if (!(await tableExists("coupon_balance_history", client))) {
+    await q(`
+      CREATE TABLE IF NOT EXISTS public.coupon_balance_history (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id int4 NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+        payment_id text NULL REFERENCES public.payments(id) ON DELETE SET NULL,
+        delta_cents int4 NOT NULL,
+        balance_before_cents int4 NOT NULL,
+        balance_after_cents int4 NOT NULL,
+        event_type text NOT NULL,
+        channel text NULL,
+        status text NULL,
+        draw_id int4 NULL,
+        reservation_id text NULL,
+        run_trace_id text NULL,
+        meta jsonb NOT NULL DEFAULT '{}'::jsonb,
+        gross_amount_cents int4 NULL,
+        cashback_percent int4 NULL,
+        cashback_amount_cents int4 NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await q(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_coupon_hist_payment_credit_purchase
+        ON public.coupon_balance_history (payment_id, event_type)
+        WHERE payment_id IS NOT NULL AND event_type = 'CREDIT_PURCHASE'
+    `);
   }
 
   const couponHistoryExists = await tableExists("coupon_balance_history", client);
@@ -89,6 +126,7 @@ export async function ensureMainRaffleCompat(client = null) {
     await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMPTZ`);
     await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
     await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+    await q(`ALTER TABLE public.numbers ADD COLUMN IF NOT EXISTS sold_at TIMESTAMPTZ NULL`);
 
     await q(`
       UPDATE public.numbers
@@ -129,6 +167,7 @@ export async function ensureMainRaffleCompat(client = null) {
     await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
     await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
     await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+    await q(`ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ NULL`);
 
     await q(`ALTER TABLE public.reservations ALTER COLUMN number DROP NOT NULL`);
 

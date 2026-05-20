@@ -3,16 +3,12 @@ import { Router } from 'express';
 import { MercadoPagoConfig, Payment } from 'mercadopago';
 import { query, ensureUserProfileColumns } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
-<<<<<<< HEAD
 import { ensureMainRaffleCompat, getTicketPriceCents } from '../services/mainRaffleCompat.js';
 import {
   isApprovedPaymentStatus,
   settleApprovedMainPayment,
 } from '../services/mainPaymentSettlement.js';
-=======
-import { getTicketPriceCents } from '../services/config.js';
-import { creditCouponOnApprovedPayment } from '../services/couponBalance.js';
->>>>>>> e3f1f3db64748382d233eca0aeb5b3e982a363e9
+import { getBackendPublicUrl } from '../utils/backendUrl.js';
 import {
   buildMercadoPagoPixPayload,
   normalizeCpf,
@@ -57,31 +53,13 @@ function normalizePaymentStatus(status) {
   return s || 'pending';
 }
 
-<<<<<<< HEAD
-function resolveBackendPublicUrl(req) {
-  const candidates = [
-    process.env.BACKEND_PUBLIC_URL,
-    process.env.PUBLIC_BACKEND_URL,
-    process.env.PUBLIC_URL,
-  ]
-    .map((v) => (v ? String(v).replace(/\/$/, '') : ''))
-    .filter(Boolean);
-=======
-function isApprovedPaymentStatus(status) {
-  return normalizePaymentStatus(status) === 'approved';
-}
->>>>>>> e3f1f3db64748382d233eca0aeb5b3e982a363e9
-
-  if (candidates.length) return candidates[0];
-
-  const protoRaw = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-  const proto = String(protoRaw).split(',')[0].trim() || 'https';
-  const host = req.get('host');
-  let fallback = `${proto}://${host}`.replace(/\/$/, '');
-  if (process.env.NODE_ENV === 'production' && !fallback.startsWith('https://')) {
-    fallback = fallback.replace(/^http:\/\//, 'https://');
-  }
-  return fallback;
+function reservationIsExpired(row) {
+  const expiresAt = row?.expires_at
+    ? new Date(row.expires_at)
+    : row?.created_at
+      ? new Date(new Date(row.created_at).getTime() + 30 * 60 * 1000)
+      : null;
+  return expiresAt ? expiresAt.getTime() < Date.now() : false;
 }
 
 /**
@@ -160,136 +138,42 @@ async function finalizeDrawIfComplete(drawId) {
 }
 
 /**
-<<<<<<< HEAD
-=======
- * Marca números como vendidos para um pagamento aprovado
- * e marca a reserva (se houver) como 'paid'.
- */
-async function settleApprovedPayment(paymentId, fallbackDrawId = null, fallbackNumbers = []) {
-  const pid = String(paymentId || '').trim();
-
-  if (!pid) {
-    return {
-      ok: false,
-      reason: 'missing_payment_id',
-      paymentRows: 0,
-      reservationRows: 0,
-      numberRows: 0,
-    };
-  }
-
-  const paymentRes = await query(
-    `
-      SELECT
-        id,
-        user_id,
-        draw_id,
-        numbers
-      FROM payments
-      WHERE id::text = $1::text
-      LIMIT 1
-    `,
-    [pid]
-  );
-
-  const payment = paymentRes.rows[0] || null;
-
-  const drawId = Number(payment?.draw_id || fallbackDrawId || 0);
-
-  const dbNumbers = normalizeNumbersList(payment?.numbers);
-  const numbers = dbNumbers.length ? dbNumbers : normalizeNumbersList(fallbackNumbers);
-
-  if (!drawId || numbers.length === 0) {
-    console.warn('[SETTLE_APPROVED_PAYMENT_SKIP]', {
-      paymentId: pid,
-      drawId,
-      numbers,
-      reason: 'missing_draw_or_numbers',
-    });
-
-    return {
-      ok: false,
-      reason: 'missing_draw_or_numbers',
-      paymentRows: 0,
-      reservationRows: 0,
-      numberRows: 0,
-    };
-  }
-
-  const paymentUpdate = await query(
-    `
-      UPDATE payments
-         SET status = 'approved',
-             paid_at = COALESCE(paid_at, NOW())
-       WHERE id::text = $1::text
-       RETURNING id, status, paid_at
-    `,
-    [pid]
-  );
-
-  const reservationLink = await query(
-    `SELECT id FROM reservations WHERE payment_id::text = $1::text LIMIT 1`,
-    [pid]
-  );
-  const linkedReservationId = reservationLink.rows[0]?.id || null;
-
-  const reservationUpdate = await query(
-    `
-      UPDATE reservations
-         SET status = 'paid',
-             payment_status = 'paid',
-             payment_id = COALESCE(payment_id, $1::text)
-       WHERE payment_id::text = $1::text
-          OR id::text = COALESCE($2::text, '')
-       RETURNING id, status, payment_status
-    `,
-    [pid, linkedReservationId ? String(linkedReservationId) : '']
-  );
-
-  const numbersUpdate = await query(
-    `
-      UPDATE numbers
-         SET status = 'sold',
-             payment_status = 'paid',
-             payment_id = $1::text,
-             reservation_id = NULL,
-             reserved_until = NULL
-       WHERE draw_id = $2
-         AND (
-           n = ANY($3::int[])
-           OR number = ANY($3::int[])
-         )
-       RETURNING draw_id, n, number, status, payment_status, payment_id
-    `,
-    [pid, drawId, numbers]
-  );
-
-  console.log('[SETTLE_APPROVED_PAYMENT_OK]', {
-    paymentId: pid,
-    drawId,
-    numbers,
-    paymentRows: paymentUpdate.rowCount,
-    reservationRows: reservationUpdate.rowCount,
-    numberRows: numbersUpdate.rowCount,
-  });
-
-  return {
-    ok: true,
-    reason: null,
-    paymentRows: paymentUpdate.rowCount,
-    reservationRows: reservationUpdate.rowCount,
-    numberRows: numbersUpdate.rowCount,
-    drawId,
-    numbers,
-  };
-}
-
-/**
->>>>>>> e3f1f3db64748382d233eca0aeb5b3e982a363e9
  * Varre pagamentos não aprovados nos últimos N minutos, reconcilia e assenta.
  * Reutilizada pelo endpoint /reconcile e pelo middleware autoReconcile.
  */
+async function _repairApprovedUnsettledPayments() {
+  const { rows } = await query(
+    `
+    SELECT DISTINCT p.id::text AS id
+      FROM public.payments p
+      JOIN public.numbers n ON n.draw_id = p.draw_id
+     WHERE LOWER(COALESCE(p.status, '')) IN ('approved', 'paid', 'pago')
+       AND COALESCE(n.n::int, n.number) = ANY(COALESCE(p.numbers, '{}'::int[]))
+       AND LOWER(COALESCE(n.status, '')) NOT IN ('sold', 'paid', 'approved', 'pago', 'vendido', 'aprovado')
+     LIMIT 200
+    `
+  );
+
+  let repaired = 0;
+  for (const { id } of rows) {
+    try {
+      const settled = await settleApprovedMainPayment(String(id), {
+        source: 'repair_approved_unsettled',
+      });
+      if (settled?.ok) repaired++;
+    } catch (e) {
+      console.warn('[repair_approved_unsettled] error', id, e?.message);
+    }
+  }
+  if (repaired > 0) {
+    console.log('[repair_approved_unsettled] repaired=', repaired);
+  }
+  return repaired;
+}
+
 async function _reconcilePendingPaymentsCore(minutes) {
+  await _repairApprovedUnsettledPayments();
+
   const lookbackMin = Math.max(5, Number(minutes || 1440)); // default 24h
   const { rows } = await query(
     `SELECT id
@@ -381,6 +265,7 @@ router.post('/pix', requireAuth, async (req, res) => {
               r.status,
               r.payment_status,
               r.expires_at,
+              r.created_at,
               u.email AS user_email,
               u.name AS user_name
          FROM reservations r
@@ -407,7 +292,7 @@ router.post('/pix', requireAuth, async (req, res) => {
     if (String(rs.payment_status || 'pending').toLowerCase() !== 'pending') {
       return res.status(400).json({ error: 'payment_not_pending' });
     }
-    if (rs.expires_at && new Date(rs.expires_at).getTime() < Date.now()) {
+    if (reservationIsExpired(rs)) {
       return res.status(400).json({ error: 'reservation_expired' });
     }
 
@@ -416,9 +301,8 @@ router.post('/pix', requireAuth, async (req, res) => {
     const amountCents = numbers.length * priceCents;
     const amount = Number((amountCents / 100).toFixed(2));
 
-    const baseUrl = resolveBackendPublicUrl(req);
-    const notificationUrl = `${baseUrl}/api/payments/webhook`;
-    console.log('[MP_WEBHOOK_URL] notification_url=', notificationUrl);
+    const notificationUrl = `${getBackendPublicUrl(req)}/api/payments/webhook`;
+    console.log('[MP_NOTIFICATION_URL]', { notificationUrl });
     if (isDebugMpEnabled()) {
       console.log('[mp.pix] notification_url=', notificationUrl);
     }
@@ -629,18 +513,32 @@ router.post('/pix', requireAuth, async (req, res) => {
     const userId = Number(rs.user_id || req.user.id);
     const createdStatus = normalizePaymentStatus(status);
 
+    const externalReference = String(reservationId);
     await query(
       `INSERT INTO payments (
          id, user_id, draw_id, numbers, amount_cents, status,
-         provider, qr_code, qr_code_base64
+         provider, provider_payment_id, external_reference,
+         qr_code, qr_code_base64, pix_qr_code, pix_qr_code_base64,
+         pix_ticket_url, pix_copy_paste, raw, updated_at
        )
-       VALUES ($1,$2,$3,$4,$5,$6,'mercadopago',$7,$8)
+       VALUES (
+         $1,$2,$3,$4,$5,$6,'mercadopago',$1,$7,
+         $8,$9,$8,$9,$10,$8,$11::jsonb,NOW()
+       )
        ON CONFLICT (id) DO UPDATE
          SET status = EXCLUDED.status,
              provider = 'mercadopago',
+             provider_payment_id = COALESCE(EXCLUDED.provider_payment_id, payments.provider_payment_id),
+             external_reference = COALESCE(EXCLUDED.external_reference, payments.external_reference),
              amount_cents = COALESCE(EXCLUDED.amount_cents, payments.amount_cents),
              qr_code = COALESCE(EXCLUDED.qr_code, payments.qr_code),
-             qr_code_base64 = COALESCE(EXCLUDED.qr_code_base64, payments.qr_code_base64)`,
+             qr_code_base64 = COALESCE(EXCLUDED.qr_code_base64, payments.qr_code_base64),
+             pix_qr_code = COALESCE(EXCLUDED.pix_qr_code, payments.pix_qr_code),
+             pix_qr_code_base64 = COALESCE(EXCLUDED.pix_qr_code_base64, payments.pix_qr_code_base64),
+             pix_ticket_url = COALESCE(EXCLUDED.pix_ticket_url, payments.pix_ticket_url),
+             pix_copy_paste = COALESCE(EXCLUDED.pix_copy_paste, payments.pix_copy_paste),
+             raw = COALESCE(EXCLUDED.raw, payments.raw),
+             updated_at = NOW()`,
       [
         String(id),
         userId,
@@ -648,8 +546,11 @@ router.post('/pix', requireAuth, async (req, res) => {
         numbers,
         amountCents,
         createdStatus,
+        externalReference,
         qr_code || null,
         qr_code_base64 || null,
+        ticket_url || null,
+        JSON.stringify(body),
       ]
     );
 
@@ -728,81 +629,44 @@ router.get('/:id/status', requireAuth, async (req, res) => {
     const resp = await mpPayment.get({ id: paymentId });
     const body = resp?.body || resp;
 
-<<<<<<< HEAD
     const rawStatus = body?.status || body?.payment_status || 'pending';
     const approvedNow = isApprovedPaymentStatus(rawStatus);
     const normalizedStatus = approvedNow ? 'approved' : normalizePaymentStatus(rawStatus);
 
-=======
-    const providerStatus = body?.status || body?.payment_status || 'pending';
-    const normalizedStatus = normalizePaymentStatus(providerStatus);
-
-    if (isApprovedPaymentStatus(normalizedStatus)) {
-      const settled = await settleApprovedPayment(paymentId);
-
-      if (!settled.ok || settled.numberRows <= 0) {
-        console.warn('[PIX_APPROVED_BUT_NOT_SETTLED]', {
-          paymentId,
-          settled,
-        });
-
-        return res.status(409).json({
-          ok: false,
-          status: 'approved',
-          code: 'approved_but_not_settled',
-          message: 'Pagamento aprovado, mas os números ainda não foram consolidados no banco.',
-          settled,
-        });
-      }
-
-      return res.json({
-        ok: true,
-        id: paymentId,
-        status: 'approved',
-        payment_status: 'approved',
-        settled: true,
-        numbers_status: 'sold',
-        drawId: settled.drawId,
-        numbers: settled.numbers,
-      });
-    }
-
->>>>>>> e3f1f3db64748382d233eca0aeb5b3e982a363e9
     await query(
-      `UPDATE payments SET status = $2 WHERE id::text = $1::text`,
+      `UPDATE payments
+          SET status = $2,
+              updated_at = NOW()
+        WHERE id::text = $1::text`,
       [paymentId, normalizedStatus]
     );
 
-<<<<<<< HEAD
     let settlement = null;
     if (approvedNow) {
-      settlement = await settleApprovedMainPayment(String(id), {
+      settlement = await settleApprovedMainPayment(paymentId, {
         source: 'mercadopago_status_check',
-        runTraceId: `mp.status#${String(id)}`,
+        runTraceId: `mp.status#${paymentId}`,
         mpPayment: body,
       });
     }
 
     const pr = await query(
-      `SELECT amount_cents, coupon_amount_cents, coupon_cashback_percent, status
+      `SELECT amount_cents, coupon_credited, coupon_amount_cents, coupon_cashback_percent, status
          FROM payments
         WHERE id = $1`,
-      [String(id)]
+      [paymentId]
     );
     const row = pr.rows[0] || {};
 
     return res.json({
-      id,
-      status: normalizedStatus,
-      amount_cents: row.amount_cents ?? null,
-      coupon_amount_cents: row.coupon_amount_cents ?? settlement?.creditResult?.delta_cents ?? null,
-      coupon_cashback_percent: row.coupon_cashback_percent ?? null,
-=======
-    return res.json({
       ok: true,
       id: paymentId,
       status: normalizedStatus,
->>>>>>> e3f1f3db64748382d233eca0aeb5b3e982a363e9
+      amount_cents: row.amount_cents ?? null,
+      coupon_credited: row.coupon_credited ?? false,
+      coupon_amount_cents: row.coupon_amount_cents ?? settlement?.creditResult?.delta_cents ?? null,
+      coupon_cashback_percent: row.coupon_cashback_percent ?? null,
+      settlement: settlement?.ok ? { ok: true, numbers: settlement.numbers } : settlement,
     });
   } catch (e) {
     console.error('[status] error:', e);
@@ -840,7 +704,10 @@ router.post('/webhook', async (req, res) => {
     });
 
     await query(
-      `UPDATE payments SET status = $2 WHERE id = $1`,
+      `UPDATE payments
+          SET status = $2,
+              updated_at = NOW()
+        WHERE id = $1`,
       [id, approvedNow ? 'approved' : normalizePaymentStatus(rawStatus)]
     );
 

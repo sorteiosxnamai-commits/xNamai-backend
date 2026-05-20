@@ -282,6 +282,13 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
     if (history_rows === 1 && user_rows === 1) {
       action = "credited";
       reason = null;
+      console.log("[COUPON_CREDITED]", {
+        paymentId: pid,
+        userId: user_id,
+        delta_cents,
+        channel,
+        source: options?.source || null,
+      });
     } else if (payment_rows === 1 && Number(delta_cents || 0) === 0 && isFinal) {
       action = "noop";
       reason = "zero_cashback";

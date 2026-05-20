@@ -81,6 +81,8 @@ async function upsertPaymentFromMp(client, paymentId, mpPayment) {
       ? Math.round(Number(mp.transaction_amount) * 100)
       : numbers.length * ticketCents;
 
+  const td = mp?.point_of_interaction?.transaction_data || {};
+
   const insertResult = await client.query(
     `
     INSERT INTO public.payments (
@@ -91,9 +93,19 @@ async function upsertPaymentFromMp(client, paymentId, mpPayment) {
       amount_cents,
       status,
       provider,
-      paid_at
+      provider_payment_id,
+      external_reference,
+      paid_at,
+      pix_qr_code,
+      pix_qr_code_base64,
+      pix_copy_paste,
+      raw,
+      updated_at
     )
-    VALUES ($1, $2, $3, $4::int[], $5, 'approved', 'mercadopago', NOW())
+    VALUES (
+      $1, $2, $3, $4::int[], $5, 'approved', 'mercadopago',
+      $1, $6, NOW(), $7, $8, $7, $9::jsonb, NOW()
+    )
     ON CONFLICT (id) DO UPDATE
        SET status = 'approved',
            user_id = COALESCE(EXCLUDED.user_id, payments.user_id),
@@ -104,10 +116,24 @@ async function upsertPaymentFromMp(client, paymentId, mpPayment) {
            END,
            amount_cents = COALESCE(NULLIF(EXCLUDED.amount_cents, 0), payments.amount_cents),
            provider = 'mercadopago',
-           paid_at = COALESCE(payments.paid_at, NOW())
+           provider_payment_id = COALESCE(EXCLUDED.provider_payment_id, payments.provider_payment_id),
+           external_reference = COALESCE(EXCLUDED.external_reference, payments.external_reference),
+           paid_at = COALESCE(payments.paid_at, NOW()),
+           raw = COALESCE(EXCLUDED.raw, payments.raw),
+           updated_at = NOW()
     RETURNING id, user_id, draw_id, numbers, amount_cents, status, coupon_credited
     `,
-    [String(paymentId), userId || null, drawId || null, numbers, amountCents]
+    [
+      String(paymentId),
+      userId || null,
+      drawId || null,
+      numbers,
+      amountCents,
+      externalRef || reservationId,
+      td.qr_code || null,
+      td.qr_code_base64 || null,
+      JSON.stringify(mp),
+    ]
   );
 
   return insertResult.rows[0] || null;
@@ -160,18 +186,10 @@ export async function settleApprovedMainPayment(paymentId, options = {}) {
 
     if (!payment && options.mpPayment) {
       payment = await upsertPaymentFromMp(client, cleanPaymentId, options.mpPayment);
-      if (payment) {
-        paymentRes = { rows: [payment] };
-      }
     }
 
     if (!payment) {
       await client.query("ROLLBACK");
-      console.warn("[MAIN_PAYMENT_SETTLED_SKIP]", {
-        paymentId: cleanPaymentId,
-        reason: "payment_not_found",
-        source: options.source || null,
-      });
       return {
         ok: false,
         reason: "payment_not_found",
@@ -211,7 +229,8 @@ export async function settleApprovedMainPayment(paymentId, options = {}) {
       UPDATE public.payments
          SET status = 'approved',
              paid_at = COALESCE(paid_at, NOW()),
-             provider = 'mercadopago'
+             provider = 'mercadopago',
+             updated_at = NOW()
        WHERE id = $1::text
       `,
       [cleanPaymentId]
@@ -225,10 +244,10 @@ export async function settleApprovedMainPayment(paymentId, options = {}) {
              payment_id = $1::text,
              reserved_until = NULL,
              reservation_id = NULL,
+             sold_at = COALESCE(sold_at, NOW()),
              updated_at = NOW()
        WHERE draw_id = $2
          AND COALESCE(n::int, number) = ANY($3::int[])
-         AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'approved', 'pago')
       `,
       [cleanPaymentId, drawId, numbers]
     );
@@ -239,6 +258,7 @@ export async function settleApprovedMainPayment(paymentId, options = {}) {
          SET status = 'paid',
              payment_status = 'paid',
              payment_id = $1::text,
+             paid_at = COALESCE(paid_at, NOW()),
              updated_at = NOW()
        WHERE payment_id = $1::text
           OR (
@@ -252,7 +272,7 @@ export async function settleApprovedMainPayment(paymentId, options = {}) {
 
     const creditResult = await creditCouponOnApprovedPayment(cleanPaymentId, {
       channel: "PIX",
-      source: options.source || "main_payment_settlement",
+      source: options.source || "main_settlement",
       runTraceId: options.runTraceId || null,
       pgClient: client,
       meta: {
@@ -274,6 +294,15 @@ export async function settleApprovedMainPayment(paymentId, options = {}) {
       delta_cents: creditResult?.delta_cents,
       source: options.source || null,
     });
+
+    if (creditResult?.action === "credited") {
+      console.log("[COUPON_CREDITED]", {
+        paymentId: cleanPaymentId,
+        userId: creditResult?.user_id,
+        delta_cents: creditResult?.delta_cents,
+        source: options.source || null,
+      });
+    }
 
     return {
       ok: true,

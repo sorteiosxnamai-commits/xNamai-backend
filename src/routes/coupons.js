@@ -110,12 +110,19 @@ router.post("/sync", requireAuth, async (req, res) => {
         // eslint-disable-next-line no-await-in-loop
         const creditRes = await creditCouponOnApprovedPayment(String(p.id), {
           channel: String(p.provider || "").toLowerCase() === "vindi" ? "VINDI" : "PIX",
-          source: "reconcile_sync",
+          source: "coupons_sync",
           runTraceId: `coupons.sync#${rid}`,
-          meta: { unit_cents: 5500 },
+          meta: { cashback_source: "draws.cashback_percent" },
         });
-        if (creditRes?.action === "credited") creditedCount++;
-        else if (creditRes?.action === "noop") noopCount++;
+        if (creditRes?.action === "credited") {
+          creditedCount++;
+          console.log("[COUPON_CREDITED]", {
+            paymentId: String(p.id),
+            userId: creditRes?.user_id,
+            delta_cents: creditRes?.delta_cents,
+            source: "coupons_sync",
+          });
+        } else if (creditRes?.action === "noop") noopCount++;
         else errorCount++;
 
         if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {

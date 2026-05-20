@@ -17,23 +17,10 @@ import {
   isApprovedPaymentStatus,
   settleApprovedMainPayment,
 } from '../services/mainPaymentSettlement.js';
+import { getBackendPublicUrl } from '../utils/backendUrl.js';
 
 const router = Router();
 const RESERVATION_TTL_MINUTES = 30;
-
-function getBaseUrl(req) {
-  const publicUrl = process.env.PUBLIC_URL ? String(process.env.PUBLIC_URL).replace(/\/$/, '') : '';
-  if (publicUrl) return publicUrl;
-
-  const protoRaw = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-  const proto = String(protoRaw).split(',')[0].trim() || 'https';
-  const host = req.get('host');
-  let baseUrl = `${proto}://${host}`.replace(/\/$/, '');
-  if (process.env.NODE_ENV === 'production' && !baseUrl.startsWith('https://')) {
-    baseUrl = baseUrl.replace(/^http:\/\//, 'https://');
-  }
-  return baseUrl;
-}
 
 /**
  * Expira reservas vencidas (best-effort, fora da transação principal).
@@ -41,34 +28,7 @@ function getBaseUrl(req) {
  * dentro da transação ao reservar (garante consistência).
  */
 async function cleanupExpiredGlobal(client = null) {
-  const q = client ? client.query.bind(client) : query;
-
-  await q(
-    `UPDATE public.reservations
-        SET status = 'expired',
-            payment_status = 'expired',
-            updated_at = NOW()
-      WHERE expires_at IS NOT NULL
-        AND expires_at <= NOW()
-        AND LOWER(COALESCE(status, '')) IN ('active','pending','reserved','reservado','pendente')
-        AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`
-  );
-
-  await q(
-    `UPDATE public.numbers
-        SET status = 'available',
-            reservation_id = NULL,
-            user_id = NULL,
-            payment_status = 'pending',
-            reserved_until = NULL,
-            reserved_at = NULL,
-            payment_id = NULL,
-            updated_at = NOW()
-      WHERE LOWER(COALESCE(status, '')) IN ('reserved','pending','reservado','pendente')
-        AND reserved_until IS NOT NULL
-        AND reserved_until <= NOW()
-        AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')`
-  );
+  await cleanupExpiredMainReservations(client);
 }
 
 router.post('/', requireAuth, async (req, res) => {
@@ -438,6 +398,7 @@ router.post('/:reservationId/pix', requireAuth, async (req, res) => {
               r.status,
               r.payment_status,
               r.expires_at,
+              r.created_at,
               u.email AS user_email,
               u.name AS user_name
          FROM public.reservations r
@@ -476,7 +437,12 @@ router.post('/:reservationId/pix', requireAuth, async (req, res) => {
       });
     }
 
-    if (reservation.expires_at && new Date(reservation.expires_at).getTime() < Date.now()) {
+    const effectiveExpires = reservation.expires_at
+      ? new Date(reservation.expires_at)
+      : reservation.created_at
+        ? new Date(new Date(reservation.created_at).getTime() + RESERVATION_TTL_MINUTES * 60 * 1000)
+        : null;
+    if (effectiveExpires && effectiveExpires.getTime() < Date.now()) {
       return res.status(400).json({
         ok: false,
         error: 'Reserva expirada.',
@@ -493,7 +459,11 @@ router.post('/:reservationId/pix', requireAuth, async (req, res) => {
       payer_email: reservation.user_email || req.user.email,
       payer_name: reservation.user_name || req.user.name || req.user.email,
       external_reference: String(reservationId),
-      notification_url: `${getBaseUrl(req)}/api/payments/webhook`,
+      notification_url: (() => {
+        const url = `${getBackendPublicUrl(req)}/api/payments/webhook`;
+        console.log('[MP_NOTIFICATION_URL]', { notificationUrl: url });
+        return url;
+      })(),
       metadata: {
         type: 'main',
         draw_id: reservation.draw_id,
@@ -507,14 +477,26 @@ router.post('/:reservationId/pix', requireAuth, async (req, res) => {
     await query(
       `INSERT INTO payments (
          id, user_id, draw_id, numbers, amount_cents, status,
-         provider, qr_code, qr_code_base64
+         provider, provider_payment_id, external_reference,
+         qr_code, qr_code_base64, pix_qr_code, pix_qr_code_base64,
+         pix_ticket_url, pix_copy_paste, updated_at
        )
-       VALUES ($1,$2,$3,$4,$5,$6,'mercadopago',$7,$8)
+       VALUES (
+         $1,$2,$3,$4,$5,$6,'mercadopago',$1,$7,
+         $8,$9,$8,$9,$10,$8,NOW()
+       )
        ON CONFLICT (id) DO UPDATE
          SET status = EXCLUDED.status,
              provider = 'mercadopago',
+             provider_payment_id = COALESCE(EXCLUDED.provider_payment_id, payments.provider_payment_id),
+             external_reference = COALESCE(EXCLUDED.external_reference, payments.external_reference),
              qr_code = COALESCE(EXCLUDED.qr_code, payments.qr_code),
-             qr_code_base64 = COALESCE(EXCLUDED.qr_code_base64, payments.qr_code_base64)`,
+             qr_code_base64 = COALESCE(EXCLUDED.qr_code_base64, payments.qr_code_base64),
+             pix_qr_code = COALESCE(EXCLUDED.pix_qr_code, payments.pix_qr_code),
+             pix_qr_code_base64 = COALESCE(EXCLUDED.pix_qr_code_base64, payments.pix_qr_code_base64),
+             pix_ticket_url = COALESCE(EXCLUDED.pix_ticket_url, payments.pix_ticket_url),
+             pix_copy_paste = COALESCE(EXCLUDED.pix_copy_paste, payments.pix_copy_paste),
+             updated_at = NOW()`,
       [
         pix.payment_id,
         req.user.id,
@@ -522,8 +504,10 @@ router.post('/:reservationId/pix', requireAuth, async (req, res) => {
         numbers,
         amountCents,
         pix.status,
+        String(reservationId),
         pix.qr_code || null,
         pix.qr_code_base64 || null,
+        pix.ticket_url || null,
       ]
     );
 

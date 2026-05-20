@@ -342,10 +342,17 @@ async function mercadoPagoWebhookHandler(req, res) {
         }
       } else {
         try {
-          await settleApprovedMainPayment(String(payment.id), {
+          const settled = await settleApprovedMainPayment(String(payment.id), {
             source: "mercadopago_generic_webhook",
             mpPayment: payment,
           });
+          if (!settled?.ok) {
+            console.warn("[MAIN_PAYMENT_NOT_FOUND_FOR_MP_WEBHOOK]", {
+              paymentId: String(payment.id),
+              externalReference,
+              reason: settled?.reason || "unknown",
+            });
+          }
         } catch (settleError) {
           console.error("[MAIN_PAYMENT_SETTLE_FAILED]", {
             paymentId: String(payment.id),

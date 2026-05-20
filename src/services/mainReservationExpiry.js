@@ -18,6 +18,9 @@ const ACTIVE_RESERVATION_STATUSES = [
 const PAID_PAYMENT_STATUSES = ["paid", "approved", "pago"];
 const PAID_NUMBER_STATUSES = ["sold", "paid", "approved", "pago", "vendido", "aprovado"];
 
+/** Reserva pública (não admin/manual). */
+const PUBLIC_SOURCE_SQL = `LOWER(COALESCE(source, 'public')) IN ('public', '')`;
+
 export async function cleanupExpiredMainReservations(client = null, drawId = null) {
   const q = runner(client);
 
@@ -33,17 +36,22 @@ export async function cleanupExpiredMainReservations(client = null, drawId = nul
     drawWhereNumbers = `AND n.draw_id = $1`;
   }
 
+  const activeStatusList = ACTIVE_RESERVATION_STATUSES.map((s) => `'${s}'`).join(", ");
+  const paidStatusList = PAID_PAYMENT_STATUSES.map((s) => `'${s}'`).join(", ");
+  const paidNumberList = PAID_NUMBER_STATUSES.map((s) => `'${s}'`).join(", ");
+
   const expiredReservationsResult = await q(
     `
     UPDATE public.reservations
        SET status = 'expired',
            payment_status = 'expired',
            updated_at = NOW()
-     WHERE expires_at IS NOT NULL
-       AND expires_at <= NOW()
+     WHERE COALESCE(expires_at, created_at + interval '30 minutes') <= NOW()
        ${drawWhereReservations}
-       AND LOWER(COALESCE(status, '')) IN (${ACTIVE_RESERVATION_STATUSES.map((s) => `'${s}'`).join(", ")})
-       AND LOWER(COALESCE(payment_status, 'pending')) NOT IN (${PAID_PAYMENT_STATUSES.map((s) => `'${s}'`).join(", ")})
+       AND ${PUBLIC_SOURCE_SQL}
+       AND LOWER(COALESCE(status, '')) IN (${activeStatusList})
+       AND LOWER(COALESCE(payment_status, 'pending')) NOT IN (${paidStatusList})
+       AND LOWER(COALESCE(status, '')) NOT IN (${paidStatusList})
      RETURNING id, reservation_group_id, draw_id
     `,
     params
@@ -62,26 +70,56 @@ export async function cleanupExpiredMainReservations(client = null, drawId = nul
            reserved_at = NULL,
            reserved_until = NULL,
            updated_at = NOW()
-     WHERE (
-       (n.reserved_until IS NOT NULL AND n.reserved_until <= NOW())
-       OR EXISTS (
-         SELECT 1
-           FROM public.reservations r
-          WHERE r.expires_at IS NOT NULL
-            AND r.expires_at <= NOW()
-            ${drawWhereReservations.replace(/draw_id/g, "r.draw_id")}
-            AND LOWER(COALESCE(r.status, '')) = 'expired'
-            AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN (${PAID_PAYMENT_STATUSES.map((s) => `'${s}'`).join(", ")})
-            AND (
-              n.reservation_id::text = r.id::text
-              OR n.reservation_id::text = r.reservation_group_id::text
-              OR COALESCE(n.n::int, n.number) = ANY(COALESCE(r.numbers, '{}'::int[]))
-            )
-       )
+     WHERE NOT EXISTS (
+       SELECT 1
+         FROM public.payments p
+        WHERE p.draw_id = n.draw_id
+          AND LOWER(COALESCE(p.status, '')) IN (${paidStatusList})
+          AND COALESCE(n.n::int, n.number) = ANY(COALESCE(p.numbers, '{}'::int[]))
      )
+       AND (
+         (
+           n.reserved_until IS NOT NULL
+           AND n.reserved_until <= NOW()
+         )
+         OR EXISTS (
+           SELECT 1
+             FROM public.reservations r
+            WHERE COALESCE(r.expires_at, r.created_at + interval '30 minutes') <= NOW()
+              ${drawWhereReservations.replace(/draw_id/g, "r.draw_id")}
+              AND ${PUBLIC_SOURCE_SQL.replace(/source/g, "r.source")}
+              AND LOWER(COALESCE(r.status, '')) = 'expired'
+              AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN (${paidStatusList})
+              AND (
+                n.reservation_id::text = r.id::text
+                OR n.reservation_id::text = r.reservation_group_id::text
+                OR (
+                  r.draw_id = n.draw_id
+                  AND COALESCE(n.n::int, n.number) = ANY(COALESCE(r.numbers, '{}'::int[]))
+                )
+              )
+         )
+         OR EXISTS (
+           SELECT 1
+             FROM public.reservations r
+            WHERE COALESCE(r.expires_at, r.created_at + interval '30 minutes') <= NOW()
+              ${drawWhereReservations.replace(/draw_id/g, "r.draw_id")}
+              AND ${PUBLIC_SOURCE_SQL.replace(/source/g, "r.source")}
+              AND LOWER(COALESCE(r.status, '')) IN (${activeStatusList})
+              AND LOWER(COALESCE(r.payment_status, 'pending')) NOT IN (${paidStatusList})
+              AND (
+                n.reservation_id::text = r.id::text
+                OR n.reservation_id::text = r.reservation_group_id::text
+                OR (
+                  r.draw_id = n.draw_id
+                  AND COALESCE(n.n::int, n.number) = ANY(COALESCE(r.numbers, '{}'::int[]))
+                )
+              )
+         )
+       )
        ${drawWhereNumbers}
-       AND LOWER(COALESCE(n.status, '')) NOT IN (${PAID_NUMBER_STATUSES.map((s) => `'${s}'`).join(", ")})
-       AND LOWER(COALESCE(n.payment_status, 'pending')) NOT IN (${PAID_PAYMENT_STATUSES.map((s) => `'${s}'`).join(", ")})
+       AND LOWER(COALESCE(n.status, '')) NOT IN (${paidNumberList})
+       AND LOWER(COALESCE(n.payment_status, 'pending')) NOT IN (${paidStatusList})
      RETURNING COALESCE(n.n::int, n.number) AS num, n.draw_id
     `,
     params

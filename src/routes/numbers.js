@@ -6,6 +6,8 @@ import { cleanupExpiredMainReservations } from '../services/mainReservationExpir
 
 const router = Router();
 
+const ADMIN_SOURCES = new Set(['admin', 'manual', 'admin_manual']);
+
 function initialsFromNameOrEmail(name, email) {
   const nm = String(name || '').trim();
   if (nm) {
@@ -22,17 +24,6 @@ function initialsFromNameOrEmail(name, email) {
 
 /**
  * GET /api/numbers
- *
- * Regras do Sorteio Principal:
- * - status sold/paid/approved => indisponível.
- * - status reserved/pending com reserved_until > NOW() => reservado por 30 minutos.
- * - status reserved/pending com reserved_until NULL e user_id preenchido => reservado permanente pelo admin.
- * - reserved_until vencido => volta para available pela limpeza.
- *
- * Aceita draw_id opcional:
- *   /api/numbers?draw_id=10
- *
- * Se não vier draw_id, usa o sorteio aberto mais recente, preservando compatibilidade.
  */
 router.get('/', async (req, res) => {
   try {
@@ -77,22 +68,40 @@ router.get('/', async (req, res) => {
 
     await cleanupExpiredMainReservations(null, drawId);
 
-    const expiredReservationLinks = await query(
+    const reservationMeta = await query(
       `
-      SELECT id::text AS id, reservation_group_id::text AS group_id
-        FROM public.reservations
-       WHERE draw_id = $1
-         AND expires_at IS NOT NULL
-         AND expires_at <= NOW()
-         AND LOWER(COALESCE(status, '')) IN ('expired', 'cancelled', 'canceled')
+      SELECT
+        id::text AS id,
+        reservation_group_id::text AS group_id,
+        LOWER(COALESCE(source, 'public')) AS source,
+        status,
+        payment_status,
+        COALESCE(expires_at, created_at + interval '30 minutes') AS effective_expires_at
+      FROM public.reservations
+      WHERE draw_id = $1
       `,
       [drawId]
     );
 
+    const reservationByLink = new Map();
     const expiredLinkIds = new Set();
-    for (const row of expiredReservationLinks.rows || []) {
-      if (row.id) expiredLinkIds.add(String(row.id));
-      if (row.group_id) expiredLinkIds.add(String(row.group_id));
+    const now = Date.now();
+
+    for (const row of reservationMeta.rows || []) {
+      const meta = {
+        source: row.source,
+        status: String(row.status || '').toLowerCase(),
+        payment_status: String(row.payment_status || 'pending').toLowerCase(),
+        expired:
+          new Date(row.effective_expires_at).getTime() <= now ||
+          ['expired', 'cancelled', 'canceled'].includes(String(row.status || '').toLowerCase()),
+      };
+      if (row.id) reservationByLink.set(String(row.id), meta);
+      if (row.group_id) reservationByLink.set(String(row.group_id), meta);
+      if (meta.expired) {
+        if (row.id) expiredLinkIds.add(String(row.id));
+        if (row.group_id) expiredLinkIds.add(String(row.group_id));
+      }
     }
 
     const pays = await query(
@@ -129,15 +138,14 @@ router.get('/', async (req, res) => {
         reserved_until,
         reserved_at,
         user_id,
-        reservation_id
+        reservation_id,
+        payment_id
       FROM public.numbers
       WHERE draw_id = $1
       ORDER BY COALESCE(n::int, number) ASC
       `,
       [drawId]
     );
-
-    const now = Date.now();
 
     const numbers = base.rows
       .map((row) => {
@@ -170,24 +178,36 @@ router.get('/', async (req, res) => {
 
         const isReservedStatus = ['reserved', 'pending', 'reservado', 'pendente'].includes(status);
 
-        const isTemporaryReservation =
-          isReservedStatus &&
-          reservedUntilMs &&
-          reservedUntilMs > now;
-
         const reservationLink = row.reservation_id
           ? String(row.reservation_id)
           : null;
 
+        const linkedReservation = reservationLink
+          ? reservationByLink.get(reservationLink)
+          : null;
+
         const linkedToExpiredReservation =
-          reservationLink && expiredLinkIds.has(reservationLink);
+          reservationLink &&
+          (expiredLinkIds.has(reservationLink) || linkedReservation?.expired);
+
+        const isPublicSource =
+          !linkedReservation ||
+          !ADMIN_SOURCES.has(linkedReservation.source);
+
+        const isTemporaryReservation =
+          isReservedStatus &&
+          reservedUntilMs &&
+          reservedUntilMs > now &&
+          !linkedToExpiredReservation;
 
         const isAdminPermanentReservation =
           isReservedStatus &&
           !reservedUntilMs &&
           row.user_id != null &&
           !linkedToExpiredReservation &&
-          paymentStatus === 'pending';
+          !isPublicSource &&
+          linkedReservation &&
+          ADMIN_SOURCES.has(linkedReservation.source);
 
         if (isTemporaryReservation || isAdminPermanentReservation) {
           return {
