@@ -30,6 +30,27 @@ const mapUser = (r) => ({
 });
 
 const normStr = (v, max = 255) => String(v ?? "").trim().slice(0, max);
+
+async function existingColumns(client, tableName, columns) {
+  const result = await client.query(
+    `
+    SELECT column_name
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = $1
+       AND column_name = ANY($2::text[])
+    `,
+    [tableName, columns]
+  );
+  return new Set((result.rows || []).map((row) => row.column_name));
+}
+
+function addSqlValue(parts, values, column, value, cast = "") {
+  values.push(value);
+  parts.columns.push(column);
+  parts.placeholders.push(`$${values.length}${cast}`);
+}
+
 const toInt = (v, def = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? (n | 0) : def;
@@ -429,6 +450,7 @@ router.post("/:id/assign-numbers", async (req, res) => {
 
     const user = userResult.rows[0];
     const groupId = randomUUID();
+    const adminPaymentId = `adminassign:${groupId}`;
     const usesUuidId = await reservationIdIsUuid(client);
 
     let reservationIdForResponse = groupId;
@@ -492,7 +514,7 @@ router.post("/:id/assign-numbers", async (req, res) => {
         ]
       );
 
-      await client.query(
+      const reservedNumbers = await client.query(
         `
         UPDATE public.numbers
            SET status = 'reserved',
@@ -508,6 +530,10 @@ router.post("/:id/assign-numbers", async (req, res) => {
         `,
         [draw_id, numbers, user_id, groupId, expiresAt]
       );
+
+      if (reservedNumbers.rowCount !== numbers.length) {
+        throw new Error(`assignment_reserve_rowcount_mismatch:${reservedNumbers.rowCount}/${numbers.length}`);
+      }
     } else {
       const inserted = await client.query(
         `
@@ -593,20 +619,137 @@ router.post("/:id/assign-numbers", async (req, res) => {
       }
     }
 
+    const paymentColumns = await existingColumns(client, "payments", [
+      "provider",
+      "provider_payment_id",
+      "external_reference",
+      "paid_at",
+      "updated_at",
+    ]);
+    const paymentParts = {
+      columns: ["id", "user_id", "draw_id", "numbers", "amount_cents", "status"],
+      placeholders: ["$1", "$2", "$3", "$4::int[]", "$5", "$6"],
+    };
+    const paymentValues = [
+      adminPaymentId,
+      user_id,
+      draw_id,
+      numbers,
+      amount_cents,
+      "approved",
+    ];
+
+    if (paymentColumns.has("provider")) {
+      addSqlValue(paymentParts, paymentValues, "provider", "admin_assign");
+    }
+    if (paymentColumns.has("provider_payment_id")) {
+      addSqlValue(paymentParts, paymentValues, "provider_payment_id", adminPaymentId);
+    }
+    if (paymentColumns.has("external_reference")) {
+      addSqlValue(paymentParts, paymentValues, "external_reference", groupId);
+    }
+    if (paymentColumns.has("paid_at")) {
+      paymentParts.columns.push("paid_at");
+      paymentParts.placeholders.push("NOW()");
+    }
+    if (paymentColumns.has("updated_at")) {
+      paymentParts.columns.push("updated_at");
+      paymentParts.placeholders.push("NOW()");
+    }
+
+    await client.query(
+      `
+      INSERT INTO public.payments (
+        ${paymentParts.columns.join(", ")}
+      )
+      VALUES (
+        ${paymentParts.placeholders.join(", ")}
+      )
+      `,
+      paymentValues
+    );
+
+    const reservationColumns = await existingColumns(client, "reservations", [
+      "paid_at",
+      "updated_at",
+    ]);
+    const reservationSet = [
+      "status = 'paid'",
+      "payment_status = 'paid'",
+      "payment_id = $2::text",
+      "expires_at = NULL",
+    ];
+    if (reservationColumns.has("paid_at")) {
+      reservationSet.push("paid_at = COALESCE(paid_at, NOW())");
+    }
+    if (reservationColumns.has("updated_at")) {
+      reservationSet.push("updated_at = NOW()");
+    }
+
+    const paidReservations = await client.query(
+      `
+      UPDATE public.reservations
+         SET ${reservationSet.join(",\n             ")}
+       WHERE reservation_group_id::text = $1::text
+          OR id::text = $1::text
+      `,
+      [groupId, adminPaymentId]
+    );
+
+    if (!paidReservations.rowCount) {
+      throw new Error("assignment_reservation_paid_mismatch:0");
+    }
+
+    const numberColumns = await existingColumns(client, "numbers", [
+      "sold_at",
+      "updated_at",
+    ]);
+    const numberSet = [
+      "status = 'sold'",
+      "payment_status = 'paid'",
+      "payment_id = $3::text",
+      "user_id = $4",
+      "reserved_until = NULL",
+      "reservation_id = NULL",
+    ];
+    if (numberColumns.has("sold_at")) {
+      numberSet.push("sold_at = COALESCE(sold_at, NOW())");
+    }
+    if (numberColumns.has("updated_at")) {
+      numberSet.push("updated_at = NOW()");
+    }
+
+    const soldNumbers = await client.query(
+      `
+      UPDATE public.numbers
+         SET ${numberSet.join(",\n             ")}
+       WHERE draw_id = $1
+         AND COALESCE(n::int, number) = ANY($2::int[])
+      `,
+      [draw_id, numbers, adminPaymentId, user_id]
+    );
+
+    if (soldNumbers.rowCount !== numbers.length) {
+      throw new Error(`assignment_sold_rowcount_mismatch:${soldNumbers.rowCount}/${numbers.length}`);
+    }
+
     await client.query("COMMIT");
 
     return res.status(201).json({
       ok: true,
       success: true,
-      message: "Números atribuídos e reservados com sucesso.",
+      message: "Números atribuídos e marcados como pagos/indisponíveis com sucesso.",
       reservation_id: reservationIdForResponse,
       reservationId: reservationIdForResponse,
+      payment_id: adminPaymentId,
+      paymentId: adminPaymentId,
       draw_id,
       drawId: draw_id,
       user_id,
       numbers,
-      status: "reserved",
-      payment_status: "pending",
+      status: "paid",
+      payment_status: "paid",
+      number_status: "sold",
       expires_at: null,
       expiresAt: null,
     });
