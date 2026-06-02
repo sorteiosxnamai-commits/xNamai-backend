@@ -4,36 +4,52 @@ import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = Router();
+
 const norm = (v, max = 2048) => String(v ?? "").trim().slice(0, max);
 
 /**
  * GET /api/admin/winners
- * Lista sorteios realizados (realized_at IS NOT NULL)
+ * Lista sorteios realizados/fechados.
+ *
+ * Ajuste mínimo:
+ * antes dependia apenas de realized_at;
+ * no XNamai muitos sorteios têm closed_at preenchido e realized_at null.
  */
-router.get("/", requireAuth, requireAdmin, async (req, res) => {
+router.get("/", requireAuth, requireAdmin, async (_req, res) => {
   try {
     const r = await query(
       `
-      select
-        d.id                                                as draw_id,
-        coalesce(nullif(d.winner_name,''), u.name, u.email, '-') as winner_name,
+      SELECT
+        d.id AS draw_id,
+        COALESCE(NULLIF(d.winner_name, ''), u.name, u.email, '-') AS winner_name,
         d.winner_number,
-        d.realized_at,
+        COALESCE(d.realized_at, d.result_at, d.closed_at) AS realized_at,
         d.closed_at,
         d.product_name,
         d.product_link
-      from public.draws d
-      left join public.users u on u.id = d.winner_user_id
-      where d.realized_at is not null
-      order by d.realized_at desc, d.id desc
+      FROM public.draws d
+      LEFT JOIN public.users u
+        ON u.id = d.winner_user_id
+      WHERE
+        COALESCE(d.realized_at, d.result_at, d.closed_at) IS NOT NULL
+        OR LOWER(COALESCE(d.status, '')) IN ('closed', 'encerrado', 'finalizado')
+      ORDER BY
+        COALESCE(d.realized_at, d.result_at, d.closed_at, d.opened_at, d.created_at) DESC NULLS LAST,
+        d.id DESC
       `
     );
 
     const now = Date.now();
+
     const winners = (r.rows || []).map((row) => {
       const realized = row.realized_at ? new Date(row.realized_at) : null;
-      const daysSince = realized ? Math.max(0, Math.floor((now - realized.getTime()) / 86400000)) : 0;
+
+      const daysSince = realized
+        ? Math.max(0, Math.floor((now - realized.getTime()) / 86400000))
+        : 0;
+
       const redeemed = !!row.closed_at;
+
       return {
         draw_id: row.draw_id,
         winner_name: row.winner_name || "-",
@@ -48,7 +64,11 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
       };
     });
 
-    return res.json({ ok: true, winners, data: winners });
+    return res.json({
+      ok: true,
+      winners,
+      data: winners,
+    });
   } catch (e) {
     console.error("[admin/winners] error:", e);
     return res.status(500).json({ error: "list_failed" });
@@ -64,13 +84,17 @@ router.patch("/:id", requireAuth, requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     const { product_name, product_link } = req.body || {};
 
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ error: "invalid_id" });
+    }
+
     const { rows } = await query(
       `
-      update public.draws
-         set product_name = coalesce($2, product_name),
-             product_link = coalesce($3, product_link)
-       where id = $1
-       returning id, product_name, product_link
+      UPDATE public.draws
+         SET product_name = COALESCE($2, product_name),
+             product_link = COALESCE($3, product_link)
+       WHERE id = $1
+       RETURNING id, product_name, product_link
       `,
       [
         id,
@@ -79,7 +103,9 @@ router.patch("/:id", requireAuth, requireAdmin, async (req, res) => {
       ]
     );
 
-    if (!rows.length) return res.status(404).json({ error: "not_found" });
+    if (!rows.length) {
+      return res.status(404).json({ error: "not_found" });
+    }
 
     return res.json({
       draw_id: rows[0].id,
