@@ -23,7 +23,7 @@ router.get("/", requireAuth, requireAdmin, async (_req, res) => {
         d.id AS draw_id,
         COALESCE(u.name, u.email, '-') AS winner_name,
         d.winner_number,
-        COALESCE(d.realized_at, d.result_at, d.closed_at) AS realized_at,
+        d.realized_at AS realized_at,
         d.closed_at,
         d.product_name,
         d.product_link
@@ -31,10 +31,9 @@ router.get("/", requireAuth, requireAdmin, async (_req, res) => {
       LEFT JOIN public.users u
         ON u.id::bigint = d.winner_user_id::bigint
       WHERE
-        COALESCE(d.realized_at, d.result_at, d.closed_at) IS NOT NULL
-        OR LOWER(COALESCE(d.status, '')) IN ('closed', 'encerrado', 'finalizado')
+        d.realized_at IS NOT NULL
       ORDER BY
-        COALESCE(d.realized_at, d.result_at, d.closed_at, d.opened_at, d.created_at) DESC NULLS LAST,
+        d.realized_at DESC NULLS LAST,
         d.id DESC
       `
     );
