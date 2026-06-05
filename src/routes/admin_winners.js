@@ -7,6 +7,24 @@ const router = Router();
 
 const norm = (v, max = 2048) => String(v ?? "").trim().slice(0, max);
 
+const normWinnerName = (v) => {
+  if (v == null) return null;
+  const text = String(v).trim();
+  return !text || text === "-" ? null : text;
+};
+
+const normWinnerNumber = (v) => {
+  if (v == null) return null;
+  const text = String(v).trim();
+  if (!text || text === "-") return null;
+  if (!/^\d+$/.test(text)) return undefined;
+
+  const n = Number(text);
+  if (!Number.isInteger(n) || n < 0 || n > 99) return undefined;
+
+  return n;
+};
+
 /**
  * GET /api/admin/winners
  * Lista sorteios realizados/fechados.
@@ -21,9 +39,9 @@ router.get("/", requireAuth, requireAdmin, async (_req, res) => {
       `
       SELECT
         d.id AS draw_id,
-        COALESCE(u.name, u.email, '-') AS winner_name,
+        COALESCE(NULLIF(d.winner_name, ''), u.name, u.email, '-') AS winner_name,
         d.winner_number,
-        d.realized_at AS realized_at,
+        COALESCE(d.realized_at, d.result_at, d.closed_at) AS realized_at,
         d.closed_at,
         d.product_name,
         d.product_link
@@ -31,9 +49,10 @@ router.get("/", requireAuth, requireAdmin, async (_req, res) => {
       LEFT JOIN public.users u
         ON u.id::bigint = d.winner_user_id::bigint
       WHERE
-        d.realized_at IS NOT NULL
+        COALESCE(d.realized_at, d.result_at, d.closed_at) IS NOT NULL
+        OR LOWER(COALESCE(d.status, '')) IN ('closed', 'encerrado', 'finalizado')
       ORDER BY
-        d.realized_at DESC NULLS LAST,
+        COALESCE(d.realized_at, d.result_at, d.closed_at, d.opened_at, d.created_at) DESC NULLS LAST,
         d.id DESC
       `
     );
@@ -76,29 +95,41 @@ router.get("/", requireAuth, requireAdmin, async (_req, res) => {
 
 /**
  * PATCH /api/admin/winners/:id
- * body: { product_name?, product_link? }
+ * body: { winner_name?, winner_number?, product_name?, product_link? }
  */
 router.patch("/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { product_name, product_link } = req.body || {};
+    const { winner_name, winner_number, product_name, product_link } = req.body || {};
 
     if (!Number.isFinite(id)) {
       return res.status(400).json({ error: "invalid_id" });
+    }
+
+    const normalizedWinnerName = normWinnerName(winner_name);
+    const normalizedWinnerNumber = normWinnerNumber(winner_number);
+
+    if (normalizedWinnerNumber === undefined) {
+      return res.status(400).json({ ok: false, error: "invalid_winner_number" });
     }
 
     const { rows } = await query(
       `
       UPDATE public.draws
          SET product_name = COALESCE($2, product_name),
-             product_link = COALESCE($3, product_link)
+             product_link = COALESCE($3, product_link),
+             winner_name = $4,
+             winner_number = $5,
+             updated_at = NOW()
        WHERE id = $1
-       RETURNING id, product_name, product_link
+       RETURNING id, winner_name, winner_number, product_name, product_link
       `,
       [
         id,
         product_name != null ? norm(product_name, 255) : null,
         product_link != null ? norm(product_link, 2048) : null,
+        normalizedWinnerName,
+        normalizedWinnerNumber,
       ]
     );
 
@@ -107,7 +138,10 @@ router.patch("/:id", requireAuth, requireAdmin, async (req, res) => {
     }
 
     return res.json({
+      ok: true,
       draw_id: rows[0].id,
+      winner_name: rows[0].winner_name || "",
+      winner_number: rows[0].winner_number ?? null,
       product_name: rows[0].product_name || "",
       product_link: rows[0].product_link || "",
     });
