@@ -47,6 +47,7 @@ const PIX_EXP_MIN = Math.max(
   30,
   Number(process.env.PIX_EXP_MIN || process.env.PIX_EXP_MINUTES || 30)
 );
+const DEFAULT_MAIN_DRAW_NUMBER_COUNT = 100;
 
 function isDebugCouponEnabled() {
   const v = String(process.env.DEBUG_COUPON || "").toLowerCase().trim();
@@ -82,7 +83,7 @@ function reservationIsExpired(row) {
 }
 
 /**
- * Fecha o draw se tiver 100 vendidos e cria um novo se não existir outro 'open'.
+ * Fecha o draw se todos os numeros existentes foram vendidos e cria um novo se nao existir outro 'open'.
  * Tudo dentro de TRANSAÇÃO + ADVISORY LOCK para evitar condições de corrida.
  */
 async function finalizeDrawIfComplete(drawId) {
@@ -114,8 +115,15 @@ async function finalizeDrawIfComplete(drawId) {
       [drawId]
     );
     const sold = cnt.rows[0]?.sold || 0;
+    const totalRes = await query(
+      `SELECT COUNT(*)::int AS total
+         FROM numbers
+        WHERE draw_id = $1`,
+      [drawId]
+    );
+    const totalNumbers = Number(totalRes.rows[0]?.total || 0);
 
-    if (sold === 100) {
+    if (totalNumbers > 0 && sold >= totalNumbers) {
       // Fecha (idempotente)
       await query(
         `UPDATE draws
@@ -138,12 +146,12 @@ async function finalizeDrawIfComplete(drawId) {
 
       const newId = ins.rows[0]?.id;
       if (newId) {
-        // Popula 0..99
+        // Popula o sorteio automatico padrao.
         await query(
           `INSERT INTO numbers (draw_id, n, status)
            SELECT $1, gs, 'available'
-             FROM generate_series(0, 99) AS gs`,
-          [newId]
+             FROM generate_series(0, $2::int - 1) AS gs`,
+          [newId, DEFAULT_MAIN_DRAW_NUMBER_COUNT]
         );
       }
     }

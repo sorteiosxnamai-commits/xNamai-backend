@@ -109,7 +109,7 @@ router.get('/', async (req, res) => {
 
         if (isPaid) {
           return {
-            n: num, number: num, label: String(num).padStart(2, '0'),
+            n: num, number: num,
             status: 'sold', payment_status: 'paid',
             owner_initials: initialsByN.get(num) || null,
             reserved_until: row.reserved_until || null,
@@ -131,7 +131,7 @@ router.get('/', async (req, res) => {
 
         if (isTemporaryReservation || isAdminPermanentReservation) {
           return {
-            n: num, number: num, label: String(num).padStart(2, '0'),
+            n: num, number: num,
             status: 'reserved', payment_status: paymentStatus || 'pending',
             reserved_until: row.reserved_until || null,
             permanent: Boolean(isAdminPermanentReservation),
@@ -139,13 +139,29 @@ router.get('/', async (req, res) => {
         }
 
         return {
-          n: num, number: num, label: String(num).padStart(2, '0'),
+          n: num, number: num,
           status: 'available', payment_status: paymentStatus || 'pending', reserved_until: null,
         };
       })
       .filter(Boolean);
 
-    return res.json({ ok: true, drawId, draw_id: drawId, numbers });
+    const totalNumbers = numbers.length;
+    const maxNumber = numbers.reduce((max, item) => Math.max(max, Number(item.n)), 0);
+    const labelDigits = totalNumbers > 100 ? Math.max(3, String(maxNumber).length) : 2;
+    const labeledNumbers = numbers.map((item) => ({
+      ...item,
+      label: String(item.n).padStart(labelDigits, '0'),
+    }));
+
+    return res.json({
+      ok: true,
+      drawId,
+      draw_id: drawId,
+      total_numbers: totalNumbers,
+      number_count: totalNumbers,
+      label_digits: labelDigits,
+      numbers: labeledNumbers,
+    });
   } catch (err) {
     console.error('[MAIN_NUMBERS_LIST_ERROR]', err?.message);
     return res.status(500).json({

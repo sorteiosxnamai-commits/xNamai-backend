@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { query, getPool } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { ensureMainRaffleCompat, reservationIdIsUuid, getTicketPriceCents } from '../services/mainRaffleCompat.js';
-import { cleanupExpiredMainReservations, ensureMainNumbersExist } from '../services/mainReservationExpiry.js';
+import { cleanupExpiredMainReservations } from '../services/mainReservationExpiry.js';
 import { assertUserUnderLimit } from '../services/purchase_limit.js';
 import { mpCreatePixPayment } from '../services/mercadopago.js';
 import { isApprovedPaymentStatus, settleApprovedMainPayment } from '../services/mainPaymentSettlement.js';
@@ -25,7 +25,7 @@ router.post('/', requireAuth, async (req, res) => {
     }
 
     const nums = Array.from(
-      new Set(numbers.map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n <= 99))
+      new Set(numbers.map(Number).filter((n) => Number.isInteger(n) && n >= 0))
     );
     if (!nums.length) return res.status(400).json({ ok: false, error: 'numbers_invalid' });
 
@@ -66,7 +66,6 @@ router.post('/', requireAuth, async (req, res) => {
     txStarted = true;
     await ensureMainRaffleCompat(client);
     await cleanupExpiredMainReservations(client, drawId);
-    await ensureMainNumbersExist(client, drawId, nums);
 
     const priceRow = await client.query(
       `SELECT COALESCE(ticket_price_cents, price_cents, 5500)::int AS price_cents
@@ -83,6 +82,15 @@ router.post('/', requireAuth, async (req, res) => {
          FROM public.numbers WHERE draw_id = $1 AND COALESCE(n::int, number) = ANY($2::int[]) FOR UPDATE`,
       [drawId, nums]
     );
+
+    const foundNumbers = new Set(locked.rows.map((row) => Number(row.number)));
+    const missingNumbers = nums.filter((n) => !foundNumbers.has(n));
+
+    if (missingNumbers.length) {
+      await client.query('ROLLBACK');
+      txStarted = false;
+      return res.status(400).json({ ok: false, error: 'numbers_invalid', invalid: missingNumbers });
+    }
 
     const conflicts = locked.rows.filter((row) => {
       const status = String(row.status || 'available').toLowerCase();

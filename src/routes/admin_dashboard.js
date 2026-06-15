@@ -13,6 +13,7 @@ const RESERVED_STATUSES = ["reserved", "pending", "reservado", "pendente"];
 const FREE_STATUSES = ["available", "free", "livre", "disponivel", "disponível"];
 
 const PAID_PAYMENT_STATUSES = ["approved", "paid", "pago"];
+const ALLOWED_DRAW_NUMBER_COUNTS = [100, 500, 1000];
 
 function toInt(value, fallback = 0) {
   const n = Number(value);
@@ -49,6 +50,19 @@ function normalizeCashbackPercent(value, fallback = 100) {
   if (!Number.isFinite(parsed)) return fallback;
 
   return Math.max(0, Math.min(100, parsed));
+}
+
+function parseDrawNumberCount(body) {
+  const raw = Object.prototype.hasOwnProperty.call(body || {}, "number_count")
+    ? body.number_count
+    : 100;
+  const numberCount = Number(raw);
+
+  if (!Number.isInteger(numberCount) || !ALLOWED_DRAW_NUMBER_COUNTS.includes(numberCount)) {
+    return null;
+  }
+
+  return numberCount;
 }
 
 async function ensureAdminSchema() {
@@ -116,18 +130,35 @@ async function ensureAdminSchema() {
   `);
 }
 
-async function ensureNumbersForDraw(drawId) {
+async function ensureNumbersForDraw(drawId, numberCount = 100) {
   if (!Number.isInteger(Number(drawId)) || Number(drawId) <= 0) return;
+
+  const safeNumberCount = ALLOWED_DRAW_NUMBER_COUNTS.includes(Number(numberCount))
+    ? Number(numberCount)
+    : 100;
 
   await query(
     `
     INSERT INTO numbers(draw_id, n, number, status, created_at, updated_at)
     SELECT $1, gs::smallint, gs::int, 'available', NOW(), NOW()
-      FROM generate_series(0, 99) AS gs
+      FROM generate_series(0, $2::int - 1) AS gs
     ON CONFLICT (draw_id, n) DO NOTHING
     `,
-    [Number(drawId)]
+    [Number(drawId), safeNumberCount]
   );
+}
+
+async function countNumbersForDraw(drawId) {
+  const { rows } = await query(
+    `
+    SELECT COUNT(*)::int AS total_numbers
+      FROM numbers
+     WHERE draw_id = $1
+    `,
+    [drawId]
+  );
+
+  return toInt(rows[0]?.total_numbers, 0);
 }
 
 async function upsertConfig(client, key, value) {
@@ -274,6 +305,7 @@ async function handleSummary(_req, res) {
         draw_id: null,
         sold: 0,
         remaining: 0,
+        number_count: 100,
         price_cents: priceCents,
         ticket_price_cents: priceCents,
         max_numbers_per_selection: maxNumbers,
@@ -291,10 +323,10 @@ async function handleSummary(_req, res) {
       });
     }
 
-    const total = Math.max(100, toInt(draw.total_numbers, 0));
+    const total = await countNumbersForDraw(draw.id);
     const sold = toInt(draw.sold_numbers, 0);
     const reserved = toInt(draw.reserved_numbers, 0);
-    const remaining = Math.max(0, total - sold - reserved);
+    const remaining = Math.max(0, total - sold);
 
     const cashbackPercent = normalizeCashbackPercent(draw.cashback_percent, 100);
 
@@ -303,6 +335,7 @@ async function handleSummary(_req, res) {
       id: draw.id,
       number: draw.id,
       total_numbers: total,
+      number_count: total,
       sold_numbers: sold,
       reserved_numbers: reserved,
       remaining_numbers: remaining,
@@ -321,6 +354,7 @@ async function handleSummary(_req, res) {
       draw_id: normalizedDraw.id,
       sold,
       remaining,
+      number_count: total,
       price_cents: normalizedDraw.ticket_price_cents,
       ticket_price_cents: normalizedDraw.ticket_price_cents,
       cashback_percent: cashbackPercent,
@@ -426,6 +460,11 @@ router.post("/new", async (req, res) => {
   try {
     await ensureAdminSchema();
     const currentConfig = await getConfigObject();
+    const numberCount = parseDrawNumberCount(req.body);
+
+    if (numberCount === null) {
+      return res.status(400).json({ error: "invalid_number_count" });
+    }
 
     const title = normalizeText(req.body.title, "");
     const prizeTitle = normalizeText(req.body.prize_title ?? req.body.prizeTitle, "");
@@ -481,12 +520,12 @@ router.post("/new", async (req, res) => {
 
     await client.query(
       `
-      INSERT INTO numbers(draw_id, n, status)
-      SELECT $1, gs, 'available'
-      FROM generate_series(0, 99) AS gs
+      INSERT INTO numbers(draw_id, n, number, status)
+      SELECT $1, gs::smallint, gs::int, 'available'
+      FROM generate_series(0, $2::int - 1) AS gs
       ON CONFLICT (draw_id, n) DO NOTHING
       `,
-      [draw.id]
+      [draw.id, numberCount]
     );
 
     await upsertConfig(client, "draw_id", draw.id);
@@ -505,13 +544,15 @@ router.post("/new", async (req, res) => {
       ok: true,
       message: "Sorteio criado com sucesso.",
       draw_id: draw.id,
+      number_count: numberCount,
       draw: {
         ...draw,
         cashback_percent: normalizeCashbackPercent(draw.cashback_percent, 100),
-        total_numbers: 100,
+        total_numbers: numberCount,
+        number_count: numberCount,
         sold_numbers: 0,
         reserved_numbers: 0,
-        remaining_numbers: 100,
+        remaining_numbers: numberCount,
       },
     });
   } catch (err) {
@@ -548,6 +589,8 @@ router.get("/open-buyers", async (req, res) => {
     }
 
     const ticketPriceCents = toInt(active.ticket_price_cents, 5500);
+    const totalNumbers = await countNumbersForDraw(active.id);
+    const labelDigits = totalNumbers > 100 ? Math.max(3, String(Math.max(0, totalNumbers - 1)).length) : 2;
 
     const occupiedResult = await query(
       `
@@ -575,7 +618,6 @@ router.get("/open-buyers", async (req, res) => {
           ON u.id = p.user_id
         CROSS JOIN LATERAL UNNEST(COALESCE(p.numbers, '{}'::int[])) AS paid_num(n)
         WHERE p.draw_id = $1
-          AND paid_num.n BETWEEN 0 AND 99
           AND LOWER(TRIM(COALESCE(p.status, ''))) = ANY($2)
         ORDER BY paid_num.n, p.created_at DESC NULLS LAST
       ),
@@ -614,7 +656,6 @@ router.get("/open-buyers", async (req, res) => {
         LEFT JOIN public.users u
           ON u.id = n.user_id
         WHERE n.draw_id = $1
-          AND COALESCE(n.n::int, n.number::int) BETWEEN 0 AND 99
           AND (
             LOWER(TRIM(COALESCE(n.status, ''))) = ANY($3)
             OR LOWER(TRIM(COALESCE(n.payment_status, ''))) = ANY($2)
@@ -665,7 +706,6 @@ router.get("/open-buyers", async (req, res) => {
         COUNT(DISTINCT COALESCE(n.n::int, n.number::int))::int AS reserved_count
       FROM public.numbers n
       WHERE n.draw_id = $1
-        AND COALESCE(n.n::int, n.number::int) BETWEEN 0 AND 99
         AND LOWER(TRIM(COALESCE(n.status, ''))) = ANY($2)
         AND LOWER(TRIM(COALESCE(n.payment_status, 'pending'))) NOT IN (
           'paid',
@@ -691,9 +731,9 @@ router.get("/open-buyers", async (req, res) => {
     const occupiedNumbers = occupiedResult.rows || [];
     const reserved = Number(reservedResult.rows?.[0]?.reserved_count || 0);
     const sold = occupiedNumbers.length;
-    const remaining = Math.max(0, 100 - sold - reserved);
+    const remaining = Math.max(0, totalNumbers - sold - reserved);
 
-    const pad2 = (value) => String(Number(value)).padStart(2, "0");
+    const padNumber = (value) => String(Number(value)).padStart(labelDigits, "0");
 
     const buyerMap = new Map();
 
@@ -751,7 +791,7 @@ router.get("/open-buyers", async (req, res) => {
         numbers: buyer.numbers.sort((a, b) => a - b),
         numbers_label: buyer.numbers
           .sort((a, b) => a - b)
-          .map(pad2)
+          .map(padNumber)
           .join(", "),
         source_label: buyer.sources.includes("Atribuído pelo admin")
           ? buyer.sources.includes("Pago")
@@ -774,7 +814,7 @@ router.get("/open-buyers", async (req, res) => {
       return {
         n: number,
         number,
-        label: pad2(number),
+        label: padNumber(number),
         buyer_key: buyerKey,
         user_id: userId,
         name: row.name || "Sem usuário",
@@ -792,7 +832,8 @@ router.get("/open-buyers", async (req, res) => {
     const normalizedDraw = {
       ...active,
       id: Number(active.id),
-      total_numbers: 100,
+      total_numbers: totalNumbers,
+      number_count: totalNumbers,
       sold_numbers: sold,
       reserved_numbers: reserved,
       remaining_numbers: remaining,
@@ -808,7 +849,9 @@ router.get("/open-buyers", async (req, res) => {
       reserved_numbers: reserved,
       remaining,
       remaining_numbers: remaining,
-      total_numbers: 100,
+      total_numbers: totalNumbers,
+      number_count: totalNumbers,
+      label_digits: labelDigits,
       draw: normalizedDraw,
       buyers,
       participants: buyers,

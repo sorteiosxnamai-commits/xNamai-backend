@@ -16,7 +16,7 @@ export function normalizeNumbersList(value) {
   if (Array.isArray(value)) {
     return value
       .map((n) => Number(n))
-      .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99);
+      .filter((n) => Number.isInteger(n) && n >= 0);
   }
 
   if (typeof value === "string") {
@@ -24,7 +24,7 @@ export function normalizeNumbersList(value) {
       .replace(/[{}[\]\s]/g, "")
       .split(",")
       .map((n) => Number(n))
-      .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99);
+      .filter((n) => Number.isInteger(n) && n >= 0);
   }
 
   return [];
