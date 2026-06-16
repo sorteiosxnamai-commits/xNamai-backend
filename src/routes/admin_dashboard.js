@@ -52,6 +52,13 @@ function normalizeCashbackPercent(value, fallback = 100) {
   return Math.max(0, Math.min(100, parsed));
 }
 
+function normalizeResultSource(value, fallback = "lotomania") {
+  if (value === undefined || value === null || value === "") return fallback;
+
+  const resultSource = String(value).trim();
+  return ["lotomania", "loteria_federal"].includes(resultSource) ? resultSource : null;
+}
+
 function parseDrawNumberCount(body) {
   const raw = Object.prototype.hasOwnProperty.call(body || {}, "number_count")
     ? body.number_count
@@ -188,7 +195,8 @@ async function getConfigObject() {
       'max_numbers_per_selection',
       'max_numbers_per_user',
       'banner_title',
-      'promo_text'
+      'promo_text',
+      'result_source'
     )
   `);
 
@@ -218,6 +226,7 @@ async function getConfigObject() {
     ),
     banner_title: config.banner_title || "",
     promo_text: config.promo_text || "",
+    result_source: normalizeResultSource(config.result_source, "lotomania") || "lotomania",
   };
 }
 
@@ -301,6 +310,7 @@ async function handleSummary(_req, res) {
     );
     const promoText = String(config.promo_text || config.banner_title || "");
     const bannerTitle = String(config.banner_title || config.promo_text || "");
+    const resultSource = config.result_source || "lotomania";
 
     if (!draw) {
       return res.json({
@@ -315,6 +325,7 @@ async function handleSummary(_req, res) {
         max_numbers_per_user: maxNumbers,
         promo_text: promoText,
         banner_title: bannerTitle,
+        result_source: resultSource,
         cashback_percent: 100,
         draw: null,
         current_draw: null,
@@ -365,6 +376,7 @@ async function handleSummary(_req, res) {
       max_numbers_per_user: normalizedDraw.max_numbers_per_user,
       promo_text: normalizedDraw.promo_text || promoText,
       banner_title: normalizedDraw.banner_title || bannerTitle,
+      result_source: resultSource,
       draw: normalizedDraw,
       current_draw: normalizedDraw,
       currentDraw: normalizedDraw,
@@ -410,6 +422,14 @@ router.patch("/config", async (req, res) => {
     );
 
     const cashbackPercent = normalizeCashbackPercent(req.body.cashback_percent, 100);
+    const resultSource = normalizeResultSource(
+      req.body.result_source,
+      currentConfig.result_source || "lotomania"
+    );
+
+    if (!resultSource) {
+      return res.status(400).json({ error: "invalid_result_source" });
+    }
 
     await client.query("BEGIN");
 
@@ -420,6 +440,7 @@ router.patch("/config", async (req, res) => {
     await upsertConfig(client, "max_numbers_per_user", maxNumbers);
     await upsertConfig(client, "promo_text", promoText);
     await upsertConfig(client, "banner_title", promoText);
+    await upsertConfig(client, "result_source", resultSource);
 
     await client.query(
       `
@@ -443,6 +464,7 @@ router.patch("/config", async (req, res) => {
       max_numbers_per_user: maxNumbers,
       promo_text: promoText,
       cashback_percent: cashbackPercent,
+      result_source: resultSource,
     });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});

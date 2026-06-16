@@ -8,10 +8,24 @@ import {
   getMaxNumbersPerSelection,
   setMaxNumbersPerSelection,
 } from "../services/config.js";
+import { query } from "../db.js";
 import { fetchCurrentOpenDraw } from "../services/mainRaffleCompat.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = Router();
+
+function normalizeResultSource(value) {
+  return value === "loteria_federal" ? "loteria_federal" : "lotomania";
+}
+
+async function getResultSource() {
+  const { rows } = await query(
+    "SELECT value FROM app_config WHERE key = $1 LIMIT 1",
+    ["result_source"]
+  );
+
+  return normalizeResultSource(rows[0]?.value);
+}
 
 /**
  * GET /api/config
@@ -20,10 +34,11 @@ const router = Router();
 router.get("/", async (_req, res) => {
   try {
     const currentDraw = await fetchCurrentOpenDraw();
-    const [fallbackPrice, banner_title, fallbackMaxSelection] = await Promise.all([
+    const [fallbackPrice, banner_title, fallbackMaxSelection, result_source] = await Promise.all([
       getTicketPriceCents(),
       getBannerTitle(),
       getMaxNumbersPerSelection(),
+      getResultSource(),
     ]);
 
     const ticket_price_cents =
@@ -40,6 +55,7 @@ router.get("/", async (_req, res) => {
       promo_text: currentDraw?.promo_text || "",
       max_numbers_per_user,
       max_numbers_per_selection: max_numbers_per_user,
+      result_source,
       cashback_percent: Number(currentDraw?.cashback_percent ?? 100),
       draw_id: currentDraw?.id ?? null,
       current_draw: currentDraw,
