@@ -13,6 +13,7 @@ import {
 
 const router = express.Router();
 const ADMIN_ASSIGN_RESERVATION_TTL_MINUTES = 30;
+const OPEN_DRAW_STATUSES = ["open", "active", "aberto", "ativo"];
 
 router.use(requireAuth, requireAdmin);
 
@@ -56,21 +57,21 @@ const toInt = (v, def = 0) => {
   return Number.isFinite(n) ? (n | 0) : def;
 };
 
-// Normaliza "numbers": aceita array ou CSV e retorna int[] 0..99 (mantém 00 como 0)
+// Normaliza "numbers": aceita array ou CSV e retorna int[] >= 0 (mantém 00 como 0)
 function parseNumbers(input) {
   const normalize = (values) => [...new Set(values)];
 
   if (Array.isArray(input)) {
     return normalize(input
       .map((n) => Number(n))
-      .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99));
+      .filter((n) => Number.isInteger(n) && n >= 0));
   }
   const s = String(input || "");
   if (!s) return [];
   return normalize(s
     .split(/[,\s;]+/).map((t) => t.trim()).filter(Boolean)
     .map((t) => Number(t))
-    .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99));
+    .filter((n) => Number.isInteger(n) && n >= 0));
 }
 
 /* =============== LISTAR (com busca/paginação) =============== */
@@ -300,17 +301,48 @@ router.post("/:id/assign-numbers", async (req, res) => {
 
     const drawResult = await client.query(
       `
-      SELECT id
-        FROM public.draws
-       WHERE id = $1
+      WITH current_draw AS (
+        SELECT id
+          FROM public.draws
+         WHERE LOWER(COALESCE(status, '')) = ANY($2::text[])
+         ORDER BY id DESC
+         LIMIT 1
+      )
+      SELECT d.id
+        FROM public.draws d
+        JOIN current_draw cd ON cd.id = d.id
+       WHERE d.id = $1
        FOR UPDATE
       `,
-      [draw_id]
+      [draw_id, OPEN_DRAW_STATUSES]
     );
 
     if (!drawResult.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ ok: false, error: "draw_not_found" });
+    }
+
+    const existingNumbersResult = await client.query(
+      `
+      SELECT DISTINCT COALESCE(n::int, number) AS number
+        FROM public.numbers
+       WHERE draw_id = $1
+         AND COALESCE(n::int, number) = ANY($2::int[])
+       ORDER BY number
+      `,
+      [draw_id, numbers]
+    );
+
+    const existingNumbers = new Set(existingNumbersResult.rows.map((r) => Number(r.number)));
+    const missingNumbers = numbers.filter((n) => !existingNumbers.has(n));
+
+    if (missingNumbers.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_numbers",
+        invalid_numbers: missingNumbers,
+      });
     }
 
     const ticketPriceCents = await getTicketPriceCents(client, draw_id);
@@ -358,21 +390,6 @@ router.post("/:id/assign-numbers", async (req, res) => {
          AND LOWER(COALESCE(payment_status, 'pending')) NOT IN ('paid','approved','pago')
       `,
       [draw_id]
-    );
-
-    await client.query(
-      `
-      INSERT INTO public.numbers (draw_id, n, number, status, created_at, updated_at)
-      SELECT $1, selected_number::smallint, selected_number::int, 'available', NOW(), NOW()
-        FROM UNNEST($2::int[]) AS selected_number
-       WHERE NOT EXISTS (
-         SELECT 1
-           FROM public.numbers existing
-          WHERE existing.draw_id = $1
-            AND COALESCE(existing.n::int, existing.number) = selected_number
-       )
-      `,
-      [draw_id, numbers]
     );
 
     const numberConflicts = await client.query(
