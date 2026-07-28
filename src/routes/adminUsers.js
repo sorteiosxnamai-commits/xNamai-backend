@@ -10,6 +10,7 @@ import {
   getTicketPriceCents,
   reservationIdIsUuid,
 } from "../services/mainRaffleCompat.js";
+import { creditCouponOnApprovedPayment } from "../services/couponBalance.js";
 
 const router = express.Router();
 const ADMIN_ASSIGN_RESERVATION_TTL_MINUTES = 30;
@@ -72,6 +73,48 @@ function parseNumbers(input) {
     .split(/[,\s;]+/).map((t) => t.trim()).filter(Boolean)
     .map((t) => Number(t))
     .filter((n) => Number.isInteger(n) && n >= 0));
+}
+
+export async function creditAdminAssignmentCashback({
+  paymentId,
+  drawId,
+  userId,
+  numbers,
+  amountCents,
+  pgClient,
+}) {
+  const result = await creditCouponOnApprovedPayment(paymentId, {
+    channel: "ADMIN",
+    source: "admin_assign",
+    runTraceId: `admin.assign#${paymentId}`,
+    pgClient,
+    meta: {
+      provider: "admin_assign",
+      draw_id: drawId,
+      user_id: userId,
+      numbers,
+      amount_cents: amountCents,
+      cashback_source: "draws.cashback_percent",
+    },
+  });
+
+  const completed =
+    result?.action === "credited" ||
+    (
+      result?.action === "noop" &&
+      ["zero_cashback", "already_in_ledger", "already_credited"].includes(result?.reason)
+    );
+
+  if (result?.ok !== true || !completed) {
+    const error = new Error(
+      `admin_assignment_cashback_failed:${result?.action || "unknown"}:${result?.reason || "unknown"}`
+    );
+    error.code = "ADMIN_ASSIGN_CASHBACK_FAILED";
+    error.couponResult = result || null;
+    throw error;
+  }
+
+  return result;
 }
 
 /* =============== LISTAR (com busca/paginação) =============== */
@@ -749,6 +792,15 @@ router.post("/:id/assign-numbers", async (req, res) => {
     if (soldNumbers.rowCount !== numbers.length) {
       throw new Error(`assignment_sold_rowcount_mismatch:${soldNumbers.rowCount}/${numbers.length}`);
     }
+
+    await creditAdminAssignmentCashback({
+      paymentId: adminPaymentId,
+      drawId: draw_id,
+      userId: user_id,
+      numbers,
+      amountCents: amount_cents,
+      pgClient: client,
+    });
 
     await client.query("COMMIT");
 

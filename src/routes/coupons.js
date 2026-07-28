@@ -55,6 +55,17 @@ async function buildTimeExpr() {
   return uniq.length === 1 ? uniq[0] : `GREATEST(${uniq.join(", ")})`;
 }
 
+export function couponChannelForPayment(payment = {}) {
+  const provider = String(payment.provider || "").trim().toLowerCase();
+  const paymentId = String(payment.id || "").trim().toLowerCase();
+
+  if (provider === "admin_assign" || paymentId.startsWith("adminassign:")) {
+    return "ADMIN";
+  }
+
+  return provider === "vindi" ? "VINDI" : "PIX";
+}
+
 // ---------- rotas ----------
 
 /**
@@ -109,7 +120,7 @@ router.post("/sync", requireAuth, async (req, res) => {
       for (const p of pend) {
         // eslint-disable-next-line no-await-in-loop
         const creditRes = await creditCouponOnApprovedPayment(String(p.id), {
-          channel: String(p.provider || "").toLowerCase() === "vindi" ? "VINDI" : "PIX",
+          channel: couponChannelForPayment(p),
           source: "coupons_sync",
           runTraceId: `coupons.sync#${rid}`,
           meta: { cashback_source: "draws.cashback_percent" },
